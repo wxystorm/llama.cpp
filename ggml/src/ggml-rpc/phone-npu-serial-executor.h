@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml.h"
+#include "ggml-impl.h"  // graph layout, log macros and ggml_are_same_layout
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
 #include "ggml-cpp.h"
