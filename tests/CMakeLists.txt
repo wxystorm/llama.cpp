@@ -311,6 +311,13 @@ llama_test(test-phone-qwen3-local-builder LABEL jupiter-phone-owned)
 llama_build(test-phone-qwen3-local-parity.cpp)
 llama_test(test-phone-qwen3-local-parity LABEL jupiter-phone-owned)
 
+# Optional manual integration smoke. Does not run in CTest because a Phone
+# with HTP, a local GGUF source and a dedicated RPC server are required.
+if (TARGET ggml-rpc AND NOT GGML_BACKEND_DL)
+    llama_build(test-jupiter-phone-owned-rpc.cpp)
+    target_link_libraries(test-jupiter-phone-owned-rpc PRIVATE ggml-rpc)
+endif()
+
 target_include_directories(test-alloc PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 
 llama_build(test-export-graph-ops.cpp)
