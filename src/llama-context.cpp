@@ -14,7 +14,9 @@
 #include "llama-ext.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
+#include <utility>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -182,7 +184,8 @@ struct jupiter_phone_owned_native_state {
                 src->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
                 !ggml_is_contiguous(src) || !ggml_is_contiguous(dst) ||
                 src->ne[0] != 5120 || dst->ne[0] != 5120 ||
-                !ggml_are_same_layout(src, dst) ||
+                src->ne[1] != dst->ne[1] ||
+                ggml_nbytes(src) != ggml_nbytes(dst) ||
                 state->next_chunk >=
                     (state->total_tokens + state->chunk_tokens - 1) /
                     state->chunk_tokens) {
@@ -1785,6 +1788,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ret = status;
         return nullptr;
     }
+    if (jupiter_phone_native) {
+        // The CPU custom op carries a synchronous RPC call. Fence the
+        // scheduler before examining its result or reusing the activation.
+        ggml_backend_sched_synchronize(sched.get());
+        if (jupiter_phone_native->failed) {
+            LLAMA_LOG_ERROR(
+                "%s: Phone-owned HTP native computation failed: %s\n",
+                __func__, jupiter_phone_native->failure.c_str());
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+    }
 
     ret = GGML_STATUS_SUCCESS;
 
@@ -2096,6 +2111,13 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    if (jupiter_phone_native && jupiter_phone_native->completed) {
+        LLAMA_LOG_ERROR(
+            "[JUPITER_PHONE_OWNED_PREFILL] status=REJECT"
+            " reason=DECODE_KV_HANDOFF_NOT_IMPLEMENTED"
+            " (native path supports complete Prefill and first-token logits only)\n");
+        return -1;
+    }
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -2237,6 +2259,34 @@ int llama_context::decode(const llama_batch & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
+    if (jupiter_phone_native) {
+        // The native Phone-owned KV is private and currently supports only
+        // a fresh contiguous single-sequence Prompt. Never silently fall
+        // back to the old RPC graph after a native registration fails.
+        const auto & complete = balloc->get_batch();
+        bool fresh = n_outputs_all == 1 && !output_all && !has_samplers &&
+                     n_tokens_all > 1 && cparams.n_ctx == 512 &&
+                     complete.n_tokens == (int32_t) n_tokens_all &&
+                     complete.pos != nullptr;
+        for (uint32_t i = 0; fresh && i < n_tokens_all; ++i) {
+            fresh = complete.pos[i] == (llama_pos) i &&
+                    (complete.n_seq_id == nullptr || complete.n_seq_id[i] == 1) &&
+                    (complete.seq_id == nullptr || complete.seq_id[i][0] == 0);
+        }
+        if (!fresh) {
+            LLAMA_LOG_ERROR(
+                "[JUPITER_PHONE_OWNED_PREFILL] status=REJECT"
+                " reason=REQUIRES_FRESH_SINGLE_SEQUENCE_LOGITS_ON_LAST_TOKEN"
+                " tokens=%u outputs=%u\n", n_tokens_all, n_outputs_all);
+            return -3;
+        }
+        if (!jupiter_phone_native->prepare_run(
+                model, cparams, n_tokens_all,
+                mctx->get_ubatch().n_tokens, backend_ptrs)) {
+            return -3;
+        }
+    }
+
     // Metadata-only, opt-in prebuild for single-stream dense Qwen3. Other
     // memory implementations / architectures keep the established path.
     const char * jupiter_prebuild_env = getenv("LLAMA_JUPITER_GRAPH_PREBUILD");
@@ -2244,6 +2294,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const bool jupiter_prefill_active =
             jupiter_prefill_opt_in != nullptr && atoi(jupiter_prefill_opt_in) != 0;
     const bool jupiter_prebuild_requested = jupiter_prefill_active &&
+            !jupiter_phone_native &&
             n_tokens_all > 1 && model.arch == LLM_ARCH_QWEN3 &&
             jupiter_prebuild_env != nullptr && atoi(jupiter_prebuild_env) != 0;
     if (jupiter_prebuild_requested) {
@@ -2585,6 +2636,25 @@ int llama_context::decode(const llama_batch & batch_inp) {
         n_tokens_prev  += ubatch.n_tokens;
         jupiter_chunk_idx++;
     } while (mctx->next());
+
+    if (jupiter_phone_native) {
+        const auto & state = *jupiter_phone_native;
+        const uint32_t expected =
+            (state.total_tokens + state.chunk_tokens - 1) / state.chunk_tokens;
+        if (state.failed || !state.prepared ||
+                state.next_chunk != expected) {
+            LLAMA_LOG_ERROR(
+                "[JUPITER_PHONE_OWNED_PREFILL] phase=COMPLETE status=FAIL"
+                " chunks=%u expected=%u\n", state.next_chunk, expected);
+            return -3;
+        }
+        jupiter_phone_native->completed = true;
+        LLAMA_LOG_INFO(
+            "[JUPITER_PHONE_OWNED_PREFILL] phase=COMPLETE"
+            " tokens=%u chunks=%u output=REAL_LOGITS"
+            " final_head=PC_CUDA status=PASS\n",
+            n_tokens_all, state.next_chunk);
+    }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
