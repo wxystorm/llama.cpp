@@ -16,6 +16,71 @@ static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO
 
 #define GGML_RPC_MAX_SERVERS       16
 
+// Dynamically retrieved procedures for the opt-in Jupiter native Phone-owned
+// Prefill bridge. These POD types keep MSVC/Android DLL boundaries independent
+// of C++ std::string and std::vector ABIs.
+#define GGML_BACKEND_RPC_PHONE_OWNED_PREPARE_PROC "ggml_backend_rpc_phone_owned_native_prepare"
+#define GGML_BACKEND_RPC_PHONE_OWNED_RUN_PROC     "ggml_backend_rpc_phone_owned_native_run"
+#define GGML_BACKEND_RPC_PHONE_OWNED_RESET_PROC   "ggml_backend_rpc_phone_owned_native_reset"
+
+struct ggml_rpc_phone_owned_plan {
+    uint32_t version;
+    uint32_t flags;
+    uint64_t run_id;
+    uint64_t p2c_run_id;
+    uint32_t region;
+    uint32_t layer;
+    uint32_t total_tokens;
+    uint32_t chunk_tokens;
+    uint32_t n_embd;
+    uint32_t position_base;
+    uint32_t kv_capacity;
+    uint32_t n_heads;
+    uint32_t n_heads_kv;
+    uint32_t head_dim;
+    uint32_t n_kv;
+    uint32_t rope_type;
+    uint32_t n_ctx_orig;
+    uint32_t kv_type;
+    float rms_norm_eps;
+    float rope_freq_base;
+    float rope_freq_scale;
+    float rope_ext_factor;
+    float rope_attn_factor;
+    float rope_beta_fast;
+    float rope_beta_slow;
+};
+struct ggml_rpc_phone_owned_prepare_stats {
+    uint32_t graphs;
+    double model_load_ms;
+    double build_ms;
+    double buffer_alloc_ms;
+    double precompile_ms;
+    double wall_ms;
+};
+struct ggml_rpc_phone_owned_run_stats {
+    uint32_t layers;
+    uint32_t tokens;
+    double upload_ms;
+    double compute_ms;
+    double output_copy_ms;
+    double wall_ms;
+};
+typedef bool (*ggml_backend_rpc_phone_owned_prepare_t)(
+    const char * endpoint,
+    const struct ggml_rpc_phone_owned_plan * plan,
+    const uint32_t * layer_devices,
+    uint32_t n_devices,
+    struct ggml_rpc_phone_owned_prepare_stats * stats);
+typedef bool (*ggml_backend_rpc_phone_owned_run_t)(
+    const char * endpoint,
+    uint64_t run_id, uint32_t region, uint32_t chunk,
+    const float * input, size_t input_floats,
+    float * output, size_t output_capacity_floats,
+    struct ggml_rpc_phone_owned_run_stats * stats);
+typedef bool (*ggml_backend_rpc_phone_owned_reset_t)(
+    const char * endpoint, uint64_t run_id);
+
 struct ggml_rpc_local_tensor_info {
     uint64_t nbytes;      //张量的字节数
     uint32_t type;      //张量的数据类型
