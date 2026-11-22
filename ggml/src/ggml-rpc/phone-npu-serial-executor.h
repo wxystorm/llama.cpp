@@ -1202,6 +1202,10 @@ public:
         auto & state = *kit->second;
         const auto & plan = state.plan;
         const auto & graph = git->second->built;
+        if (chunk >= ggml_phone_owned::chunk_count(plan)) {
+            reason = "PHONE_NATIVE_CHUNK_OUT_OF_RANGE";
+            return false;
+        }
         const uint32_t token_begin = chunk * plan.chunk_tokens;
         const uint32_t tokens = std::min<uint32_t>(
             plan.chunk_tokens, plan.total_tokens - token_begin);
