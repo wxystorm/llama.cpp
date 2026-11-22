@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <map>
 #include <stdexcept>
@@ -2703,6 +2704,36 @@ int llama_context::decode(const llama_batch & batch_inp) {
             for (uint32_t i = 0; i < n_outputs; ++i) {
                 output_ids[out_ids[i]] = i;
             }
+        }
+    }
+
+    // Optional real model output oracle for full-Prefill correctness A/B.
+    // One binary F32 [n_vocab] vector, exactly the final output row.
+    // This is disabled by default; it is NOT suitable for timed benchmarks.
+    if (const char * dump_path = std::getenv("LLAMA_JUPITER_LOGITS_DUMP_FILE")) {
+        if (*dump_path && n_outputs_all > 0 && logits.data && n_vocab > 0) {
+            ggml_backend_sched_synchronize(sched.get());
+            const float * row = logits.data +
+                (size_t) (n_outputs_all - 1)*n_vocab;
+            std::ofstream stream(dump_path, std::ios::binary | std::ios::trunc);
+            if (!stream) {
+                LLAMA_LOG_ERROR(
+                    "[JUPITER_LOGITS_DUMP] status=FAIL reason=OPEN path=%s\n",
+                    dump_path);
+                return -3;
+            }
+            stream.write(reinterpret_cast<const char *>(row),
+                         std::streamsize(n_vocab*sizeof(float)));
+            stream.close();
+            if (!stream) {
+                LLAMA_LOG_ERROR(
+                    "[JUPITER_LOGITS_DUMP] status=FAIL reason=WRITE path=%s\n",
+                    dump_path);
+                return -3;
+            }
+            LLAMA_LOG_INFO(
+                "[JUPITER_LOGITS_DUMP] status=PASS count=%lld path=%s\n",
+                (long long) n_vocab, dump_path);
         }
     }
 
