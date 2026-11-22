@@ -1507,7 +1507,23 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 }
 
-static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+// Opt-in scheduler allocation profile. Keep the normal allocation path unchanged
+// when LLAMA_JUPITER_SCHED_ALLOC_TIMING is not enabled.
+struct ggml_backend_sched_alloc_profile {
+    bool enabled = false;
+    bool backend_ids_changed = false;
+    bool fast_alloc_attempted = false;
+    bool realloc_triggered = false;
+    double backend_check_ms = 0.0;
+    double alloc_fast_ms = 0.0;
+    double backend_sync_ms = 0.0;
+    double reserve_ms = 0.0;
+    double alloc_retry_ms = 0.0;
+};
+
+static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched, ggml_backend_sched_alloc_profile * profile) {
+    const bool timed = profile != nullptr && profile->enabled;
+    const int64_t check_begin_us = timed ? ggml_time_us() : 0;
     bool backend_ids_changed = false;
     for (int i = 0; i < sched->graph.n_nodes; i++) {
         if (sched->node_backend_ids[i] != sched->prev_node_backend_ids[i] &&
@@ -1525,9 +1541,29 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             }
         }
     }
+    if (timed) {
+        profile->backend_ids_changed = backend_ids_changed;
+        profile->backend_check_ms = (ggml_time_us() - check_begin_us)/1000.0;
+    }
 
-    // allocate graph
-    if (backend_ids_changed || !ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
+    // Preserve the original short-circuit: if backend assignments changed,
+    // skip the first allocation attempt and go directly to the reserve path.
+    bool fast_alloc_ok = false;
+    if (!backend_ids_changed) {
+        const int64_t fast_begin_us = timed ? ggml_time_us() : 0;
+        fast_alloc_ok = ggml_gallocr_alloc_graph(sched->galloc, &sched->graph);
+        if (timed) {
+            profile->fast_alloc_attempted = true;
+            profile->alloc_fast_ms = (ggml_time_us() - fast_begin_us)/1000.0;
+        }
+    }
+
+    if (backend_ids_changed || !fast_alloc_ok) {
+        if (timed) {
+            // Means the reserve/retry branch was taken; it does not prove
+            // that a physical buffer was reallocated.
+            profile->realloc_triggered = true;
+        }
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: failed to allocate graph, reserving (backend_ids_changed = %d)\n", __func__, backend_ids_changed);
 #endif
@@ -1543,14 +1579,29 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             }
         }
 
-        // the re-allocation may cause the split inputs to be moved to a different address
-        // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
+        // The reserve path can wait for previously submitted GPU/RPC work.
+        // Synchronize without ggml_backend_sched_synchronize to avoid
+        // changing cur_copy, as in the original implementation.
+        const int64_t sync_begin_us = timed ? ggml_time_us() : 0;
         for (int i = 0; i < sched->n_backends; i++) {
             ggml_backend_synchronize(sched->backends[i]);
         }
+        if (timed) {
+            profile->backend_sync_ms = (ggml_time_us() - sync_begin_us)/1000.0;
+        }
 
+        const int64_t reserve_begin_us = timed ? ggml_time_us() : 0;
         ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
-        if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
+        if (timed) {
+            profile->reserve_ms = (ggml_time_us() - reserve_begin_us)/1000.0;
+        }
+
+        const int64_t retry_begin_us = timed ? ggml_time_us() : 0;
+        const bool retry_ok = ggml_gallocr_alloc_graph(sched->galloc, &sched->graph);
+        if (timed) {
+            profile->alloc_retry_ms = (ggml_time_us() - retry_begin_us)/1000.0;
+        }
+        if (!retry_ok) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             return false;
         }
@@ -1955,17 +2006,44 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
     GGML_ASSERT(!sched->is_alloc);
 
+    const char * profile_env = getenv("LLAMA_JUPITER_SCHED_ALLOC_TIMING");
+    const bool profile_enabled = profile_env != nullptr && atoi(profile_env) != 0;
+    ggml_backend_sched_alloc_profile profile {};
+    profile.enabled = profile_enabled;
+    const int64_t total_begin_us = profile_enabled ? ggml_time_us() : 0;
+
     sched->cur_copy = sched->next_copy;
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
 
+    const int64_t split_begin_us = profile_enabled ? ggml_time_us() : 0;
     ggml_backend_sched_split_graph(sched, graph);
+    const double split_graph_ms = profile_enabled ? (ggml_time_us() - split_begin_us)/1000.0 : 0.0;
 
-    if (!ggml_backend_sched_alloc_splits(sched)) {
+    const int64_t alloc_begin_us = profile_enabled ? ggml_time_us() : 0;
+    const bool allocated = ggml_backend_sched_alloc_splits(sched, &profile);
+    if (profile_enabled) {
+        const double alloc_splits_ms = (ggml_time_us() - alloc_begin_us)/1000.0;
+        const double total_ms = (ggml_time_us() - total_begin_us)/1000.0;
+        const double other_ms = total_ms - split_graph_ms - profile.backend_check_ms -
+            profile.alloc_fast_ms - profile.backend_sync_ms - profile.reserve_ms - profile.alloc_retry_ms;
+        GGML_LOG_INFO(
+            "[JUPITER_SCHED_ALLOC] splits=%d backends=%d graph_nodes=%d graph_leafs=%d "
+            "backend_ids_changed=%d fast_alloc_attempted=%d realloc_triggered=%d "
+            "split_graph_ms=%.3f backend_check_ms=%.3f alloc_fast_ms=%.3f "
+            "backend_sync_ms=%.3f reserve_ms=%.3f alloc_retry_ms=%.3f "
+            "alloc_splits_ms=%.3f other_ms=%.3f total_ms=%.3f status=%s\n",
+            sched->n_splits, sched->n_backends, graph->n_nodes, graph->n_leafs,
+            (int) profile.backend_ids_changed, (int) profile.fast_alloc_attempted,
+            (int) profile.realloc_triggered,
+            split_graph_ms, profile.backend_check_ms, profile.alloc_fast_ms,
+            profile.backend_sync_ms, profile.reserve_ms, profile.alloc_retry_ms,
+            alloc_splits_ms, other_ms, total_ms, allocated ? "PASS" : "FAIL");
+    }
+    if (!allocated) {
         return false;
     }
 
     sched->is_alloc = true;
-
     return true;
 }
 
