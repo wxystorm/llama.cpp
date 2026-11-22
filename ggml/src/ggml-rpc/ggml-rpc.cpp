@@ -548,19 +548,27 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
         return false;
     }
 
-    // Graph registration is a newly appended opcode. Older Jupiter RPC
-    // servers accept the base protocol but close the connection on REGISTER.
-    // Detect that mismatch up front instead of reporting an opaque fail-fast.
-    if (jupiter_graph_prebuild_enabled() &&
+    // Legacy GRAPH_REGISTER needs patch 4; native Phone-owned opcodes need
+    // patch 5. Preserve backwards-compatible legacy inference when the
+    // new feature is not opted in.
+    const bool native_phone_owned =
+        std::getenv("LLAMA_JUPITER_PHONE_OWNED_NATIVE") != nullptr &&
+        std::atoi(std::getenv("LLAMA_JUPITER_PHONE_OWNED_NATIVE")) != 0;
+    const uint8_t required_patch = native_phone_owned ? 5 :
+        jupiter_graph_prebuild_enabled() ? 4 : 0;
+    if (required_patch != 0 &&
         (response.major != RPC_PROTO_MAJOR_VERSION ||
          response.minor != RPC_PROTO_MINOR_VERSION ||
-         response.patch < RPC_PROTO_PATCH_VERSION)) {
+         response.patch < required_patch)) {
         GGML_LOG_ERROR(
-            "[JUPITER_GRAPH_PREBUILD] phase=HELLO status=REJECT "
-            "reason=PHONE_SERVER_REBUILD_REQUIRED phone_rpc=%u.%u.%u required_rpc=%u.%u.%u\n",
-            (unsigned) response.major, (unsigned) response.minor, (unsigned) response.patch,
-            (unsigned) RPC_PROTO_MAJOR_VERSION, (unsigned) RPC_PROTO_MINOR_VERSION,
-            (unsigned) RPC_PROTO_PATCH_VERSION);
+            "[JUPITER_PHONE_OWNED] phase=HELLO status=REJECT"
+            " reason=PHONE_SERVER_REBUILD_REQUIRED"
+            " phone_rpc=%u.%u.%u required_rpc=%u.%u.%u\n",
+            (unsigned) response.major, (unsigned) response.minor,
+            (unsigned) response.patch,
+            (unsigned) RPC_PROTO_MAJOR_VERSION,
+            (unsigned) RPC_PROTO_MINOR_VERSION,
+            (unsigned) required_patch);
         return false;
     }
 
