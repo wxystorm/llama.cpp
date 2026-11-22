@@ -4653,12 +4653,90 @@ static ggml_backend_dev_t ggml_backend_rpc_reg_get_device(ggml_backend_reg_t reg
     }
 }
 
+// Explicit C-compatible procedure entrypoints so llama.cpp can invoke
+// the Phone-owned RPC module without linking to ggml-rpc's C++ STL ABI.
+static bool ggml_backend_rpc_phone_owned_native_prepare(
+        const char * endpoint,
+        const ggml_rpc_phone_owned_plan * input,
+        const uint32_t * layer_devices, uint32_t n_devices,
+        ggml_rpc_phone_owned_prepare_stats * stats) {
+    if (!endpoint || !input || !layer_devices || !stats ||
+            n_devices == 0 || n_devices > 8) {
+        return false;
+    }
+    *stats = {};
+    ggml_phone_owned::region_plan plan {};
+    jupiter_phone_owned_copy_plan(plan, *input);
+    const char * reason = "NONE";
+    if (!ggml_phone_owned::validate(plan, reason) ||
+            n_devices != ggml_phone_owned::layer_count(plan)) {
+        return false;
+    }
+    ggml_jupiter_phone_owned::prepare_stats native {};
+    const bool ok = ggml_jupiter_phone_owned::prepare(
+        endpoint, plan,
+        std::vector<uint32_t>(layer_devices, layer_devices + n_devices),
+        native);
+    if (ok) {
+        stats->graphs = native.graphs;
+        stats->model_load_ms = native.model_load_ms;
+        stats->build_ms = native.build_ms;
+        stats->buffer_alloc_ms = native.buffer_alloc_ms;
+        stats->precompile_ms = native.precompile_ms;
+        stats->wall_ms = native.wall_ms;
+    }
+    return ok;
+}
+
+static bool ggml_backend_rpc_phone_owned_native_run(
+        const char * endpoint, uint64_t run_id,
+        uint32_t region, uint32_t chunk,
+        const float * input, size_t input_floats,
+        float * output, size_t output_capacity_floats,
+        ggml_rpc_phone_owned_run_stats * stats) {
+    if (!endpoint || !input || !output || !stats ||
+            input_floats == 0 || input_floats != output_capacity_floats) {
+        return false;
+    }
+    *stats = {};
+    std::vector<float> result;
+    ggml_jupiter_phone_owned::run_stats native {};
+    const bool ok = ggml_jupiter_phone_owned::run_chunk(
+        endpoint, run_id, region, chunk,
+        input, input_floats, result, native);
+    if (!ok || result.size() != output_capacity_floats) {
+        return false;
+    }
+    std::memcpy(output, result.data(), result.size()*sizeof(float));
+    stats->layers = native.layers;
+    stats->tokens = native.tokens;
+    stats->upload_ms = native.upload_ms;
+    stats->compute_ms = native.compute_ms;
+    stats->output_copy_ms = native.output_copy_ms;
+    stats->wall_ms = native.wall_ms;
+    return true;
+}
+
+static bool ggml_backend_rpc_phone_owned_native_reset(
+        const char * endpoint, uint64_t run_id) {
+    return ggml_jupiter_phone_owned::reset(endpoint, run_id);
+}
+
 static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (std::strcmp(name, "ggml_backend_rpc_add_server") == 0) {
         return (void *)ggml_backend_rpc_add_server;
     }
     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
         return (void *)ggml_backend_rpc_start_server;
+    }
+    if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_OWNED_PREPARE_PROC) == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_phone_owned_native_prepare);
+    }
+    if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_OWNED_RUN_PROC) == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_phone_owned_native_run);
+    }
+    if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_OWNED_RESET_PROC) == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_phone_owned_native_reset);
     }
     if (std::strcmp(name, "ggml_backend_rpc_graph_prebuild") == 0) {
         return reinterpret_cast<void *>(ggml_backend_rpc_graph_prebuild);
