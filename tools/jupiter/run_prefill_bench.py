@@ -227,6 +227,8 @@ def parser() -> argparse.ArgumentParser:
                         "(requires rebuilt Phone RPC server, legacy C2P only)")
     p.add_argument("--comm-timing", action="store_true",
                    help="opt in to per-chunk host/RPC timing (diagnostic runs only)")
+    p.add_argument("--sched-alloc-timing", action="store_true",
+                   help="trace scheduler graph split, allocator, backend sync and reserve timings (diagnostic only)")
     p.add_argument(
         "--skip-verify", action="store_true",
         help="skip the one-time -lv 4 sequence-plan verification before timing",
@@ -320,6 +322,7 @@ def main() -> int:
         "LLAMA_JUPITER_GRAPH_PREBUILD": "1" if args.graph_prebuild else "0",
         "LLAMA_GRAPH_REUSE_DISABLE": "0",
         "LLAMA_JUPITER_TIMELINE": "1" if args.comm_timing else "0",
+        "LLAMA_JUPITER_SCHED_ALLOC_TIMING": "1" if args.sched_alloc_timing else "0",
     })
     base_env.pop("LLAMA_JUPITER_SEQUENCE_PLAN", None)
     base_env.pop("LLAMA_JUPITER_PLAN_FILE", None)
@@ -357,6 +360,8 @@ def main() -> int:
     }
     if args.cpu_layers:
         config["cpu_layers"] = args.cpu_layers
+    if args.sched_alloc_timing:
+        config["sched_alloc_timing"] = True
     # Keep strict default configs backwards-compatible with earlier runs;
     # an opt-in tolerance must be visible in the experiment identity.
     if args.timing_token_tolerance:
@@ -387,7 +392,9 @@ def main() -> int:
         f"local_graph_reuse={int(args.local_graph_reuse)} "
         f"graph_prebuild={int(args.graph_prebuild)} "
         f"default_ubatch={default_ubatch} chunk_ubatch={args.ubatch} "
-        f"comm_timing={int(args.comm_timing)} trace=0 profile_stage=0",
+        f"comm_timing={int(args.comm_timing)} "
+        f"sched_alloc_timing={int(args.sched_alloc_timing)} "
+        f"trace=0 profile_stage=0",
         flush=True,
     )
 
