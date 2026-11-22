@@ -1,4 +1,6 @@
 #include "ggml-rpc.h"
+#include "phone-owned-jupiter-api.h"
+#include "phone-npu-serial-executor.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpp.h"
@@ -10,6 +12,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -110,6 +113,10 @@ enum rpc_cmd {
     RPC_CMD_JUPITER_SYNC,
     // Opt-in: construct/store a remote Graph without executing it.
     RPC_CMD_GRAPH_REGISTER,
+    // Native Phone-owned HTP graph lifecycle (opt-in).
+    RPC_CMD_PHONE_OWNED_PREPARE,
+    RPC_CMD_PHONE_OWNED_RUN,
+    RPC_CMD_PHONE_OWNED_RESET,
     RPC_CMD_COUNT,
 };
 
@@ -240,6 +247,70 @@ struct rpc_msg_jupiter_event_req {
 struct rpc_msg_jupiter_rsp {
     uint8_t ok;
 };
+
+struct rpc_msg_phone_owned_plan_req {
+    uint32_t version;
+    uint32_t flags;
+    uint64_t run_id;
+    uint64_t p2c_run_id;
+    uint32_t region;
+    uint32_t layer;
+    uint32_t total_tokens;
+    uint32_t chunk_tokens;
+    uint32_t n_embd;
+    uint32_t position_base;
+    uint32_t kv_capacity;
+    uint32_t n_heads;
+    uint32_t n_heads_kv;
+    uint32_t head_dim;
+    uint32_t n_kv;
+    uint32_t rope_type;
+    uint32_t n_ctx_orig;
+    uint32_t kv_type;
+    float rms_norm_eps;
+    float rope_freq_base;
+    float rope_freq_scale;
+    float rope_ext_factor;
+    float rope_attn_factor;
+    float rope_beta_fast;
+    float rope_beta_slow;
+};
+static_assert(sizeof(rpc_msg_phone_owned_plan_req) == 108,
+              "Jupiter Phone-owned plan wire ABI changed");
+
+struct rpc_msg_phone_owned_prepare_req {
+    rpc_msg_phone_owned_plan_req plan;
+    uint32_t layer_devices[64];
+};
+struct rpc_msg_phone_owned_prepare_rsp {
+    uint8_t ok;
+    uint32_t graphs;
+    double model_load_ms;
+    double build_ms;
+    double buffer_alloc_ms;
+    double precompile_ms;
+    double wall_ms;
+};
+struct rpc_msg_phone_owned_run_req {
+    uint64_t run_id;
+    uint32_t region;
+    uint32_t chunk;
+    uint32_t input_floats;
+};
+struct rpc_msg_phone_owned_run_rsp {
+    uint8_t ok;
+    uint32_t output_floats;
+    uint32_t layers;
+    uint32_t tokens;
+    double upload_ms;
+    double compute_ms;
+    double output_copy_ms;
+    double wall_ms;
+};
+struct rpc_msg_phone_owned_reset_req {
+    uint64_t run_id;
+};
+
 
 struct rpc_msg_set_tensor_from_local_file_rsp {
     // 0:不支持本地文件加载
@@ -1963,6 +2034,140 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, 
     get_device_memory(sock, device, free, total);
 }
 
+
+// Explicit field copies: the public C++ plan is not a packed wire ABI.
+template <typename To, typename From>
+static void jupiter_phone_owned_copy_plan(To & dst, const From & src) {
+    dst.version = src.version;
+    dst.flags = src.flags;
+    dst.run_id = src.run_id;
+    dst.p2c_run_id = src.p2c_run_id;
+    dst.region = src.region;
+    dst.layer = src.layer;
+    dst.total_tokens = src.total_tokens;
+    dst.chunk_tokens = src.chunk_tokens;
+    dst.n_embd = src.n_embd;
+    dst.position_base = src.position_base;
+    dst.kv_capacity = src.kv_capacity;
+    dst.n_heads = src.n_heads;
+    dst.n_heads_kv = src.n_heads_kv;
+    dst.head_dim = src.head_dim;
+    dst.n_kv = src.n_kv;
+    dst.rope_type = src.rope_type;
+    dst.n_ctx_orig = src.n_ctx_orig;
+    dst.kv_type = src.kv_type;
+    dst.rms_norm_eps = src.rms_norm_eps;
+    dst.rope_freq_base = src.rope_freq_base;
+    dst.rope_freq_scale = src.rope_freq_scale;
+    dst.rope_ext_factor = src.rope_ext_factor;
+    dst.rope_attn_factor = src.rope_attn_factor;
+    dst.rope_beta_fast = src.rope_beta_fast;
+    dst.rope_beta_slow = src.rope_beta_slow;
+}
+
+
+// Native Phone-owned HTP graph lifecycle. These functions are deliberately
+// separate from the legacy GGML RPC Graph path, and do not change llama.cpp
+// placement, output norm/head, or the canonical decode KV cache.
+namespace ggml_jupiter_phone_owned {
+
+bool prepare(const char * endpoint,
+             const ggml_phone_owned::region_plan & plan,
+             const std::vector<uint32_t> & layer_devices,
+             prepare_stats & stats) {
+    stats = {};
+    const char * why = nullptr;
+    const size_t count = ggml_phone_owned::layer_count(plan);
+    if (!endpoint || !ggml_phone_owned::validate(plan, why) ||
+            count == 0 || count > 64 || layer_devices.size() != count) {
+        GGML_LOG_ERROR("[JUPITER_PHONE_OWNED] prepare rejected: %s\n",
+                       why ? why : "DEVICE_MAP_OR_ENDPOINT");
+        return false;
+    }
+    rpc_msg_phone_owned_prepare_req req {};
+    jupiter_phone_owned_copy_plan(req.plan, plan);
+    for (size_t i = 0; i < count; ++i) {
+        req.layer_devices[i] = layer_devices[i];
+    }
+    auto sock = get_socket(endpoint);
+    if (!sock) { return false; }
+    rpc_msg_phone_owned_prepare_rsp rsp {};
+    const bool received = send_rpc_cmd(
+        sock, RPC_CMD_PHONE_OWNED_PREPARE, &req, sizeof(req),
+        &rsp, sizeof(rsp));
+    if (!received || !rsp.ok) {
+        GGML_LOG_ERROR("[JUPITER_PHONE_OWNED] prepare failed: run=%" PRIu64
+                       " region=%u\n", plan.run_id, plan.region);
+        return false;
+    }
+    stats.graphs = rsp.graphs;
+    stats.model_load_ms = rsp.model_load_ms;
+    stats.build_ms = rsp.build_ms;
+    stats.buffer_alloc_ms = rsp.buffer_alloc_ms;
+    stats.precompile_ms = rsp.precompile_ms;
+    stats.wall_ms = rsp.wall_ms;
+    return true;
+}
+
+bool run_chunk(const char * endpoint, uint64_t run_id,
+               uint32_t region, uint32_t chunk,
+               const float * input, size_t input_floats,
+               std::vector<float> & output, run_stats & stats) {
+    output.clear();
+    stats = {};
+    if (!endpoint || !input || !run_id || !input_floats ||
+            input_floats > ggml_phone_owned::k_max_activation_bytes / sizeof(float) ||
+            input_floats > UINT32_MAX) {
+        return false;
+    }
+    const size_t data_bytes = input_floats * sizeof(float);
+    std::vector<uint8_t> req(sizeof(rpc_msg_phone_owned_run_req) + data_bytes);
+    rpc_msg_phone_owned_run_req header {
+        run_id, region, chunk, static_cast<uint32_t>(input_floats)
+    };
+    std::memcpy(req.data(), &header, sizeof(header));
+    std::memcpy(req.data() + sizeof(header), input, data_bytes);
+    auto sock = get_socket(endpoint);
+    if (!sock || !send_rpc_cmd(sock, RPC_CMD_PHONE_OWNED_RUN,
+                               req.data(), req.size())) {
+        return false;
+    }
+    std::vector<uint8_t> response;
+    if (!recv_msg(sock, response) ||
+            response.size() < sizeof(rpc_msg_phone_owned_run_rsp)) {
+        return false;
+    }
+    rpc_msg_phone_owned_run_rsp rsp {};
+    std::memcpy(&rsp, response.data(), sizeof(rsp));
+    const size_t output_bytes = size_t(rsp.output_floats) * sizeof(float);
+    if (!rsp.ok || rsp.output_floats != input_floats ||
+            output_bytes > ggml_phone_owned::k_max_activation_bytes ||
+            response.size() != sizeof(rsp) + output_bytes) {
+        return false;
+    }
+    output.resize(rsp.output_floats);
+    std::memcpy(output.data(), response.data() + sizeof(rsp), output_bytes);
+    stats.layers = rsp.layers;
+    stats.tokens = rsp.tokens;
+    stats.upload_ms = rsp.upload_ms;
+    stats.compute_ms = rsp.compute_ms;
+    stats.output_copy_ms = rsp.output_copy_ms;
+    stats.wall_ms = rsp.wall_ms;
+    return true;
+}
+
+bool reset(const char * endpoint, uint64_t run_id) {
+    if (!endpoint || !run_id) { return false; }
+    auto sock = get_socket(endpoint);
+    if (!sock) { return false; }
+    rpc_msg_phone_owned_reset_req req { run_id };
+    rpc_msg_jupiter_rsp rsp {};
+    return send_rpc_cmd(sock, RPC_CMD_PHONE_OWNED_RESET,
+                        &req, sizeof(req), &rsp, sizeof(rsp)) && rsp.ok;
+}
+
+} // namespace ggml_jupiter_phone_owned
+
 // RPC server-side implementation
 class rpc_server {
 public:
@@ -1996,6 +2201,9 @@ public:
     bool jupiter_event_record(const rpc_msg_jupiter_event_req & request);
     bool jupiter_event_wait(const rpc_msg_jupiter_event_req & request, rpc_msg_jupiter_rsp & response);
     bool jupiter_sync(rpc_msg_jupiter_rsp & response);
+    bool phone_owned_prepare(const rpc_msg_phone_owned_prepare_req & req, rpc_msg_phone_owned_prepare_rsp & rsp);
+    bool phone_owned_run(const std::vector<uint8_t> & request, std::vector<uint8_t> & response);
+    bool phone_owned_reset(const rpc_msg_phone_owned_reset_req & req);
     struct stored_graph {
         std::vector<uint8_t>   buffer;
         ggml_cgraph          * graph;
@@ -2032,6 +2240,18 @@ private:
     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
     //新加的
     ggml_rpc_local_tensor_source local_tensor_source {};
+
+
+    // One opt-in native Phone-owned run at a time. Legacy RPC Graphs remain
+    // untouched. The pilot does not bind the production decode KV cache.
+    struct phone_owned_chain {
+        ggml_phone_owned::region_plan plan {};
+        std::vector<uint32_t> devices;
+        uint32_t next_chunk = 0;
+    };
+    std::mutex phone_owned_mutex;
+    std::vector<std::unique_ptr<ggml_phone_npu_serial::full_region_executor>> phone_owned_executors;
+    std::map<std::pair<uint64_t, uint32_t>, phone_owned_chain> phone_owned_chains;
 
     std::mutex jupiter_event_mutex;
     std::condition_variable jupiter_event_cv;
@@ -2667,6 +2887,188 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
     }
     result->view_offs = tensor->view_offs;
     return result;
+}
+
+
+bool rpc_server::phone_owned_prepare(
+        const rpc_msg_phone_owned_prepare_req & request,
+        rpc_msg_phone_owned_prepare_rsp & response) {
+    response = {};
+    ggml_phone_owned::region_plan plan {};
+    jupiter_phone_owned_copy_plan(plan, request.plan);
+    const char * why = "NONE";
+    const size_t count = ggml_phone_owned::layer_count(plan);
+    if (!ggml_phone_owned::validate(plan, why) || count == 0 || count > 64 ||
+            local_tensor_source.get_info == nullptr ||
+            local_tensor_source.read == nullptr) {
+        GGML_LOG_ERROR("[JUPITER_PHONE_OWNED] PREPARE_REJECT reason=%s\n",
+            why ? why : "LOCAL_GGUF_SOURCE_UNAVAILABLE");
+        return false;
+    }
+    std::vector<uint32_t> mapping(request.layer_devices,
+                                  request.layer_devices + count);
+    for (uint32_t device : mapping) {
+        if (device >= backends.size()) {
+            GGML_LOG_ERROR("[JUPITER_PHONE_OWNED] PREPARE_REJECT reason=DEVICE_OUT_OF_RANGE\n");
+            return false;
+        }
+    }
+    std::lock_guard<std::mutex> lock(phone_owned_mutex);
+    const auto key = std::make_pair(plan.run_id, plan.region);
+    const auto previous = phone_owned_chains.find(key);
+    if (previous != phone_owned_chains.end()) {
+        response.ok = ggml_phone_owned::equal(previous->second.plan, plan) &&
+                      previous->second.devices == mapping ? 1 : 0;
+        response.graphs = response.ok ?
+            uint32_t(count * ggml_phone_owned::chunk_count(plan)) : 0;
+        return response.ok;
+    }
+    // Fail closed instead of dropping another run's private KV unexpectedly.
+    if (!phone_owned_chains.empty()) {
+        GGML_LOG_ERROR("[JUPITER_PHONE_OWNED] PREPARE_REJECT reason=ACTIVE_RUN_RESET_REQUIRED\n");
+        return false;
+    }
+    if (phone_owned_executors.size() < backends.size()) {
+        phone_owned_executors.resize(backends.size());
+    }
+    const int64_t begin_us = ggml_time_us();
+    for (uint32_t offset = 0; offset < count; ++offset) {
+        const uint32_t device = mapping[offset];
+        if (!phone_owned_executors[device]) {
+            phone_owned_executors[device] =
+                std::make_unique<ggml_phone_npu_serial::full_region_executor>(
+                    backends[device]);
+        }
+        auto & owner = *phone_owned_executors[device];
+        auto child = ggml_phone_owned::single_layer_plan(plan, offset);
+        ggml_phone_npu_serial::full_region_executor::model_load_stats load {};
+        std::string reason;
+        const int64_t load_begin_us = ggml_time_us();
+        if (!owner.load_model_layer(
+                local_tensor_source, child.layer, reason, load)) {
+            GGML_LOG_ERROR("[JUPITER_PHONE_OWNED] PREPARE_REJECT"
+                           " layer=%u device=%u reason=%s\n",
+                           child.layer, device, reason.c_str());
+            return false;
+        }
+        response.model_load_ms += (ggml_time_us() - load_begin_us) / 1000.0;
+
+        ggml_phone_npu_serial::full_region_executor::local_htp_prepare_stats st {};
+        if (!owner.prepare_owned_htp_graphs(child, reason, st)) {
+            GGML_LOG_ERROR("[JUPITER_PHONE_OWNED] PREPARE_REJECT"
+                           " layer=%u device=%u reason=%s\n",
+                           child.layer, device, reason.c_str());
+            return false;
+        }
+        response.graphs += st.chunks;
+        response.build_ms += st.cpu_build_ms;
+        response.buffer_alloc_ms += st.buffer_alloc_ms;
+        response.precompile_ms += st.precompile_ms;
+        GGML_LOG_INFO("[JUPITER_PHONE_OWNED] PREPARE_LAYER"
+                      " layer=%u device=%u graphs=%u build_ms=%.3f"
+                      " buffer_ms=%.3f precompile_ms=%.3f\n",
+                      child.layer, device, st.chunks, st.cpu_build_ms,
+                      st.buffer_alloc_ms, st.precompile_ms);
+    }
+    phone_owned_chain chain {};
+    chain.plan = plan;
+    chain.devices = std::move(mapping);
+    phone_owned_chains.emplace(key, std::move(chain));
+    response.ok = 1;
+    response.wall_ms = (ggml_time_us() - begin_us) / 1000.0;
+    GGML_LOG_INFO("[JUPITER_PHONE_OWNED] PREPARE_READY run=%" PRIu64
+                  " region=%u layers=%zu graphs=%u wall_ms=%.3f\n",
+                  plan.run_id, plan.region, count, response.graphs,
+                  response.wall_ms);
+    return true;
+}
+
+bool rpc_server::phone_owned_run(
+        const std::vector<uint8_t> & request,
+        std::vector<uint8_t> & response) {
+    response.clear();
+    if (request.size() < sizeof(rpc_msg_phone_owned_run_req)) { return false; }
+    rpc_msg_phone_owned_run_req req {};
+    std::memcpy(&req, request.data(), sizeof(req));
+    if (req.input_floats == 0 ||
+            req.input_floats > ggml_phone_owned::k_max_activation_bytes / sizeof(float) ||
+            request.size() != sizeof(req) + size_t(req.input_floats) * sizeof(float)) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(phone_owned_mutex);
+    const auto it = phone_owned_chains.find({req.run_id, req.region});
+    if (it == phone_owned_chains.end()) { return false; }
+    auto & chain = it->second;
+    const auto & plan = chain.plan;
+    const uint32_t count = uint32_t(ggml_phone_owned::layer_count(plan));
+    if (req.chunk != chain.next_chunk ||
+            req.chunk >= ggml_phone_owned::chunk_count(plan)) {
+        return false;
+    }
+    const uint32_t tokens = std::min<uint32_t>(
+        plan.chunk_tokens, plan.total_tokens - req.chunk * plan.chunk_tokens);
+    if (uint64_t(tokens) * plan.n_embd != req.input_floats) {
+        return false;
+    }
+    const int64_t begin_us = ggml_time_us();
+    std::vector<float> activation(req.input_floats);
+    std::memcpy(activation.data(),
+                request.data() + sizeof(req),
+                req.input_floats * sizeof(float));
+    rpc_msg_phone_owned_run_rsp rsp {};
+    rsp.layers = count;
+    rsp.tokens = tokens;
+    for (uint32_t offset = 0; offset < count; ++offset) {
+        const uint32_t device = chain.devices[offset];
+        auto & owner = *phone_owned_executors[device];
+        const uint32_t internal_region =
+            ggml_phone_owned::internal_layer_region(plan, offset);
+        ggml_phone_npu_serial::full_region_executor::local_only_profile st {};
+        std::vector<float> next;
+        std::string reason;
+        if (!owner.run_native_prefill_chunk(
+                req.run_id, internal_region, req.chunk,
+                activation.data(), activation.size(), next, reason, st)) {
+            GGML_LOG_ERROR("[JUPITER_PHONE_OWNED] RUN_REJECT"
+                           " layer=%u chunk=%u device=%u reason=%s\n",
+                           plan.layer + offset, req.chunk, device,
+                           reason.c_str());
+            return false;
+        }
+        rsp.upload_ms += st.input_upload_ms;
+        rsp.compute_ms += st.htp_compute_ms;
+        rsp.output_copy_ms += st.output_copy_ms;
+        activation.swap(next);
+    }
+    rsp.ok = 1;
+    rsp.output_floats = uint32_t(activation.size());
+    rsp.wall_ms = (ggml_time_us() - begin_us) / 1000.0;
+    response.resize(sizeof(rsp) + activation.size() * sizeof(float));
+    std::memcpy(response.data(), &rsp, sizeof(rsp));
+    std::memcpy(response.data() + sizeof(rsp),
+                activation.data(), activation.size() * sizeof(float));
+    ++chain.next_chunk;
+    GGML_LOG_INFO("[JUPITER_PHONE_OWNED] RUN_DONE run=%" PRIu64
+                  " region=%u chunk=%u tokens=%u layers=%u compute_ms=%.3f"
+                  " wall_ms=%.3f status=PASS\n",
+                  req.run_id, req.region, req.chunk, tokens, count,
+                  rsp.compute_ms, rsp.wall_ms);
+    return true;
+}
+
+bool rpc_server::phone_owned_reset(const rpc_msg_phone_owned_reset_req & req) {
+    std::lock_guard<std::mutex> lock(phone_owned_mutex);
+    if (phone_owned_chains.empty() ||
+            phone_owned_chains.begin()->first.first != req.run_id) {
+        return false;
+    }
+    for (auto & owner : phone_owned_executors) {
+        if (owner) { owner->release_owned_htp_graphs(); }
+    }
+    phone_owned_chains.clear();
+    GGML_LOG_INFO("[JUPITER_PHONE_OWNED] RESET run=%" PRIu64 " status=PASS\n",
+                  req.run_id);
+    return true;
 }
 
 bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
@@ -3778,6 +4180,29 @@ static void rpc_serve_client(rpc_server & server,
                 if (!server.graph_compute(input)) {
                     return;
                 }
+                break;
+            }
+            case RPC_CMD_PHONE_OWNED_PREPARE: {
+                rpc_msg_phone_owned_prepare_req req {};
+                if (!recv_msg(sock, &req, sizeof(req))) { return; }
+                rpc_msg_phone_owned_prepare_rsp rsp {};
+                server.phone_owned_prepare(req, rsp);
+                if (!send_msg(sock, &rsp, sizeof(rsp))) { return; }
+                break;
+            }
+            case RPC_CMD_PHONE_OWNED_RUN: {
+                std::vector<uint8_t> req, rsp;
+                if (!recv_msg(sock, req)) { return; }
+                if (!server.phone_owned_run(req, rsp)) { return; }
+                if (!send_msg(sock, rsp.data(), rsp.size())) { return; }
+                break;
+            }
+            case RPC_CMD_PHONE_OWNED_RESET: {
+                rpc_msg_phone_owned_reset_req req {};
+                if (!recv_msg(sock, &req, sizeof(req))) { return; }
+                rpc_msg_jupiter_rsp rsp {};
+                rsp.ok = server.phone_owned_reset(req) ? 1 : 0;
+                if (!send_msg(sock, &rsp, sizeof(rsp))) { return; }
                 break;
             }
             case RPC_CMD_GRAPH_REGISTER: {
