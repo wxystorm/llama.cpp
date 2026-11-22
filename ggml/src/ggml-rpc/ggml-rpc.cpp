@@ -2906,7 +2906,8 @@ bool rpc_server::phone_owned_prepare(
     jupiter_phone_owned_copy_plan(plan, request.plan);
     const char * why = "NONE";
     const size_t count = ggml_phone_owned::layer_count(plan);
-    if (!ggml_phone_owned::validate(plan, why) || count == 0 || count > 64 ||
+    if (!ggml_phone_owned::validate(plan, why) || count == 0 || count > 8 ||
+            ggml_phone_owned::chunk_count(plan) > 16 ||
             local_tensor_source.get_info == nullptr ||
             local_tensor_source.read == nullptr) {
         GGML_LOG_ERROR("[JUPITER_PHONE_OWNED] PREPARE_REJECT reason=%s\n",
@@ -2939,6 +2940,12 @@ bool rpc_server::phone_owned_prepare(
     if (phone_owned_executors.size() < backends.size()) {
         phone_owned_executors.resize(backends.size());
     }
+    const auto rollback = [&]() {
+        for (auto & owner : phone_owned_executors) {
+            if (owner) { owner->release_owned_htp_graphs(); }
+        }
+        response = {};
+    };
     const int64_t begin_us = ggml_time_us();
     for (uint32_t offset = 0; offset < count; ++offset) {
         const uint32_t device = mapping[offset];
@@ -2957,6 +2964,7 @@ bool rpc_server::phone_owned_prepare(
             GGML_LOG_ERROR("[JUPITER_PHONE_OWNED] PREPARE_REJECT"
                            " layer=%u device=%u reason=%s\n",
                            child.layer, device, reason.c_str());
+            rollback();
             return false;
         }
         response.model_load_ms += (ggml_time_us() - load_begin_us) / 1000.0;
@@ -2966,6 +2974,7 @@ bool rpc_server::phone_owned_prepare(
             GGML_LOG_ERROR("[JUPITER_PHONE_OWNED] PREPARE_REJECT"
                            " layer=%u device=%u reason=%s\n",
                            child.layer, device, reason.c_str());
+            rollback();
             return false;
         }
         response.graphs += st.chunks;
