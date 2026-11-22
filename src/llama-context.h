@@ -16,6 +16,7 @@
 
 struct llama_model;
 class llama_batch_allocr;
+struct jupiter_phone_owned_native_state;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -345,6 +346,9 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+
+    // Opt-in full-Prefill Phone-owned HTP suffix; never enabled for Decode.
+    std::unique_ptr<jupiter_phone_owned_native_state> jupiter_phone_native;
 
     bool sched_need_reserve = true;
 
