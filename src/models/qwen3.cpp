@@ -59,6 +59,12 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
+    const bool phone_native = params.jupiter_phone_owned_op != nullptr;
+    if (phone_native) {
+        GGML_ASSERT(n_layer == 40 && n_embd == 5120 &&
+                    "Phone-owned Prefill supports only Qwen3-14B");
+    }
+
     inpL = build_inp_embd(model.tok_embd);
 
     // inp_pos - contains the positions
@@ -68,7 +74,7 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = 0; il < (phone_native ? 32 : n_layer); ++il) {
         res->t_layer_inp[il] = inpL;
 
         ggml_tensor * inpSA = inpL;
@@ -141,6 +147,25 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
         inpL = cur;
     }
     cur = inpL;
+
+    if (phone_native) {
+        // The CPU custom node receives the exact output of Layer 31. It
+        // executes Layers 32..39 on Phone-owned HTP Graphs and returns the
+        // full hidden state. No remote GGML RPC tensor/graph is allocated.
+        GGML_ASSERT(cur->type == GGML_TYPE_F32);
+        cur = ggml_map_custom1(
+            ctx0, cur, params.jupiter_phone_owned_op, 1,
+            params.jupiter_phone_owned_user);
+        cb(cur, "phone_owned_hidden", -1);
+        ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
+
+        // The old Qwen3 graph gathers only requested outputs during its last
+        // layer. Our native bridge needs all tokens for KV, so gather AFTER
+        // the phone has executed the entire Chunk instead.
+        if (inp_out_ids) {
+            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        }
+    }
 
     cur = build_norm(cur,
             model.output_norm, NULL,
