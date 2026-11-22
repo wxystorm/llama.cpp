@@ -1282,6 +1282,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     const bool jupiter_prefill = llama_jupiter::enabled();
+    const char * native_env = std::getenv("LLAMA_JUPITER_PHONE_OWNED_NATIVE");
+    const bool jupiter_phone_native = jupiter_prefill && native_env != nullptr &&
+                                     std::atoi(native_env) != 0;
     const bool jupiter_pc_layers_env = std::getenv("LLAMA_JUPITER_PC_LAYERS") != nullptr;
     const bool jupiter_plan_file = std::getenv("LLAMA_JUPITER_PLAN_FILE") != nullptr;
     const int jupiter_pc_layers = llama_jupiter::model_pc_layers(n_layer_all / 2);
@@ -1298,6 +1301,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     uint64_t jupiter_htp_global_budget_bytes = 0;
 
     if (jupiter_prefill) {
+        if (jupiter_phone_native &&
+                (n_layer_all != 40 || hparams.n_embd != 5120 ||
+                 jupiter_pc_layers != 32 || jupiter_cpu_layers != 16)) {
+            throw std::runtime_error(
+                "Jupiter native Phone-owned full Prefill pilot requires Qwen3-14B,"
+                " PC layers 0..31, CPU layers 0..15 and Phone layers 32..39");
+        }
         if (split_mode != LLAMA_SPLIT_MODE_LAYER) {
             throw std::runtime_error("LLAMA_JUPITER_PREFILL requires --split-mode layer");
         }
@@ -1437,9 +1447,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                         weights[index - jupiter_pc_layers] += padded_alloc(weight.tensor);
                         counted_tensors++;
                     }
-                } else if (name.rfind("output.", 0) == 0 ||
-                           name.rfind("output_norm.", 0) == 0 ||
-                           (!has_output && name == "token_embd.weight")) {
+                } else if (!jupiter_phone_native &&
+                           (name.rfind("output.", 0) == 0 ||
+                            name.rfind("output_norm.", 0) == 0 ||
+                            (!has_output && name == "token_embd.weight"))) {
                     output_bytes += padded_alloc(weight.tensor);
                     counted_tensors++;
                 }
@@ -1616,6 +1627,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
 
         if (jupiter_prefill) {
+            if (jupiter_phone_native && il >= jupiter_pc_layers) {
+                // The full PC graph is cut after layer 31. No Phone HTP
+                // weight/activation tensor may be allocated by PC GGML RPC.
+                // Keep the unused suffix model tensors in host memory;
+                // the Phone-owned server loads its own HTP copies locally.
+                // Keep the Final RMSNorm / LM Head on PC CUDA.
+                const bool final_head = il == n_layer_all;
+                LLAMA_LOG_INFO(
+                    "[JUPITER_PHONE_OWNED] model_placement layer=%d device=%s"
+                    " role=%s\n", il,
+                    ggml_backend_dev_name(final_head ? jupiter_pc_dev : cpu_dev),
+                    final_head ? "PC_HEAD" : "PHONE_WEIGHT_PLACEHOLDER_CPU");
+                return final_head ?
+                    llama_model::impl::layer_dev{
+                        jupiter_pc_dev, &pimpl->gpu_buft_list.at(jupiter_pc_dev)} :
+                    llama_model::impl::layer_dev{
+                        cpu_dev, &pimpl->cpu_buft_list};
+            }
             const bool on_cpu = il < jupiter_cpu_layers;
             const bool on_pc_gpu = !on_cpu && il < jupiter_pc_layers;
             size_t session_index = 0;
