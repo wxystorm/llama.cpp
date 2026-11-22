@@ -1178,6 +1178,94 @@ public:
         return true;
     }
 
+    // Jupiter pilot: execute a native Phone-owned prefill layer without a
+    // PC-built GGML graph or canonical decode KV binding. The returned tensor
+    // is the final hidden state for this layer, NOT logits. This is limited
+    // to fresh monotonic prefill and is deliberately separate from the
+    // production decode-KV handoff in run_owned_only_chunk().
+    bool run_native_prefill_chunk(uint64_t run_id, uint32_t region,
+                                  uint32_t chunk, const float * input,
+                                  size_t input_floats,
+                                  std::vector<float> & output,
+                                  std::string & reason,
+                                  local_only_profile & profile) {
+        reason.clear();
+        profile = {};
+        output.clear();
+        const auto kit = owned_kv_.find({run_id, region});
+        const auto git = owned_graphs_.find(
+            std::make_tuple(run_id, region, chunk));
+        if (kit == owned_kv_.end() || git == owned_graphs_.end()) {
+            reason = "PHONE_NATIVE_GRAPH_NOT_PREPARED";
+            return false;
+        }
+        auto & state = *kit->second;
+        const auto & plan = state.plan;
+        const auto & graph = git->second->built;
+        const uint32_t token_begin = chunk * plan.chunk_tokens;
+        const uint32_t tokens = std::min<uint32_t>(
+            plan.chunk_tokens, plan.total_tokens - token_begin);
+        const size_t expected_floats = size_t(tokens) * plan.n_embd;
+        if (chunk >= ggml_phone_owned::chunk_count(plan) ||
+            state.next_chunk != chunk ||
+            graph.token_begin != token_begin || graph.tokens != tokens ||
+            graph.cache_k != state.k || graph.cache_v != state.v ||
+            input == nullptr || input_floats != expected_floats ||
+            !graph.input || !graph.output ||
+            !graph.input->buffer || !graph.output->buffer ||
+            graph.input->type != GGML_TYPE_F32 ||
+            graph.output->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(graph.input) ||
+            !ggml_is_contiguous(graph.output) ||
+            ggml_nbytes(graph.input) != expected_floats * sizeof(float) ||
+            ggml_nbytes(graph.output) != expected_floats * sizeof(float)) {
+            reason = "PHONE_NATIVE_CHUNK_SHAPE_OR_FIFO";
+            return false;
+        }
+        for (size_t i = 0; i < input_floats; ++i) {
+            if (!std::isfinite(input[i])) {
+                reason = "PHONE_NATIVE_NONFINITE_INPUT";
+                return false;
+            }
+        }
+        const int64_t upload_begin = ggml_time_us();
+        if (state.scratch_buffer &&
+                !refresh_owned_chunk_side_inputs(plan, chunk, graph, reason)) {
+            return false;
+        }
+        ggml_backend_tensor_set(
+            graph.input, input, 0, expected_floats * sizeof(float));
+        ggml_backend_synchronize(backend_);
+        profile.input_upload_ms = (ggml_time_us() - upload_begin) / 1000.0;
+
+        const int64_t compute_begin = ggml_time_us();
+        const ggml_status status =
+            ggml_backend_graph_compute(backend_, graph.graph);
+        ggml_backend_synchronize(backend_);
+        profile.htp_compute_ms = (ggml_time_us() - compute_begin) / 1000.0;
+        if (status != GGML_STATUS_SUCCESS) {
+            reason = "PHONE_NATIVE_HTP_COMPUTE_FAILED";
+            return false;
+        }
+
+        const int64_t read_begin = ggml_time_us();
+        output.resize(expected_floats);
+        ggml_backend_tensor_get(
+            graph.output, output.data(), 0, output.size() * sizeof(float));
+        profile.output_copy_ms = (ggml_time_us() - read_begin) / 1000.0;
+        for (float value : output) {
+            if (!std::isfinite(value)) {
+                output.clear();
+                reason = "PHONE_NATIVE_NONFINITE_OUTPUT";
+                return false;
+            }
+        }
+        profile.tokens = tokens;
+        profile.layer = plan.layer;
+        ++state.next_chunk;
+        return true;
+    }
+
     struct local_exec_profile {
         double input_read_ms = 0.0;
         double input_upload_ms = 0.0;
