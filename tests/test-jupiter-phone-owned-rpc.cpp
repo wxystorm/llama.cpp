@@ -51,6 +51,12 @@ int main(int argc, char ** argv) {
     if (argc == 4 && std::string(argv[3]) != "--run") {
         return 2;
     }
+    // Refuse older server protocol before sending native opcodes.
+#ifdef _WIN32
+    _putenv_s("LLAMA_JUPITER_PHONE_OWNED_NATIVE", "1");
+#else
+    setenv("LLAMA_JUPITER_PHONE_OWNED_NATIVE", "1", 1);
+#endif
     const std::string endpoint(argv[1]);
     const bool execute = argc == 4;
     const int sessions = std::atoi(argv[2]);
