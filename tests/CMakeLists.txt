@@ -301,6 +301,16 @@ target_link_libraries(${TEST_TARGET} PRIVATE llama)
 
 llama_build_and_test(test-alloc.cpp)
 llama_build_and_test(test-jupiter-htp-placement.cpp)
+
+# Model-free regression tests imported from the Phone-owned / Graphless
+# HTP implementation. They do not require a phone or a GGUF model.
+llama_build(test-phone-owned-execution-plan.cpp)
+llama_test(test-phone-owned-execution-plan LABEL jupiter-phone-owned)
+llama_build(test-phone-qwen3-local-builder.cpp)
+llama_test(test-phone-qwen3-local-builder LABEL jupiter-phone-owned)
+llama_build(test-phone-qwen3-local-parity.cpp)
+llama_test(test-phone-qwen3-local-parity LABEL jupiter-phone-owned)
+
 target_include_directories(test-alloc PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 
 llama_build(test-export-graph-ops.cpp)
