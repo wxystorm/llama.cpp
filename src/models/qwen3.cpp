@@ -153,6 +153,8 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
         // executes Layers 32..39 on Phone-owned HTP Graphs and returns the
         // full hidden state. No remote GGML RPC tensor/graph is allocated.
         GGML_ASSERT(cur->type == GGML_TYPE_F32);
+        // The native RPC wire is a dense F32 [n_embd, n_tokens] tensor.
+        cur = ggml_cont(ctx0, cur);
         cur = ggml_map_custom1(
             ctx0, cur, params.jupiter_phone_owned_op, 1,
             params.jupiter_phone_owned_user);
