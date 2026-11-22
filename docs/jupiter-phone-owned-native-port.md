@@ -1,113 +1,157 @@
-# Jupiter Phone-owned Native HTP Graph Port (experimental)
+# Jupiter: Phone-owned Native Qwen3-14B Full Prefill (experimental)
 
-Source: `feat/phone-plan-overlap-multi-htp-20261109`; target base:
-`feat/jupiter-htp-direct-rpc-20261112`.
+Base: `feat/jupiter-htp-direct-rpc-20261112`  
+Ported from: `feat/phone-plan-overlap-multi-htp-20261109`  
+Working branch: `feat/jupiter-phone-owned-graphless-20261122`
 
 ## What is implemented
 
-- The **original** immutable `region_plan`, Qwen3 local graph builder,
-  output-parity helpers and Phone-owned HTP serial executor are imported.
-- The phone's HTP executor can load immutable Qwen3 layer weights from its
-  **local GGUF tensor source**, construct/allocate/compile native layer graphs
-  and retain a private persistent F16 KV for each layer.
-- New opt-in RPC opcodes:
-  - `PHONE_OWNED_PREPARE`: one Plan + one explicit device ID per layer;
-    prepares all layer/chunk Graphs on the phone, with preparation timings.
-  - `PHONE_OWNED_RUN`: sends one F32 hidden state
-    `[n_embd, n_tokens]`, computes every configured layer **on the phone**
-    in Transformer order, and returns the last F32 hidden state.
-  - `PHONE_OWNED_RESET`: drops native graphs/private KV for the active run.
-- Client-side C++ entry points:
-  `ggml_jupiter_phone_owned::{prepare,run_chunk,reset}` in
-  `ggml/src/ggml-rpc/phone-owned-jupiter-api.h`.
-- Three source-origin, model-free regression tests and a manual S1/S4
-  native-graph prepare/run smoke tool.
-- RPC version **4.0.5**: rebuild both the PC and phone RPC binaries for native
-  mode. Legacy RPC execution remains the default and does not issue the new
-  commands.
+A complete **single fresh Prefill forward pass** is wired into the **real**
+`llama-cli` / `llama_context::decode()` path, producing the final PC
+Qwen3 logits for the first token:
 
-## Deliberate limitations / NOT yet implemented
+1. PC CPU runs Transformer layers **0–15**.
+2. PC CUDA runs Transformer layers **16–31**.
+3. One GGML CPU custom operation transfers the exact F32 layer-31 hidden
+   state to Phone and invokes `PHONE_OWNED_RUN`.
+4. Phone-owned native HTP graphs run layers **32–39** in order, retaining
+   per-layer private F16 KV across the Prompt chunks.
+5. The last hidden state comes back to PC, which computes the original
+   `output_norm` and `output.weight` LM Head on CUDA. The returned logits
+   are consumed by the regular llama.cpp sampling code.
 
-**This is the native Phone-owned RPC execution bridge, not an end-to-end
-`llama-cli` replacement or a demonstrated Prefill speedup.**
+No GGML RPC Graph for layers 32–39 exists in the PC Scheduler during native
+mode: the HTP suffix weights are instead loaded from Phone's local GGUF.
+Unused PC model copies of those suffix weights are kept on CPU memory,
+not allocated through RPC/HTP; final LM Head weights are placed on PC CUDA.
 
-- Normal `llama-cli` still builds the complete PC/RPC Graph and executes
-  the original Scheduler. Its `graph_alloc_ms` will not change until
-  the CPU/CUDA Graph is cut at the layer-31 boundary and a delegate to
-  `run_chunk` is inserted in the main inference path.
-- The native endpoint currently returns **layer-39 hidden states**, not
-  logits. The final output norm/head and generation/decode must be implemented
-  or delegated to PC before enabling an end-to-end cutover.
-- The original Plan supports only fresh monotonic Prefill (position base 0,
-  F16 KV, no prefix reuse or KV shifting). Private Phone-owned KV is **not**
-  synchronized to the legacy decode cache in this pilot.
-- Synthetic-input smoke tests measure feasibility, not model correctness.
-  Real same-boundary-activation comparisons against the unchanged legacy
-  path, KV parity, logits parity and HTP memory-budget checks are mandatory
-  before performance claims or enabling native mode in normal benchmarks.
-- The first Phone-owned bridge is exclusive: one active run per phone RPC
-  server. Mixing legacy compute and Phone-owned execution concurrently
-  on the same HTP sessions is unsupported.
-- Local GGUF access must be provided to the phone RPC server. A server
-  without `local_tensor_source.get_info/read` fails closed during prepare.
+The native bridge is dynamically resolved via the GGML RPC backend registry.
+It can be disabled by unsetting `LLAMA_JUPITER_PHONE_OWNED_NATIVE` (or
+setting it to `0`), leaving the legacy Jupiter path unchanged.
 
-## Model-free build and tests
+### Limitations (important)
 
-On a Linux PC (no phone, CUDA or Hexagon required for static model-free tests):
+**Code integrated and committed, but full Prefill runtime correctness and
+performance have NOT yet been verified on physical PC/Phone.**
 
-```bash
-cmake -S . -B build-phone-owned -DGGML_RPC=ON -DGGML_CUDA=OFF -DLLAMA_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build build-phone-owned --parallel 4 --target ggml-rpc-server test-jupiter-phone-owned-rpc test-phone-owned-execution-plan test-phone-qwen3-local-builder test-phone-qwen3-local-parity
-ctest --test-dir build-phone-owned --output-on-failure -R 'test-phone-owned-execution-plan|test-phone-qwen3-local-builder|test-phone-qwen3-local-parity'
-```
+- Strict pilot: dense Qwen3-14B, 40 layers, hidden size 5120, 40 Q heads,
+  8 KV heads, head dimension 128, context exactly **512**, Flash Attention
+  enabled, fresh 0-based contiguous single-sequence Prompt, 1 logits output.
+- HTP session count **1 or 4**. S4 assignment: L32–33/HTP0,
+  L34–35/HTP1, L36–37/HTP2, L38–39/HTP3.
+- The native Phone KV is not yet copied into the legacy llama.cpp Decode
+  cache. **Generate only one token (`-n 1`)**; later Decode is intentionally
+  rejected, rather than silently producing incorrect tokens.
+- The PC still allocates CPU/CUDA Scheduler graphs for the first 32 layers
+  and output head; only the **remote HTP suffix** is removed.
+- Preparation/HTP weight load and HTP graph compilation happen during the
+  first native Prefill request in this prototype; reported prompt-eval
+  latency includes this cost. Moving prepare to model load is a later step.
+- Real logits output doesn't imply numerical parity. Compare with baseline
+  using the supplied binary logits A/B runner before reporting speedup.
+- No async overlap, prefix reuse, KV shift, additional sequences, LoRA,
+  or automatic mixed-context decoding in the pilot.
 
-On Windows, use your existing `build-jupiter` configuration if it enables
-`GGML_RPC` and `LLAMA_BUILD_TESTS`, otherwise reconfigure.
-
-## HTP smoke
-
-Rebuild and restart the Phone RPC server from this branch; it needs its local
-Qwen3-14B GGUF tensor source and HTP0 for S1, HTP0..HTP3 for S4.
-The S1/S4 mapping matches the earlier 8-layer layout:
-`S1: 0,0,0,0,0,0,0,0`;
-`S4: 0,0,1,1,2,2,3,3`.
-
-The smoke uses a 175-token Plan split into chunks **88 + 87**, layers 32–39,
-fresh `n_kv=512` and F16 KV. It **does not** measure a language-model response.
+## Build: Windows PC
 
 ```powershell
-# prepare only: build and precompile Phone-owned Graphs
-.\build-jupiter\bin\Release\test-jupiter-phone-owned-rpc.exe 10.71.109.52:10140 1
+cd E:\llama\llama-jupiter
+git fetch origin
+git switch feat/jupiter-phone-owned-graphless-20261122
+git pull --ff-only
 
-# also compute the two chunks from finite synthetic F32 hidden inputs
-.\build-jupiter\bin\Release\test-jupiter-phone-owned-rpc.exe 10.71.109.52:10140 1 --run
-
-# 4 sessions (requires all four HTP devices and enough session memory)
-.\build-jupiter\bin\Release\test-jupiter-phone-owned-rpc.exe 10.71.109.52:10140 4 --run
+cmake --build build-phone-owned --config Release --target llama-cli ggml-rpc --parallel 8
+cmake --build build-phone-owned --config Release --target test-phone-owned-execution-plan test-phone-qwen3-local-builder test-phone-qwen3-local-parity --parallel 8
+ctest --test-dir build-phone-owned -C Release --output-on-failure -R "test-phone-owned-execution-plan|test-phone-qwen3-local-builder|test-phone-qwen3-local-parity"
 ```
 
-The tool automatically sets `LLAMA_JUPITER_PHONE_OWNED_NATIVE=1`
-so the HELLO handshake rejects phone RPC servers older than 4.0.5.
-If the phone lacks a local GGUF loader or native fixed-graph precompile
-entry point, look for `[JUPITER_PHONE_OWNED] PREPARE_REJECT` in the
-phone log. There must be no silent fallback to old RPC Graph execution.
+The legacy standalone native RPC smoke tool is still available as
+`test-jupiter-phone-owned-rpc`, but **it is not the full-Prefill test**.
 
-Expected log markers:
+## Build and run: Phone Termux
 
-- `[JUPITER_PHONE_OWNED] PREPARE_LAYER`
-- `[JUPITER_PHONE_OWNED] PREPARE_READY`
-- `[JUPITER_PHONE_OWNED] RUN_DONE`
-- `[JUPITER_PHONE_OWNED] RESET`
+Use the same experimental branch and the original working Android/HTP
+toolchain and library paths. For example, assuming `build-htp` is your
+previously configured Android build:
 
-## Required next integration step
+```bash
+cd ~/llama-jupiter
+git fetch origin
+git switch feat/jupiter-phone-owned-graphless-20261122
+git pull --ff-only
 
-1. Gate the complete CPU/CUDA-local Graph at the layer-31/32 boundary.
-2. Feed the boundary activation for each Chunk into the registered Phone-owned
-   Region, without PC Scheduler RPC-layer split/alloc/INIT_TENSOR.
-3. Restore final norm/head on PC or implement the phone's final head,
-   and integrate the post-prefill decode KV state.
-4. Compare outputs against the unmodified legacy path before evaluating
-   TTFT; isolate prepare-at-load time from request-time execution.
+cmake --build build-htp --target ggml-rpc-server -j 4
 
-**Do not report the previous 1-second `alloc_retry_ms` as eliminated until
-the whole-Graph PC Scheduler allocation is actually bypassed.**
+export GGML_HEXAGON_NDEV=1
+export LD_LIBRARY_PATH="$HOME/phone-stream-htp/lib:${LD_LIBRARY_PATH:-}"
+export ADSP_LIBRARY_PATH="$HOME/phone-stream-htp/lib:${ADSP_LIBRARY_PATH:-}"
+export LD_PRELOAD=/system/lib64/liblzma.so
+
+# Replace these with actual build and local GGUF paths:
+./build-htp/bin/ggml-rpc-server \
+  -H 0.0.0.0 -p 10140 -d HTP0 \
+  -m "$HOME/models/Qwen3-14B-Q4_K_M.gguf"
+```
+
+The RPC server must say `v4.0.5` and have direct access to the local
+Qwen3-14B GGUF via `-m`. For S4, restart with
+`GGML_HEXAGON_NDEV=4` and `-d HTP0,HTP1,HTP2,HTP3`.
+Use a trusted private PC–Phone network; do not expose RPC to the internet.
+
+## Run: complete Prompt Prefill + logits A/B
+
+From the PC PowerShell:
+
+```powershell
+cd E:\llama\llama-jupiter
+
+python .\tools\jupiter\run_phone_owned_full_prefill.py `
+  --exe ".\build-phone-owned\bin\Release\llama-cli.exe" `
+  --model "E:\llama\models\Qwen3-14B-Q4_K_M.gguf" `
+  --rpc "10.71.109.52:10140" `
+  --prompt-file "E:\llama\datasets\sharegpt\sharegpt40\prompt_128_01.txt" `
+  --sessions 1 `
+  --target-tokens 175 `
+  --chunks 88,87 `
+  --mode both `
+  --out-dir ".\phone-owned-prefill-s1"
+```
+
+This runs **legacy first** and **native second**, using the same real
+Prompt and two-Chunk plan. It disables CLI warmup and uses `-n 1`.
+Its `results.json` contains the prompt-eval time, binary F32 logits
+paths, exact Top-1 agreement, max-absolute error, RMSE, relative RMSE and
+cosine. A numeric mismatch is reported, not silently labeled PASS.
+
+For S4, restart Phone RPC with four HTP devices, then use `--sessions 4`
+and an isolated output directory.
+
+### Expected log milestones
+
+```text
+[JUPITER_PHONE_OWNED] model_placement layer=32 ... role=PHONE_WEIGHT_PLACEHOLDER_CPU
+[JUPITER_PHONE_OWNED] model_placement layer=40 ... role=PC_HEAD
+[JUPITER_PHONE_OWNED_PREFILL] phase=PREPARE_BEGIN ...
+[JUPITER_PHONE_OWNED_PREFILL] phase=PREPARE_DONE ...
+[JUPITER_PHONE_OWNED_PREFILL] phase=CHUNK_DONE chunk=0 tokens=88 ...
+[JUPITER_PHONE_OWNED_PREFILL] phase=CHUNK_DONE chunk=1 tokens=87 ...
+[JUPITER_PHONE_OWNED_PREFILL] phase=COMPLETE tokens=175 chunks=2 output=REAL_LOGITS ...
+[JUPITER_LOGITS_DUMP] status=PASS ...
+```
+
+Each client must rebuild its RPC library and the Phone must rebuild and
+restart the v4.0.5 server. Never combine this RPC version with an older
+Phone instance in native mode.
+
+## Next verification before performance claims
+
+1. Check compilation on Windows MSVC and Termux HTP.
+2. Check S1 native prepare and two real Prompt chunks.
+3. Compare full F32 logits against baseline and inspect KV/Attention
+   discrepancies if they differ.
+4. Compare S1/S4 phase breakdowns and the PC `JUPITER_SCHED_ALLOC` timing.
+5. Only after parity: measure request TTFT separately from HTP preparation.
+6. Separately implement verified Phone-KV → Decode handoff for `-n > 1`.
+
+**Do not claim the former ~1-second RPC `alloc_retry_ms` was removed until
+the new branch runs and measures a real Prompt with this native graph path.**
