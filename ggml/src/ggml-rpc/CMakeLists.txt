@@ -5,6 +5,13 @@ ggml_add_backend_library(ggml-rpc
                          transport.cpp
                         )
 
+# Native Phone-owned HTP graphs use the Android Hexagon backend registry.
+# Keep this optional; PC ggml-rpc must not depend on Hexagon.
+if (ANDROID AND GGML_HEXAGON AND NOT GGML_BACKEND_DL)
+    target_link_libraries(ggml-rpc PRIVATE ggml-hexagon)
+    target_compile_definitions(ggml-rpc PRIVATE GGML_RPC_WITH_HEXAGON)
+endif()
+
 if (WIN32)
     target_link_libraries(ggml-rpc PRIVATE ws2_32)
 endif()
