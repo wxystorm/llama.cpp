@@ -707,6 +707,12 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // Opt-in Phone-owned Qwen3 prefill bridge. This function is a single
+    // CPU custom GGML op that replaces the last eight RPC Transformer layers.
+    // A null function preserves the original graph exactly.
+    ggml_custom1_op_t jupiter_phone_owned_op = nullptr;
+    void * jupiter_phone_owned_user = nullptr;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -777,7 +783,9 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
-            cross == other.cross;
+            cross == other.cross &&
+            jupiter_phone_owned_op == other.jupiter_phone_owned_op &&
+            jupiter_phone_owned_user == other.jupiter_phone_owned_user;
     }
 };
 
