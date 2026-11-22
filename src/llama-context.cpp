@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-rpc.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -22,6 +23,221 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
+
+
+// Native Phone-owned Prefill (Qwen3-14B pilot). Unlike the legacy Jupiter
+// path, the CPU GGML custom op calls the Phone Graph that owns the final
+// eight Transformer layers. The output head stays on PC CUDA. Only fresh
+// Prefill is supported: the Phone-owned KV has no Decode handoff yet.
+struct jupiter_phone_owned_native_state {
+    std::string endpoint;
+    ggml_backend_rpc_phone_owned_prepare_t prepare_fn = nullptr;
+    ggml_backend_rpc_phone_owned_run_t run_fn = nullptr;
+    ggml_backend_rpc_phone_owned_reset_t reset_fn = nullptr;
+    uint64_t run_id = 0;
+    uint32_t total_tokens = 0;
+    uint32_t chunk_tokens = 0;
+    uint32_t next_chunk = 0;
+    bool prepared = false;
+    bool completed = false;
+    bool failed = false;
+    std::string failure;
+
+    explicit jupiter_phone_owned_native_state(std::string ep) :
+        endpoint(std::move(ep)) {}
+
+    void fail(const std::string & msg) {
+        failed = true;
+        failure = msg;
+        LLAMA_LOG_ERROR("[JUPITER_PHONE_OWNED_PREFILL] status=FAIL reason=%s\n",
+                       failure.c_str());
+    }
+
+    bool prepare_run(const llama_model & model, const llama_cparams & cparams,
+                     uint32_t tokens, uint32_t first_chunk,
+                     const std::vector<ggml_backend_t> & backends) {
+        if (prepared || completed) {
+            fail("RUN_ALREADY_ACTIVE_OR_COMPLETED");
+            return false;
+        }
+        const auto & hp = model.hparams;
+        if (model.arch != LLM_ARCH_QWEN3 || hp.n_layer() != 40 ||
+                hp.n_embd != 5120 || hp.n_head() != 40 ||
+                hp.n_head_kv() != 8 || hp.n_embd_head_k() != 128 ||
+                !cparams.flash_attn || cparams.n_ctx != 512 ||
+                cparams.n_ctx_seq != 512 ||
+                tokens < 2 || tokens > 512 ||
+                first_chunk == 0 || first_chunk > tokens ||
+                !model.output || !model.output_norm) {
+            fail("UNSUPPORTED_QWEN3_14B_FRESH_PREFILL_SHAPE_OR_KV");
+            return false;
+        }
+        for (ggml_backend_t backend : backends) {
+            if (!backend) { continue; }
+            auto * device = ggml_backend_get_device(backend);
+            if (!device) { continue; }
+            auto * reg = ggml_backend_dev_backend_reg(device);
+            if (!reg) { continue; }
+            auto prepare = reinterpret_cast<ggml_backend_rpc_phone_owned_prepare_t>(
+                ggml_backend_reg_get_proc_address(
+                    reg, GGML_BACKEND_RPC_PHONE_OWNED_PREPARE_PROC));
+            auto run = reinterpret_cast<ggml_backend_rpc_phone_owned_run_t>(
+                ggml_backend_reg_get_proc_address(
+                    reg, GGML_BACKEND_RPC_PHONE_OWNED_RUN_PROC));
+            auto reset = reinterpret_cast<ggml_backend_rpc_phone_owned_reset_t>(
+                ggml_backend_reg_get_proc_address(
+                    reg, GGML_BACKEND_RPC_PHONE_OWNED_RESET_PROC));
+            if (prepare && run && reset) {
+                prepare_fn = prepare;
+                run_fn = run;
+                reset_fn = reset;
+                break;
+            }
+        }
+        if (!prepare_fn || !run_fn || !reset_fn) {
+            fail("RPC_NATIVE_PROCS_NOT_FOUND_REBUILD_PC_GGML_RPC");
+            return false;
+        }
+        uint32_t sessions = 1;
+        if (const char * sessions_env =
+                std::getenv("LLAMA_JUPITER_HTP_SESSIONS")) {
+            sessions = (uint32_t) std::atoi(sessions_env);
+        }
+        if (sessions != 1 && sessions != 4) {
+            fail("PILOT_REQUIRES_HTP_SESSIONS_1_OR_4");
+            return false;
+        }
+        std::vector<uint32_t> devices(8, 0);
+        if (sessions == 4) {
+            for (uint32_t i = 0; i < 8; ++i) {
+                devices[i] = i/2;
+            }
+        }
+
+        // Exact scalar parameters of the regular Qwen3 graph. No weight,
+        // tensor pointer, or PC-side Graph is serialized to the Phone.
+        ggml_rpc_phone_owned_plan plan {};
+        plan.version = 3;
+        plan.flags = 1 | (8u << 16);
+        plan.run_id = (uint64_t) ggml_time_us();
+        plan.p2c_run_id = plan.run_id;
+        plan.region = 0;
+        plan.layer = 32;
+        plan.total_tokens = tokens;
+        plan.chunk_tokens = first_chunk;
+        plan.n_embd = hp.n_embd;
+        plan.position_base = 0;
+        plan.kv_capacity = cparams.n_ctx_seq;
+        plan.n_heads = hp.n_head();
+        plan.n_heads_kv = hp.n_head_kv();
+        plan.head_dim = hp.n_embd_head_k();
+        plan.n_kv = cparams.n_ctx_seq;
+        plan.rope_type = 2; // GGML_ROPE_TYPE_NEOX
+        plan.n_ctx_orig = cparams.n_ctx_orig_yarn;
+        plan.kv_type = 1; // GGML_TYPE_F16
+        plan.rms_norm_eps = hp.f_norm_rms_eps;
+        plan.rope_freq_base = cparams.rope_freq_base;
+        plan.rope_freq_scale = cparams.rope_freq_scale;
+        plan.rope_ext_factor = cparams.yarn_ext_factor;
+        plan.rope_attn_factor = cparams.yarn_attn_factor;
+        plan.rope_beta_fast = cparams.yarn_beta_fast;
+        plan.rope_beta_slow = cparams.yarn_beta_slow;
+        ggml_rpc_phone_owned_prepare_stats stats {};
+        const int64_t begin = ggml_time_us();
+        LLAMA_LOG_INFO(
+            "[JUPITER_PHONE_OWNED_PREFILL] phase=PREPARE_BEGIN run=%" PRIu64
+            " tokens=%u chunk=%u sessions=%u ctx=%u\n",
+            plan.run_id, tokens, first_chunk, sessions, cparams.n_ctx_seq);
+        if (!prepare_fn(endpoint.c_str(), &plan,
+                        devices.data(), (uint32_t) devices.size(), &stats)) {
+            fail("PHONE_NATIVE_PREPARE_REJECTED_CHECK_PHONE_RPC_LOG");
+            return false;
+        }
+        run_id = plan.run_id;
+        total_tokens = tokens;
+        chunk_tokens = first_chunk;
+        prepared = true;
+        LLAMA_LOG_INFO(
+            "[JUPITER_PHONE_OWNED_PREFILL] phase=PREPARE_DONE run=%" PRIu64
+            " graphs=%u load_ms=%.3f build_ms=%.3f buffer_ms=%.3f"
+            " precompile_ms=%.3f phone_wall_ms=%.3f pc_wall_ms=%.3f status=PASS\n",
+            run_id, stats.graphs, stats.model_load_ms, stats.build_ms,
+            stats.buffer_alloc_ms, stats.precompile_ms,
+            stats.wall_ms, (ggml_time_us() - begin)/1000.0);
+        return true;
+    }
+
+    static void graph_compute(ggml_tensor * dst, const ggml_tensor * src,
+                              int ith, int nth, void * user_data) {
+        if (ith != 0) { return; }
+        auto * state = static_cast<jupiter_phone_owned_native_state *>(user_data);
+        if (!state) { return; }
+        const auto zero_output = [&]() {
+            if (dst && dst->data) {
+                std::memset(dst->data, 0, ggml_nbytes(dst));
+            }
+        };
+        if (nth != 1 || !state->prepared || state->failed ||
+                !src || !dst || !src->data || !dst->data ||
+                src->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(src) || !ggml_is_contiguous(dst) ||
+                src->ne[0] != 5120 || dst->ne[0] != 5120 ||
+                !ggml_are_same_layout(src, dst) ||
+                state->next_chunk >=
+                    (state->total_tokens + state->chunk_tokens - 1) /
+                    state->chunk_tokens) {
+            state->fail("INVALID_NATIVE_GRAPH_CALLBACK_LAYOUT_OR_FIFO");
+            zero_output();
+            return;
+        }
+        const uint32_t token_begin = state->next_chunk * state->chunk_tokens;
+        const uint32_t expected_tokens = std::min(
+            state->chunk_tokens, state->total_tokens - token_begin);
+        if (src->ne[1] != (int64_t) expected_tokens) {
+            state->fail("CHUNK_SCHEDULE_MISMATCH");
+            zero_output();
+            return;
+        }
+        const size_t n_floats = size_t(expected_tokens)*5120;
+        ggml_rpc_phone_owned_run_stats stats {};
+        const int64_t begin = ggml_time_us();
+        const bool ok = state->run_fn(
+            state->endpoint.c_str(), state->run_id,
+            0, state->next_chunk,
+            static_cast<const float *>(src->data), n_floats,
+            static_cast<float *>(dst->data), n_floats, &stats);
+        if (!ok || stats.layers != 8 || stats.tokens != expected_tokens) {
+            state->fail("PHONE_NATIVE_CHUNK_RPC_OR_HTP_FAILURE");
+            zero_output();
+            return;
+        }
+        LLAMA_LOG_INFO(
+            "[JUPITER_PHONE_OWNED_PREFILL] phase=CHUNK_DONE"
+            " run=%" PRIu64 " chunk=%u tokens=%u"
+            " phone_compute_ms=%.3f phone_upload_ms=%.3f"
+            " phone_copy_ms=%.3f phone_wall_ms=%.3f"
+            " total_bridge_ms=%.3f status=PASS\n",
+            state->run_id, state->next_chunk, expected_tokens,
+            stats.compute_ms, stats.upload_ms, stats.output_copy_ms,
+            stats.wall_ms, (ggml_time_us() - begin)/1000.0);
+        ++state->next_chunk;
+    }
+
+    void reset_run() {
+        if (prepared && reset_fn) {
+            if (!reset_fn(endpoint.c_str(), run_id)) {
+                LLAMA_LOG_ERROR(
+                    "[JUPITER_PHONE_OWNED_PREFILL] phase=RESET"
+                    " run=%" PRIu64 " status=FAIL\n", run_id);
+            } else {
+                LLAMA_LOG_INFO(
+                    "[JUPITER_PHONE_OWNED_PREFILL] phase=RESET"
+                    " run=%" PRIu64 " status=PASS\n", run_id);
+            }
+        }
+        prepared = false;
+    }
+};
 
 //
 // llama_context
@@ -74,6 +290,27 @@ llama_context::llama_context(
     t_load_us  = model.t_load_us;
 
     const auto & hparams = model.hparams;
+
+    if (const char * native = std::getenv("LLAMA_JUPITER_PHONE_OWNED_NATIVE")) {
+        if (std::atoi(native) != 0) {
+            const char * enabled = std::getenv("LLAMA_JUPITER_PREFILL");
+            const char * endpoint = std::getenv("LLAMA_JUPITER_PHONE_OWNED_ENDPOINT");
+            if (!enabled || std::atoi(enabled) == 0 ||
+                    !endpoint || !*endpoint) {
+                throw std::runtime_error(
+                    "LLAMA_JUPITER_PHONE_OWNED_NATIVE requires"
+                    " LLAMA_JUPITER_PREFILL=1 and"
+                    " LLAMA_JUPITER_PHONE_OWNED_ENDPOINT=host:port");
+            }
+            jupiter_phone_native =
+                std::make_unique<jupiter_phone_owned_native_state>(endpoint);
+            LLAMA_LOG_INFO(
+                "[JUPITER_PHONE_OWNED_PREFILL] mode=FULL_PREFILL"
+                " endpoint=%s stage=PC_CPU_16_PC_CUDA_16_PHONE_HTP_8"
+                " head=PC_CUDA decode=UNSUPPORTED status=ENABLED\n",
+                endpoint);
+        }
+    }
 
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
@@ -564,6 +801,12 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    if (jupiter_phone_native) {
+        if (sched) {
+            ggml_backend_sched_synchronize(sched.get());
+        }
+        jupiter_phone_native->reset_run();
+    }
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -2789,6 +3032,9 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.jupiter_phone_owned_op =*/
+            jupiter_phone_native ? jupiter_phone_owned_native_state::graph_compute : nullptr,
+        /*.jupiter_phone_owned_user =*/ jupiter_phone_native.get(),
     };
 }
 
