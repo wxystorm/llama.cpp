@@ -176,14 +176,14 @@ The branch now provides two entirely optional debugging interfaces:
 
 - PC: LLAMA_JUPITER_STAGE_DUMP_DIR=<absolute local directory> and
   LLAMA_JUPITER_STAGE_DUMP_TOKENS=175. GGML scheduler eval callback
-  saves L31/L32/L39 F32 stage outputs only during the 175-token request,
+  saves L31-L39 F32 stage outputs plus result_norm and result_output only during the 175-token request,
   not the synthetic two-token startup probe.
 - Phone: GGML_RPC_PHONE_OWNED_STAGE_DUMP_DIR=<Termux directory> set before
-  starting the rebuilt RPC server. When running native HTP Layers 32 and 39
-  it writes l_out-32-chunk0.f32, l_out-32-chunk1.f32,
-  l_out-39-chunk0.f32 and l_out-39-chunk1.f32.
+  starting the rebuilt RPC server. When running native HTP Layers 32 through 39
+  it writes l_out-{32..39}-chunk{0,1}.f32 (16 Phone F32 files).
 - Native PC: add --stage-dump to run_phone_owned_full_prefill.py;
-  this saves native-pc-stages/l_out-31.f32 and phone_owned_hidden.f32.
+  this saves native-pc-stages/l_out-31.f32, phone_owned_hidden.f32,
+  result_norm.f32 and result_output.f32.
 
 Rebuild PC llama-cli and Phone ggml-rpc-server from this branch before
 enabling checkpoints. The phone file export requires restarting the server
@@ -192,9 +192,9 @@ with the GGML_RPC_PHONE_OWNED_STAGE_DUMP_DIR environment variable.
 To get reference intermediate tensors, run normal pure-CPU llama-cli on
 the same real Prompt (175 tokens), with -ngl 0, --flash-attn on, -n 1,
 context 512, and LLAMA_JUPITER_PREFILL=0, while the PC dump variables
-are enabled. The expected files are l_out-31.f32, l_out-32.f32 and
-l_out-39.f32. Use a different directory for the native PC dump.
-Transfer four phone HTP checkpoint files into one local PC directory.
+are enabled. The expected files are l_out-31.f32 through l_out-39.f32, plus
+result_norm.f32 and result_output.f32. Use a different directory for the native PC dump.
+Transfer all 16 phone HTP checkpoint files into one local PC directory.
 
 Use compare_phone_owned_stages.py with --cpu-dir, --native-dir and
 --phone-dir. It prints cosine, relative RMSE, absolute error and per-chunk
@@ -209,6 +209,15 @@ Use compare_phone_owned_stages.py with --cpu-dir, --native-dir and
 
 Do NOT use these debug runs for performance claims. Scheduler eval
 callbacks synchronize and split compute; phone dumps add file I/O.
+
+Follow the FULL layer-by-layer progression through L32, L33, ..., L38,
+then compare only the final output token at L39. Next compare the
+output of PC Final RMSNorm (5120 F32s) and the raw LM Head logits
+(151936 F32s) to isolate projection correctness. A large drop in
+cosine between L39 and result_norm suggests a final norm issue;
+a large drop between result_norm and result_output suggests the
+LM Head weight/layout/device path. These are diagnostic hypotheses,
+not automatically proven root causes.
 
 ## Next verification before performance claims
 
