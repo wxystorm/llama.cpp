@@ -85,33 +85,42 @@ def main() -> int:
 
     cpu31 = load_f32(args.cpu_dir / "l_out-31.f32", n_elements)
     cpu32 = load_f32(args.cpu_dir / "l_out-32.f32", n_elements)
-    cpu39 = load_f32(args.cpu_dir / "l_out-39.f32", n_elements)
+    # Standard llama.cpp Qwen3 calls get_rows() inside layer 39 for
+    # only the selected output token. All earlier layer outputs and
+    # Phone-owned native outputs still contain the whole Prompt.
+    cpu39_last = load_f32(args.cpu_dir / "l_out-39.f32", args.embd)
     native31 = load_f32(args.native_dir / "l_out-31.f32", n_elements)
     native39 = load_f32(args.native_dir / "phone_owned_hidden.f32", n_elements)
     phone32 = get_phone_stage(args.phone_dir, 32, chunks, args.embd)
     phone39 = get_phone_stage(args.phone_dir, 39, chunks, args.embd)
 
     comparisons = [
-        ("L31 PC input parity", cpu31, native31),
-        ("L32 first Phone layer", cpu32, phone32),
-        ("L39 full Phone suffix", cpu39, phone39),
-        ("L39 phone-to-PC transfer", phone39, native39),
+        ("L31 PC input parity", cpu31, native31, True),
+        ("L32 first Phone layer", cpu32, phone32, True),
+        ("L39 final-token Phone suffix",
+         cpu39_last, phone39[-args.embd:], False),
+        ("L39 phone-to-PC transfer", phone39, native39, True),
     ]
     result = {
         "chunks": chunks,
         "n_embd": args.embd,
         "measurements": {},
     }
-    for title, reference, candidate in comparisons:
+    for title, reference, candidate, full_prompt in comparisons:
         summary = compare(reference, candidate)
         parts = []
-        offset = 0
-        for index, tokens in enumerate(chunks):
-            count = tokens * args.embd
-            part = compare(
-                reference[offset:offset+count], candidate[offset:offset+count])
-            parts.append({"chunk": index, "tokens": tokens, **part})
-            offset += count
+        if full_prompt:
+            offset = 0
+            for index, tokens in enumerate(chunks):
+                count = tokens * args.embd
+                part = compare(
+                    reference[offset:offset+count],
+                    candidate[offset:offset+count])
+                parts.append({"chunk": index, "tokens": tokens, **part})
+                offset += count
+        else:
+            # L39 CPU reference contains only the final selected logits row.
+            parts = [{"chunk": len(chunks)-1, "tokens": 1, **summary}]
         summary["per_chunk"] = parts
         result["measurements"][title] = summary
         print(f"[PHONE_PARITY] {title}")
