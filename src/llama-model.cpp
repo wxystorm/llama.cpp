@@ -1303,10 +1303,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if (jupiter_prefill) {
         if (jupiter_phone_native &&
                 (n_layer_all != 40 || hparams.n_embd != 5120 ||
-                 jupiter_pc_layers != 32 || jupiter_cpu_layers != 16)) {
+                 jupiter_pc_layers < 32 || jupiter_pc_layers >= n_layer_all ||
+                 n_layer_all - jupiter_pc_layers > 8)) {
             throw std::runtime_error(
-                "Jupiter native Phone-owned full Prefill pilot requires Qwen3-14B,"
-                " PC layers 0..31, CPU layers 0..15 and Phone layers 32..39");
+                "Jupiter native Phone-owned Prefill requires Qwen3-14B"
+                " with a contiguous 1..8-layer Phone suffix (PC layers 32..39)");
         }
         if (split_mode != LLAMA_SPLIT_MODE_LAYER) {
             throw std::runtime_error("LLAMA_JUPITER_PREFILL requires --split-mode layer");
@@ -1628,8 +1629,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
         if (jupiter_prefill) {
             if (jupiter_phone_native && il >= jupiter_pc_layers) {
-                // The full PC graph is cut after layer 31. No Phone HTP
-                // weight/activation tensor may be allocated by PC GGML RPC.
+                // The PC graph is cut at Jupiter's planned Phone boundary.
+                // No Phone HTP weight/activation tensor is allocated by PC RPC.
                 // Keep the unused suffix model tensors in host memory;
                 // the Phone-owned server loads its own HTP copies locally.
                 // Keep the Final RMSNorm / LM Head on PC CUDA.
