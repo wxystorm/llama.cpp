@@ -31,6 +31,7 @@ int main() {
                 if (chunk == 2) { output = {0x11, 0x22, 0x33}; }
                 return true;
             });
+        CHECK(!queue.abandoned());
         CHECK(queue.push(0, {1, 2, 3, 4}));
         CHECK(queue.push(1, {5, 6, 7, 8}));
         // Backpressure will wait until a prior Chunk has completed.
@@ -71,6 +72,7 @@ int main() {
         std::string error;
         CHECK(!queue.wait_final(output, error));
         CHECK(error == "PHONE_NATIVE_HTP_EXECUTION_FAILED");
+        CHECK(queue.abandoned());
         CHECK(!queue.push(1, {2}));
         queue.stop();
     }
