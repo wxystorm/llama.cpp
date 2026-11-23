@@ -51,6 +51,32 @@ int main() {
     wide.layer = 63;
     wide.n_heads = 64;
     CHECK(validate(wide, reason));
+    // Qwen3-32B: 64 blocks, 5120 hidden, 64 Q heads x 128,
+    // 8 KV heads, fixed Jupiter Context=2048. Different Phone suffix
+    // sizes must retain the original immutable Graph plan and KV bounds.
+    for (uint32_t first = 56; first <= 63; ++first) {
+        auto native32 = a;
+        const uint32_t count = 64 - first;
+        native32.layer = first;
+        native32.region = 0;
+        native32.n_heads = 64;
+        native32.total_tokens = 2048;
+        native32.kv_capacity = 2048;
+        native32.n_kv = 2048;
+        native32.chunk_tokens = 128;
+        native32.version = count == 1 ? k_plan_version : k_multi_plan_version;
+        native32.flags = count == 1 ? k_flag_flash_attn : flags_for_layers(count);
+        CHECK(validate(native32, reason));
+        CHECK(layer_count(native32) == count);
+        CHECK(chunk_count(native32) == 16);
+        CHECK(matches_chunk(native32, 15, 1920, 128, 91,
+                            128ULL*5120*4, 128ULL*5120*4));
+        for (uint32_t off = 0; off < count; ++off) {
+            const auto child = single_layer_plan(native32, off);
+            CHECK(child.layer == first + off);
+            CHECK(validate(child, reason));
+        }
+    }
     CHECK(owned_task_uid(15, 0) != owned_task_uid(1, 0));
     CHECK(chunk_count(a) == 4);
     // Jupiter original q(x,y) Sequence DP can use nonuniform widths.
