@@ -4861,6 +4861,32 @@ static void rpc_serve_client(rpc_server & server,
                 if (!send_msg(sock, rsp.data(), rsp.size())) { return; }
                 break;
             }
+            case RPC_CMD_PHONE_OWNED_AUTO_START: {
+                rpc_msg_phone_owned_auto_start_req req {};
+                if (!recv_msg(sock, &req, sizeof(req))) { return; }
+                rpc_msg_jupiter_rsp rsp {};
+                rsp.ok = server.phone_owned_auto_start(req) ? 1 : 0;
+                if (!send_msg(sock, &rsp, sizeof(rsp))) { return; }
+                break;
+            }
+            case RPC_CMD_PHONE_OWNED_AUTO_PUSH: {
+                std::vector<uint8_t> request;
+                if (!recv_msg(sock, request)) { return; }
+                rpc_msg_jupiter_rsp rsp {};
+                rsp.ok = server.phone_owned_auto_push(std::move(request)) ? 1 : 0;
+                if (!send_msg(sock, &rsp, sizeof(rsp))) { return; }
+                break;
+            }
+            case RPC_CMD_PHONE_OWNED_AUTO_P2C_WAIT: {
+                rpc_msg_phone_owned_auto_p2c_wait_req req {};
+                if (!recv_msg(sock, &req, sizeof(req))) { return; }
+                std::vector<uint8_t> rsp;
+                if (!server.phone_owned_auto_p2c_wait(req, rsp) ||
+                        !send_msg(sock, rsp.data(), rsp.size())) {
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_PHONE_OWNED_RESET: {
                 rpc_msg_phone_owned_reset_req req {};
                 if (!recv_msg(sock, &req, sizeof(req))) { return; }
