@@ -91,7 +91,7 @@ struct jupiter_stage_dump_state {
         }
         if (t->buffer == nullptr ||
                 bytes % sizeof(float) != 0 ||
-                bytes > size_t(512)*5120*sizeof(float)) {
+                bytes > size_t(4096)*5120*sizeof(float)) {
             st->failed = true;
             LLAMA_LOG_ERROR("[JUPITER_STAGE_DUMP] stage=%s status=FAIL"
                             " reason=BAD_TENSOR_SIZE bytes=%zu\n",
@@ -663,9 +663,9 @@ llama_context::llama_context(
             if (const char * target_env =
                     std::getenv("LLAMA_JUPITER_STAGE_DUMP_TOKENS")) {
                 const int parsed = std::atoi(target_env);
-                if (parsed <= 0 || parsed > 512) {
+                if (parsed <= 0 || parsed > 4096) {
                     throw std::runtime_error(
-                        "LLAMA_JUPITER_STAGE_DUMP_TOKENS must be in 1..512");
+                        "LLAMA_JUPITER_STAGE_DUMP_TOKENS must be in 1..4096");
                 }
                 target = uint32_t(parsed);
             }
