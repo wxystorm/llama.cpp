@@ -16,6 +16,7 @@
 #include <cmath>
 #include <chrono>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -1506,7 +1507,7 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
         llama_memory_clear(mem, true);
         llama_synchronize(ctx);
         COM_INF("[JUPITER_PHONE_OWNED_PREFILL] phase=SEQ_RM_PROBE"
-                " mode=MEMORY_ONLY result=%d synthetic_decode=SKIPPED\\n",
+                " mode=MEMORY_ONLY result=%d synthetic_decode=SKIPPED\n",
                 static_cast<int>(res));
         return res;
     }
