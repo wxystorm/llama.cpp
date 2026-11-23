@@ -162,16 +162,16 @@ def main() -> int:
                     "stop processing", "prompt eval time",
                 ))
             ]
-            clue_text = "\\n".join(clues[-35:]) or "(no matching milestones)"
-            tail_text = "\\n".join(lines[-45:]) or "(empty log)"
+            clue_text = "\n".join(clues[-35:]) or "(no matching milestones)"
+            tail_text = "\n".join(lines[-45:]) or "(empty log)"
             raise RuntimeError(
                 f"{mode}: no JUPITER_SEQUENCE_PLAN was emitted. "
                 f"Possibilities: the request failed before init_batch, "
                 f"or the explicit chunk plan was rejected. "
                 f"Inspect the original cause below; no model speedup/parity "
-                f"can be inferred.\\n"
-                f"--- key milestones/errors ---\\n{clue_text}\\n"
-                f"--- last 45 log lines ---\\n{tail_text}\\n"
+                f"can be inferred.\n"
+                f"--- key milestones/errors ---\n{clue_text}\n"
+                f"--- last 45 log lines ---\n{tail_text}\n"
                 f"--- full log: {log_path}"
             )
         observed_total = int(plan_matches[-1].group(1))
