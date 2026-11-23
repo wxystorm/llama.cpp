@@ -60,9 +60,11 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
     ggml_tensor * inpL;
 
     const bool phone_native = params.jupiter_phone_owned_op != nullptr;
+    const int phone_first = phone_native ? params.jupiter_phone_first_layer : int(n_layer);
     if (phone_native) {
         GGML_ASSERT(n_layer == 40 && n_embd == 5120 &&
-                    "Phone-owned Prefill supports only Qwen3-14B");
+                    phone_first >= 32 && phone_first < n_layer &&
+                    "Phone-owned Prefill supports 1..8 Qwen3-14B suffix layers");
     }
 
     inpL = build_inp_embd(model.tok_embd);
@@ -74,7 +76,7 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    for (int il = 0; il < (phone_native ? 32 : n_layer); ++il) {
+    for (int il = 0; il < phone_first; ++il) {
         res->t_layer_inp[il] = inpL;
 
         ggml_tensor * inpSA = inpL;
@@ -149,9 +151,9 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
     cur = inpL;
 
     if (phone_native) {
-        // The CPU custom node receives the exact output of Layer 31. It
-        // executes Layers 32..39 on Phone-owned HTP Graphs and returns the
-        // full hidden state. No remote GGML RPC tensor/graph is allocated.
+        // The CPU custom node receives the exact final PC Layer output.
+        // Phone-owned HTP executes the remaining contiguous Qwen3 suffix.
+        // No remote GGML RPC tensor/graph is allocated.
         GGML_ASSERT(cur->type == GGML_TYPE_F32);
         // The native RPC wire is a dense F32 [n_embd, n_tokens] tensor.
         cur = ggml_cont(ctx0, cur);
