@@ -5395,6 +5395,44 @@ static bool ggml_backend_rpc_phone_owned_native_reset(
     return ggml_jupiter_phone_owned::reset(endpoint, run_id);
 }
 
+static bool ggml_backend_rpc_phone_owned_native_auto_start(
+        const char * endpoint, uint64_t run_id, uint64_t p2c_run_id,
+        uint32_t region, uint32_t max_in_flight) {
+    return ggml_jupiter_phone_owned::auto_start(
+        endpoint, run_id, p2c_run_id, region, max_in_flight);
+}
+
+static bool ggml_backend_rpc_phone_owned_native_auto_push(
+        const char * endpoint, uint64_t run_id, uint64_t p2c_run_id,
+        uint32_t region, uint32_t chunk, const float * input,
+        size_t input_floats) {
+    return ggml_jupiter_phone_owned::auto_push(
+        endpoint, run_id, p2c_run_id, region, chunk, input, input_floats);
+}
+
+static bool ggml_backend_rpc_phone_owned_native_auto_p2c_wait(
+        const char * endpoint, uint64_t run_id, uint64_t p2c_run_id,
+        uint32_t region, float * output, size_t capacity_floats,
+        ggml_rpc_phone_owned_run_stats * stats) {
+    if (!endpoint || !output || !capacity_floats || !stats) { return false; }
+    *stats = {};
+    std::vector<float> data;
+    ggml_jupiter_phone_owned::run_stats result {};
+    if (!ggml_jupiter_phone_owned::auto_p2c_wait(
+            endpoint, run_id, p2c_run_id, region, data, result) ||
+            data.size() != capacity_floats) {
+        return false;
+    }
+    std::memcpy(output, data.data(), data.size()*sizeof(float));
+    stats->layers = result.layers;
+    stats->tokens = result.tokens;
+    stats->upload_ms = result.upload_ms;
+    stats->compute_ms = result.compute_ms;
+    stats->output_copy_ms = result.output_copy_ms;
+    stats->wall_ms = result.wall_ms;
+    return true;
+}
+
 static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (std::strcmp(name, "ggml_backend_rpc_add_server") == 0) {
         return (void *)ggml_backend_rpc_add_server;
@@ -5410,6 +5448,15 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_OWNED_RESET_PROC) == 0) {
         return reinterpret_cast<void *>(ggml_backend_rpc_phone_owned_native_reset);
+    }
+    if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_OWNED_AUTO_START_PROC) == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_phone_owned_native_auto_start);
+    }
+    if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_OWNED_AUTO_PUSH_PROC) == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_phone_owned_native_auto_push);
+    }
+    if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_OWNED_AUTO_P2C_WAIT_PROC) == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_phone_owned_native_auto_p2c_wait);
     }
     if (std::strcmp(name, "ggml_backend_rpc_graph_prebuild") == 0) {
         return reinterpret_cast<void *>(ggml_backend_rpc_graph_prebuild);
