@@ -32,6 +32,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--prompts", nargs="+", required=True,
                    help="two or more UTF-8 .txt files; order is preserved")
     p.add_argument("--async-phone", action="store_true", help="overlap PC/Phone chunks")
+    p.add_argument("--autonomous-phone", action="store_true", help="Phone server FIFO and independent P2C")
     p.add_argument("--revisit-first", action="store_true",
                    help="replay first prompt after all supplied prompts (A-B-A)")
     p.add_argument("--require-revisit-hit", action="store_true",
@@ -89,6 +90,8 @@ def chunks_for(n_tokens: int, size: int) -> list[int]:
 
 def run() -> int:
     args = parse_args()
+    if args.async_phone and args.autonomous_phone:
+        raise ValueError("--async-phone and --autonomous-phone are exclusive")
     if args.require_revisit_hit and not args.revisit_first:
         raise ValueError("--require-revisit-hit needs --revisit-first")
     if not 1 <= args.chunk_size <= 4096:
@@ -152,6 +155,8 @@ def run() -> int:
         ]
         if args.async_phone:
             command.append("--async-phone")
+        if args.autonomous_phone:
+            command.append("--autonomous-phone")
         print(f"[PHONE_MULTI_PROMPT] RUN {index}/{len(sequence)} "
               f"prompt={path.name} tokens={n_tokens}", flush=True)
         process = subprocess.run(
