@@ -3497,7 +3497,186 @@ bool rpc_server::phone_owned_run(
     return true;
 }
 
+bool rpc_server::phone_owned_auto_start(
+        const rpc_msg_phone_owned_auto_start_req & req) {
+    if (!req.run_id || !req.p2c_run_id ||
+            req.max_in_flight < 1 || req.max_in_flight > 4) {
+        return false;
+    }
+    // Same lock ordering as RESET: stream registry before Graph registry.
+    // The autonomous worker takes only Graph registry while executing.
+    std::lock_guard<std::mutex> stream_lock(phone_owned_auto_mutex);
+    if (phone_owned_auto_active) {
+        GGML_LOG_ERROR("[PHONE_AUTO] START_REJECT reason=ACTIVE_STREAM\n");
+        return false;
+    }
+    auto state = std::make_shared<phone_owned_auto_state>();
+    {
+        std::lock_guard<std::mutex> graph_lock(phone_owned_mutex);
+        const auto it = phone_owned_chains.find({req.run_id, req.region});
+        if (it == phone_owned_chains.end() ||
+                it->second.plan.p2c_run_id != req.p2c_run_id) {
+            GGML_LOG_ERROR("[PHONE_AUTO] START_REJECT reason=PLAN_NOT_PREPARED\n");
+            return false;
+        }
+        const auto & plan = it->second.plan;
+        state->run_id = req.run_id;
+        state->p2c_run_id = req.p2c_run_id;
+        state->region = req.region;
+        state->n_embd = plan.n_embd;
+        state->total_tokens = plan.total_tokens;
+        state->chunk_tokens = plan.chunk_tokens;
+        state->layer_count = uint32_t(ggml_phone_owned::layer_count(plan));
+    }
+    const uint32_t n_chunks = (state->total_tokens +
+                              state->chunk_tokens - 1) / state->chunk_tokens;
+    try {
+        // Input PUSH, not a PC worker calling RUN, triggers the Phone worker.
+        // Reuse exactly the proven local HTP Graph, KV FIFO and error path.
+        state->queue = std::make_shared<ggml_phone_autonomous::prefill_queue>(
+            n_chunks, req.max_in_flight,
+            [this](uint32_t chunk, const std::vector<uint8_t> & payload,
+                   std::vector<uint8_t> & result) -> bool {
+                const bool ok = phone_owned_run(payload, result);
+                GGML_LOG_INFO(
+                    "[PHONE_AUTO] EXEC_DONE chunk=%u status=%s\n",
+                    chunk, ok ? "PASS" : "FAIL");
+                return ok;
+            });
+    } catch (...) {
+        GGML_LOG_ERROR("[PHONE_AUTO] START_REJECT reason=WORKER_START\n");
+        return false;
+    }
+    phone_owned_auto_active = std::move(state);
+    GGML_LOG_INFO(
+        "[PHONE_AUTO] START run=%" PRIu64 " p2c_run=%" PRIu64
+        " region=%u chunks=%u queue_depth=%u status=READY\n",
+        req.run_id, req.p2c_run_id, req.region, n_chunks, req.max_in_flight);
+    return true;
+}
+
+bool rpc_server::phone_owned_auto_push(std::vector<uint8_t> payload) {
+    if (payload.size() < sizeof(rpc_msg_phone_owned_auto_push_req)) {
+        return false;
+    }
+    rpc_msg_phone_owned_auto_push_req req {};
+    std::memcpy(&req, payload.data(), sizeof(req));
+    std::shared_ptr<phone_owned_auto_state> active;
+    {
+        std::lock_guard<std::mutex> lock(phone_owned_auto_mutex);
+        active = phone_owned_auto_active;
+    }
+    if (!active || req.run_id != active->run_id ||
+            req.p2c_run_id != active->p2c_run_id ||
+            req.region != active->region || !req.input_floats ||
+            req.input_floats >
+                ggml_phone_owned::k_max_activation_bytes / sizeof(float) ||
+            payload.size() != sizeof(req) + size_t(req.input_floats)*sizeof(float) ||
+            req.chunk >= (active->total_tokens + active->chunk_tokens - 1) /
+                          active->chunk_tokens) {
+        GGML_LOG_ERROR("[PHONE_AUTO] PUSH_REJECT reason=RUN_OR_SHAPE\n");
+        return false;
+    }
+    const uint32_t tokens = std::min<uint32_t>(
+        active->chunk_tokens,
+        active->total_tokens - req.chunk*active->chunk_tokens);
+    if (uint64_t(req.input_floats) !=
+            uint64_t(tokens)*active->n_embd) {
+        GGML_LOG_ERROR("[PHONE_AUTO] PUSH_REJECT reason=TOKEN_SIZE\n");
+        return false;
+    }
+    // The existing Phone-owned RUN accepts its own wire header; serialize a
+    // private, immutable request before queueing, so the RPC receive buffer
+    // can be recycled immediately after admission.
+    rpc_msg_phone_owned_run_req run {
+        req.run_id, req.region, req.chunk, req.input_floats
+    };
+    std::vector<uint8_t> task(sizeof(run) +
+                              size_t(req.input_floats)*sizeof(float));
+    std::memcpy(task.data(), &run, sizeof(run));
+    std::memcpy(task.data() + sizeof(run),
+                payload.data() + sizeof(req),
+                size_t(req.input_floats)*sizeof(float));
+    const bool accepted = active->queue->push(req.chunk, std::move(task));
+    GGML_LOG_INFO(
+        "[PHONE_AUTO] INPUT_PUSH run=%" PRIu64
+        " p2c_run=%" PRIu64 " chunk=%u tokens=%u accepted=%u status=%s\n",
+        req.run_id, req.p2c_run_id, req.chunk, tokens,
+        active->queue->accepted(), accepted ? "QUEUED" : "REJECT");
+    return accepted;
+}
+
+bool rpc_server::phone_owned_auto_p2c_wait(
+        const rpc_msg_phone_owned_auto_p2c_wait_req & req,
+        std::vector<uint8_t> & response) {
+    std::shared_ptr<phone_owned_auto_state> active;
+    {
+        std::lock_guard<std::mutex> lock(phone_owned_auto_mutex);
+        active = phone_owned_auto_active;
+    }
+    rpc_msg_phone_owned_run_rsp error_rsp {};
+    if (!active || req.run_id != active->run_id ||
+            req.p2c_run_id != active->p2c_run_id ||
+            req.region != active->region) {
+        response.resize(sizeof(error_rsp));
+        std::memcpy(response.data(), &error_rsp, sizeof(error_rsp));
+        return true;
+    }
+    std::string reason;
+    if (!active->queue->wait_final(response, reason)) {
+        GGML_LOG_ERROR(
+            "[PHONE_AUTO] P2C_RETURN run=%" PRIu64
+            " p2c_run=%" PRIu64 " status=FAIL reason=%s\n",
+            req.run_id, req.p2c_run_id, reason.c_str());
+        response.resize(sizeof(error_rsp));
+        std::memcpy(response.data(), &error_rsp, sizeof(error_rsp));
+        return true;
+    }
+    if (response.size() < sizeof(rpc_msg_phone_owned_run_rsp)) {
+        return false;
+    }
+    rpc_msg_phone_owned_run_rsp rsp {};
+    std::memcpy(&rsp, response.data(), sizeof(rsp));
+    const uint32_t final_tokens =
+        active->total_tokens % active->chunk_tokens ?
+        active->total_tokens % active->chunk_tokens : active->chunk_tokens;
+    if (!rsp.ok || rsp.tokens != final_tokens ||
+            rsp.layers != active->layer_count ||
+            rsp.output_floats != uint64_t(final_tokens)*active->n_embd ||
+            response.size() != sizeof(rsp) +
+                size_t(rsp.output_floats)*sizeof(float)) {
+        GGML_LOG_ERROR("[PHONE_AUTO] P2C_RETURN status=FAIL reason=OUTPUT_SHAPE\n");
+        return false;
+    }
+    GGML_LOG_INFO(
+        "[PHONE_AUTO] P2C_RETURN run=%" PRIu64 " p2c_run=%" PRIu64
+        " tokens=%u bytes=%zu status=PASS\n",
+        req.run_id, req.p2c_run_id, rsp.tokens,
+        size_t(rsp.output_floats)*sizeof(float));
+    return true;
+}
+
+void rpc_server::phone_owned_auto_stop(uint64_t run_id) {
+    std::shared_ptr<phone_owned_auto_state> active;
+    {
+        std::lock_guard<std::mutex> lock(phone_owned_auto_mutex);
+        if (!phone_owned_auto_active ||
+                (run_id != 0 && phone_owned_auto_active->run_id != run_id)) {
+            return;
+        }
+        active = std::move(phone_owned_auto_active);
+    }
+    // Join *before* RESET can release any compiled HTP Graph or private KV.
+    // Do not hold phone_owned_mutex while waiting: worker may be in RUN.
+    active->queue->stop();
+    GGML_LOG_INFO(
+        "[PHONE_AUTO] STOP run=%" PRIu64 " accepted=%u completed=%u\n",
+        active->run_id, active->queue->accepted(),
+        active->queue->completed());
+}
+
 bool rpc_server::phone_owned_reset(const rpc_msg_phone_owned_reset_req & req) {
+    phone_owned_auto_stop(req.run_id);
     std::lock_guard<std::mutex> lock(phone_owned_mutex);
     if (phone_owned_chains.size() != 1 ||
             phone_owned_chains.begin()->first.first != req.run_id) {
@@ -3746,6 +3925,7 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
 }
 
 rpc_server::~rpc_server() {
+    phone_owned_auto_stop(0);
     for (auto buffer : buffers) {
         ggml_backend_buffer_free(buffer);
     }
