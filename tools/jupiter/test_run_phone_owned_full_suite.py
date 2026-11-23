@@ -220,5 +220,49 @@ class TestResume(unittest.TestCase):
                 self.assertEqual(suite.run(), 0)
 
 
+class Test32BFullSuite(unittest.TestCase):
+    def test_32b_fixed_2048_one_prompt_dry_run(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root)
+            prompts = base / "prompts"
+            prompts.mkdir()
+            (prompts / "prompt_256_01.txt").write_text(
+                "This is a sample.", encoding="utf-8")
+            model = base / "Qwen3-32B-Q4_K_M.gguf"
+            exe = base / "llama-cli.exe"
+            tok = base / "llama-tokenize.exe"
+            for p in (model, exe, tok):
+                p.write_bytes(b"fake")
+            args = argparse.Namespace(
+                exe=str(exe), tokenizer=str(tok), model=str(model),
+                model_size="32b", rpc="127.0.0.1:10140",
+                prompts_dir=str(prompts), pattern="prompt_256_01.txt",
+                out_dir=str(base / "output"), layouts=None,
+                cpu_layers=None, cuda_layers=12, phone_layers=8,
+                sessions=4, chunk_size=128,
+                sequence_policy="jupiter-dp", min_chunk_json=None,
+                stage2_repeats=2, q_repeats=2, refine_repeats=2,
+                max_rounds=6, max_chunk=128, repeats=1,
+                expected_count=1, mode_order="alternate", no_warmup=False,
+                revisit_first=False, resume=False,
+                continue_on_error=False, timeout_seconds=60, dry_run=True)
+            spec = ModelLayout("32b", 64, 5120, 64, 8, 128)
+            with patch.object(suite, "parse_args", return_value=args), \
+                 patch.object(suite, "inspect_model", return_value=spec), \
+                 patch.object(suite, "count_model_tokens", return_value=358):
+                self.assertEqual(suite.run(), 0)
+            manifest = json.loads(
+                (base / "output" / "suite-manifest.json").read_text(
+                    encoding="utf-8"))["config"]
+            self.assertEqual(manifest["context"], 2048)
+            self.assertEqual(manifest["model_size"], "32b")
+            self.assertEqual(manifest["model_layers"], 64)
+            self.assertEqual(manifest["cpu_layers"], 44)
+            self.assertEqual(manifest["layouts"], [56])
+            self.assertEqual(manifest["phone_layer_counts"], [8])
+            self.assertEqual(manifest["prompts"][0]["tokens"], 358)
+            self.assertEqual(manifest["prompts"][0]["context"], 2048)
+
+
 if __name__ == "__main__":
     unittest.main()
