@@ -132,13 +132,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out-dir", default=None,
                    help="default: jupiter-autonomous-{14b|32b}-dp-2048")
     p.add_argument("--layouts", default=None,
-                   help="first Phone layers: 14B 32..39; 32B 56..63")
+                   help="first Phone layers: 14B 24..39; 32B 48..63")
     p.add_argument("--cpu-layers", type=int, default=None,
                    help="PC CPU layers (default 16 for 14B, 44 for 32B)")
     p.add_argument("--cuda-layers", type=int, default=None,
                    help="PC CUDA layers; derives CPU when not explicitly set")
     p.add_argument("--phone-layers", type=int, default=None,
-                   help="Phone HTP suffix layer count 1..8; conflicts with --layouts")
+                   help="Phone HTP suffix layer count 1..16; conflicts with --layouts")
     p.add_argument("--sessions", type=int, choices=(1, 2, 3, 4), default=4)
     p.add_argument("--sequence-policy", choices=("jupiter-dp", "fixed-control"),
                    default="jupiter-dp",
