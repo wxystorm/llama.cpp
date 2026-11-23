@@ -31,6 +31,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--rpc", required=True)
     p.add_argument("--prompts", nargs="+", required=True,
                    help="two or more UTF-8 .txt files; order is preserved")
+    p.add_argument("--async-phone", action="store_true", help="overlap PC/Phone chunks")
     p.add_argument("--revisit-first", action="store_true",
                    help="replay first prompt after all supplied prompts (A-B-A)")
     p.add_argument("--require-revisit-hit", action="store_true",
@@ -149,6 +150,8 @@ def run() -> int:
             "--chunks", ",".join(map(str, chunks)),
             "--mode", "native", "--out-dir", str(work),
         ]
+        if args.async_phone:
+            command.append("--async-phone")
         print(f"[PHONE_MULTI_PROMPT] RUN {index}/{len(sequence)} "
               f"prompt={path.name} tokens={n_tokens}", flush=True)
         process = subprocess.run(
