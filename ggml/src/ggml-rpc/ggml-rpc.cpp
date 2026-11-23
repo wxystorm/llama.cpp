@@ -2217,6 +2217,93 @@ bool run_chunk(const char * endpoint, uint64_t run_id,
     return true;
 }
 
+bool auto_start(const char * endpoint, uint64_t run_id, uint64_t p2c_run_id,
+                uint32_t region, uint32_t max_in_flight) {
+    if (!endpoint || !run_id || !p2c_run_id || max_in_flight == 0 ||
+            max_in_flight > 4) { return false; }
+    const rpc_msg_phone_owned_auto_start_req req {
+        run_id, p2c_run_id, region, max_in_flight
+    };
+    rpc_msg_jupiter_rsp rsp {};
+    auto sock = get_socket(endpoint);
+    return sock && send_rpc_cmd(
+        sock, RPC_CMD_PHONE_OWNED_AUTO_START,
+        &req, sizeof(req), &rsp, sizeof(rsp)) && rsp.ok == 1;
+}
+
+bool auto_push(const char * endpoint, uint64_t run_id, uint64_t p2c_run_id,
+               uint32_t region, uint32_t chunk,
+               const float * input, size_t input_floats) {
+    if (!endpoint || !run_id || !p2c_run_id || !input || !input_floats ||
+            input_floats > ggml_phone_owned::k_max_activation_bytes/sizeof(float) ||
+            input_floats > UINT32_MAX) { return false; }
+    const rpc_msg_phone_owned_auto_push_req header {
+        run_id, p2c_run_id, region, chunk, static_cast<uint32_t>(input_floats)
+    };
+    std::vector<uint8_t> payload(sizeof(header) + input_floats*sizeof(float));
+    std::memcpy(payload.data(), &header, sizeof(header));
+    std::memcpy(payload.data() + sizeof(header), input,
+                input_floats*sizeof(float));
+    // Preserve a dedicated, ordered input lane independently of the PC's
+    // legacy RPC tensor/Graph control traffic. PUSH waits for queue capacity,
+    // not for HTP execution.
+    static thread_local socket_ptr push_socket;
+    static thread_local std::string push_endpoint;
+    if (push_endpoint != endpoint) {
+        push_socket.reset();
+        push_endpoint = endpoint;
+    }
+    if (!push_socket) {
+        push_socket = get_socket_lane(endpoint, "phone-owned-auto-input");
+    }
+    rpc_msg_jupiter_rsp rsp {};
+    return push_socket && send_rpc_cmd(
+        push_socket, RPC_CMD_PHONE_OWNED_AUTO_PUSH,
+        payload.data(), payload.size(), &rsp, sizeof(rsp)) && rsp.ok == 1;
+}
+
+bool auto_p2c_wait(const char * endpoint, uint64_t run_id,
+                   uint64_t p2c_run_id, uint32_t region,
+                   std::vector<float> & output, run_stats & stats) {
+    output.clear();
+    stats = {};
+    if (!endpoint || !run_id || !p2c_run_id) { return false; }
+    const rpc_msg_phone_owned_auto_p2c_wait_req req {
+        run_id, p2c_run_id, region
+    };
+    // The Phone worker autonomously publishes final hidden states. This
+    // dedicated P2C RPC blocks on the completion event (no polling).
+    auto sock = get_socket_lane(endpoint, "phone-owned-auto-p2c");
+    if (!sock || !send_rpc_cmd(
+            sock, RPC_CMD_PHONE_OWNED_AUTO_P2C_WAIT, &req, sizeof(req))) {
+        return false;
+    }
+    std::vector<uint8_t> response;
+    if (!recv_msg(sock, response) ||
+            response.size() < sizeof(rpc_msg_phone_owned_run_rsp)) {
+        return false;
+    }
+    rpc_msg_phone_owned_run_rsp rsp {};
+    std::memcpy(&rsp, response.data(), sizeof(rsp));
+    if (!rsp.ok || !rsp.output_floats ||
+            rsp.output_floats >
+                ggml_phone_owned::k_max_activation_bytes / sizeof(float) ||
+            response.size() != sizeof(rsp) +
+                size_t(rsp.output_floats)*sizeof(float)) {
+        return false;
+    }
+    output.resize(rsp.output_floats);
+    std::memcpy(output.data(), response.data() + sizeof(rsp),
+                output.size()*sizeof(float));
+    stats.layers = rsp.layers;
+    stats.tokens = rsp.tokens;
+    stats.upload_ms = rsp.upload_ms;
+    stats.compute_ms = rsp.compute_ms;
+    stats.output_copy_ms = rsp.output_copy_ms;
+    stats.wall_ms = rsp.wall_ms;
+    return true;
+}
+
 bool reset(const char * endpoint, uint64_t run_id) {
     if (!endpoint || !run_id) { return false; }
     auto sock = get_socket(endpoint);
