@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    5
+#define RPC_PROTO_PATCH_VERSION    6
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -80,6 +80,29 @@ typedef bool (*ggml_backend_rpc_phone_owned_run_t)(
     struct ggml_rpc_phone_owned_run_stats * stats);
 typedef bool (*ggml_backend_rpc_phone_owned_reset_t)(
     const char * endpoint, uint64_t run_id);
+
+// Opt-in Phone-side autonomous Prefill. START arms a single bounded input
+// stream, PUSH transfers an independent F32 Chunk and only acknowledges
+// queue admission, and P2C_WAIT subscribes to the final Phone-owned hidden
+// state on a dedicated socket. No Decode or production KV handoff.
+#define GGML_BACKEND_RPC_PHONE_OWNED_AUTO_START_PROC \
+    "ggml_backend_rpc_phone_owned_auto_start"
+#define GGML_BACKEND_RPC_PHONE_OWNED_AUTO_PUSH_PROC \
+    "ggml_backend_rpc_phone_owned_auto_push"
+#define GGML_BACKEND_RPC_PHONE_OWNED_AUTO_P2C_WAIT_PROC \
+    "ggml_backend_rpc_phone_owned_auto_p2c_wait"
+
+typedef bool (*ggml_backend_rpc_phone_owned_auto_start_t)(
+    const char * endpoint, uint64_t run_id, uint64_t p2c_run_id,
+    uint32_t region, uint32_t max_in_flight);
+typedef bool (*ggml_backend_rpc_phone_owned_auto_push_t)(
+    const char * endpoint, uint64_t run_id, uint64_t p2c_run_id,
+    uint32_t region, uint32_t chunk, const float * input,
+    size_t input_floats);
+typedef bool (*ggml_backend_rpc_phone_owned_auto_p2c_wait_t)(
+    const char * endpoint, uint64_t run_id, uint64_t p2c_run_id,
+    uint32_t region, float * output, size_t output_capacity_floats,
+    struct ggml_rpc_phone_owned_run_stats * stats);
 
 struct ggml_rpc_local_tensor_info {
     uint64_t nbytes;      //张量的字节数
