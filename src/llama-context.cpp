@@ -56,7 +56,7 @@ struct jupiter_stage_dump_state {
         if (ask) { return selected; }
         if (!selected) { return true; }
         if (t->type != GGML_TYPE_F32 || t->ne[0] != 5120 ||
-                !ggml_is_contiguous(t) || t->buffer == nullptr) {
+                !ggml_is_contiguous(t)) {
             st->failed = true;
             LLAMA_LOG_ERROR("[JUPITER_STAGE_DUMP] stage=%s status=FAIL"
                             " reason=UNSUPPORTED_TENSOR_LAYOUT type=%d ne0=%" PRId64 "\n",
@@ -74,7 +74,8 @@ struct jupiter_stage_dump_state {
                 " reason=NO_SELECTED_OUTPUT_TOKENS\n", stage.c_str());
             return true;
         }
-        if (bytes % sizeof(float) != 0 ||
+        if (t->buffer == nullptr ||
+                bytes % sizeof(float) != 0 ||
                 bytes > size_t(512)*5120*sizeof(float)) {
             st->failed = true;
             LLAMA_LOG_ERROR("[JUPITER_STAGE_DUMP] stage=%s status=FAIL"
