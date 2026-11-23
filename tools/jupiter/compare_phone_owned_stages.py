@@ -2,8 +2,9 @@
 """Compare CPU and native Phone-owned Qwen3 hidden-state checkpoints.
 
 This is correctness diagnostics, not a timing/benchmark tool.
-PC l_out-31/32/39 checkpoints are written by the GGML eval callback.
-Phone l_out-32/39 checkpoints are written after native HTP layer execution.
+PC l_out-31..39 and result_norm/result_output checkpoints are
+captured by the GGML eval callback. Phone layers 32..39 are captured
+after actual native HTP layer execution.
 """
 
 from __future__ import annotations
@@ -74,42 +75,68 @@ def main() -> int:
     parser.add_argument("--phone-dir", type=Path, required=True)
     parser.add_argument("--chunks", default="88,87")
     parser.add_argument("--embd", type=int, default=5120)
+    parser.add_argument("--vocab", type=int, default=151936)
     parser.add_argument("--out", type=Path, default=Path("phone-stage-parity.json"))
     args = parser.parse_args()
     if sys.byteorder != "little":
         raise RuntimeError("requires little-endian F32 files")
     chunks = [int(v) for v in args.chunks.split(",")]
-    if not chunks or any(n <= 0 for n in chunks) or args.embd <= 0:
+    if (not chunks or any(n <= 0 for n in chunks) or
+            args.embd <= 0 or args.vocab <= 0):
         parser.error("chunks and embd must be positive")
     n_elements = sum(chunks)*args.embd
 
+    comparisons = []
     cpu31 = load_f32(args.cpu_dir / "l_out-31.f32", n_elements)
-    cpu32 = load_f32(args.cpu_dir / "l_out-32.f32", n_elements)
-    # Standard llama.cpp Qwen3 calls get_rows() inside layer 39 for
-    # only the selected output token. All earlier layer outputs and
-    # Phone-owned native outputs still contain the whole Prompt.
-    cpu39_last = load_f32(args.cpu_dir / "l_out-39.f32", args.embd)
     native31 = load_f32(args.native_dir / "l_out-31.f32", n_elements)
-    native39 = load_f32(args.native_dir / "phone_owned_hidden.f32", n_elements)
-    phone32 = get_phone_stage(args.phone_dir, 32, chunks, args.embd)
-    phone39 = get_phone_stage(args.phone_dir, 39, chunks, args.embd)
+    comparisons.append(("L31 PC input parity", cpu31, native31, args.embd))
 
-    comparisons = [
-        ("L31 PC input parity", cpu31, native31, True),
-        ("L32 first Phone layer", cpu32, phone32, True),
-        ("L39 final-token Phone suffix",
-         cpu39_last, phone39[-args.embd:], False),
-        ("L39 phone-to-PC transfer", phone39, native39, True),
-    ]
+    # Standard Qwen3 gathers only the final selected logits row during
+    # Transformer layer 39, whereas the native Phone computes every token.
+    # Compare full 175-token tensors at layers 32..38, then the selected
+    # final token at layer 39.
+    for layer in range(32, 39):
+        cpu_layer = load_f32(args.cpu_dir / f"l_out-{layer}.f32", n_elements)
+        phone_layer = get_phone_stage(
+            args.phone_dir, layer, chunks, args.embd)
+        comparisons.append((
+            f"L{layer} CPU vs HTP", cpu_layer, phone_layer, args.embd
+        ))
+    cpu39_last = load_f32(args.cpu_dir / "l_out-39.f32", args.embd)
+    phone39 = get_phone_stage(args.phone_dir, 39, chunks, args.embd)
+    comparisons.append((
+        "L39 final-token Phone suffix", cpu39_last,
+        phone39[-args.embd:], args.embd
+    ))
+    native39 = load_f32(
+        args.native_dir / "phone_owned_hidden.f32", n_elements)
+    comparisons.append((
+        "L39 phone-to-PC transfer", phone39, native39, args.embd
+    ))
+
+    # These two post-Transformer checks identify whether final logits
+    # diverge at RMSNorm or at the LM Head matrix multiplication.
+    cpu_norm = load_f32(args.cpu_dir / "result_norm.f32", args.embd)
+    native_norm = load_f32(args.native_dir / "result_norm.f32", args.embd)
+    comparisons.append((
+        "Final RMSNorm CPU vs Native", cpu_norm, native_norm, args.embd
+    ))
+    cpu_output = load_f32(args.cpu_dir / "result_output.f32", args.vocab)
+    native_output = load_f32(
+        args.native_dir / "result_output.f32", args.vocab)
+    comparisons.append((
+        "Raw LM Head logits CPU vs Native",
+        cpu_output, native_output, args.vocab
+    ))
     result = {
         "chunks": chunks,
         "n_embd": args.embd,
         "measurements": {},
     }
-    for title, reference, candidate, full_prompt in comparisons:
+    for title, reference, candidate, width in comparisons:
         summary = compare(reference, candidate)
         parts = []
-        if full_prompt:
+        if len(reference) == n_elements and width == args.embd:
             offset = 0
             for index, tokens in enumerate(chunks):
                 count = tokens * args.embd
@@ -119,7 +146,8 @@ def main() -> int:
                 parts.append({"chunk": index, "tokens": tokens, **part})
                 offset += count
         else:
-            # L39 CPU reference contains only the final selected logits row.
+            # The last Transformer layer / final head have only one
+            # selected output token, not all 175 Prompt positions.
             parts = [{"chunk": len(chunks)-1, "tokens": 1, **summary}]
         summary["per_chunk"] = parts
         result["measurements"][title] = summary
