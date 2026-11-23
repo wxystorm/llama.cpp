@@ -38,7 +38,7 @@ ctest --test-dir build-phone-owned -C Release --output-on-failure -R "test-phone
 
 Defaults are the already-tested paths:
 - model `E:\llama\models\Qwen3-14B-Q4_K_M.gguf` by default; select 32B with `-ModelSize 32b`
-- dataset `E:\llama\datasets\sharegpt\sharegpt40`
+- dataset `E:\llama\datasets\sharegpt\sharegpt50_short`
 - Phone RPC `10.71.109.52:10140`
 - 14B default: CPU L0..15, CUDA L16..31, Phone L32..39 (8 HTP layers)
 - 32B default: CPU L0..43, CUDA L44..55, Phone L56..63 (8 HTP layers)
