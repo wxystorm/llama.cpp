@@ -2144,8 +2144,24 @@ bool run_chunk(const char * endpoint, uint64_t run_id,
     // request/response frames across threads.
     const char * async_env = std::getenv("LLAMA_JUPITER_PHONE_OWNED_ASYNC");
     const bool async = async_env && std::strcmp(async_env, "1") == 0;
-    auto sock = async ? get_socket_lane(endpoint, "phone-owned-async") :
-                        get_socket(endpoint);
+    std::shared_ptr<socket_t> sock;
+    if (async) {
+        // Keep this connection alive across all Chunks in the same worker.
+        // The global lane registry stores weak references, so an uncached
+        // temporary socket would otherwise reconnect on every Chunk.
+        static thread_local std::shared_ptr<socket_t> worker_socket;
+        static thread_local std::string worker_endpoint;
+        if (worker_endpoint != endpoint) {
+            worker_socket.reset();
+            worker_endpoint = endpoint;
+        }
+        if (!worker_socket) {
+            worker_socket = get_socket_lane(endpoint, "phone-owned-async");
+        }
+        sock = worker_socket;
+    } else {
+        sock = get_socket(endpoint);
+    }
     if (!sock || !send_rpc_cmd(sock, RPC_CMD_PHONE_OWNED_RUN,
                                req.data(), req.size())) {
         return false;
