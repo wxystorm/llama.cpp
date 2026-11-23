@@ -8,6 +8,8 @@
 
 #include <array>
 #include <cinttypes>
+#include <cmath>
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
@@ -3000,6 +3002,68 @@ bool rpc_server::phone_owned_prepare(
     return true;
 }
 
+// Debug-only F32 native HTP checkpoints for cross-device Qwen3 parity.
+// Disabled unless GGML_RPC_PHONE_OWNED_STAGE_DUMP_DIR is set on the Phone.
+// This reads already-materialized layer output from run_native_prefill_chunk;
+// it does not rebuild the Graph, change KV or introduce an RPC opcode.
+static bool jupiter_phone_owned_dump_stage(
+        uint32_t layer, uint32_t chunk,
+        const std::vector<float> & values) {
+    const char * directory =
+        std::getenv("GGML_RPC_PHONE_OWNED_STAGE_DUMP_DIR");
+    if (!directory || !*directory || (layer != 32 && layer != 39)) {
+        return true;
+    }
+    if (values.empty() || values.size() % 5120 != 0) {
+        GGML_LOG_ERROR(
+            "[JUPITER_PHONE_STAGE_DUMP] layer=%u chunk=%u"
+            " status=FAIL reason=BAD_ACTIVATION_SHAPE\n",
+            layer, chunk);
+        return false;
+    }
+    std::error_code ec;
+    fs::path folder(directory);
+    fs::create_directories(folder, ec);
+    fs::path file = folder / (
+        "l_out-" + std::to_string(layer) +
+        "-chunk" + std::to_string(chunk) + ".f32");
+    std::ofstream stream(file, std::ios::binary | std::ios::trunc);
+    if (ec || !stream) {
+        GGML_LOG_ERROR(
+            "[JUPITER_PHONE_STAGE_DUMP] layer=%u chunk=%u"
+            " status=FAIL reason=OPEN path=%s\n",
+            layer, chunk, file.string().c_str());
+        return false;
+    }
+    stream.write(
+        reinterpret_cast<const char *>(values.data()),
+        std::streamsize(values.size()*sizeof(float)));
+    stream.close();
+    if (!stream) {
+        GGML_LOG_ERROR(
+            "[JUPITER_PHONE_STAGE_DUMP] layer=%u chunk=%u"
+            " status=FAIL reason=WRITE path=%s\n",
+            layer, chunk, file.string().c_str());
+        return false;
+    }
+    size_t nonfinite = 0;
+    long double square_sum = 0.0;
+    for (float v : values) {
+        if (!std::isfinite(v)) {
+            ++nonfinite;
+        } else {
+            square_sum += double(v)*double(v);
+        }
+    }
+    GGML_LOG_INFO(
+        "[JUPITER_PHONE_STAGE_DUMP] layer=%u chunk=%u tokens=%zu"
+        " nonfinite=%zu rms=%.7f path=%s status=PASS\n",
+        layer, chunk, values.size()/5120, nonfinite,
+        std::sqrt(double(square_sum/values.size())),
+        file.string().c_str());
+    return true;
+}
+
 bool rpc_server::phone_owned_run(
         const std::vector<uint8_t> & request,
         std::vector<uint8_t> & response) {
@@ -3055,6 +3119,10 @@ bool rpc_server::phone_owned_run(
         rsp.upload_ms += st.input_upload_ms;
         rsp.compute_ms += st.htp_compute_ms;
         rsp.output_copy_ms += st.output_copy_ms;
+        if (!jupiter_phone_owned_dump_stage(
+                plan.layer + offset, req.chunk, next)) {
+            return false;
+        }
         activation.swap(next);
     }
     rsp.ok = 1;
