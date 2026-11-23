@@ -2993,82 +2993,138 @@ bool rpc_server::phone_owned_prepare(
     }
     const int64_t begin_us = ggml_time_us();
 
-    // The previous completed request has released its *logical* run ID,
-    // but its HTP fixed Graphs are still resident under their original
-    // physical_run_id. No RPC wire change is needed: new logical IDs are
-    // translated to this key only inside phone_owned_run().
-    if (phone_owned_standby != nullptr) {
-        const bool matches = jupiter_phone_owned_persistence_enabled() &&
-            ggml_phone_owned::same_execution_template(
-                phone_owned_standby->plan, plan) &&
-            phone_owned_standby->devices == mapping;
-        bool rearmed = matches;
-        size_t kv_cleared_bytes = 0;
-        std::string miss_reason = matches ? "NONE" : "TEMPLATE_OR_DEVICE_MISMATCH";
-        if (matches) {
-            for (uint32_t offset = 0; offset < count; ++offset) {
-                const uint32_t device = mapping[offset];
-                if (device >= phone_owned_executors.size() ||
-                        !phone_owned_executors[device]) {
-                    rearmed = false;
-                    miss_reason = "RESIDENT_EXECUTOR_MISSING";
-                    break;
-                }
-                auto child = ggml_phone_owned::single_layer_plan(plan, offset);
-                std::string reason;
-                size_t bytes = 0;
-                if (!phone_owned_executors[device]->rearm_native_prefill_graphs(
-                        phone_owned_standby->physical_run_id,
-                        child.region, child, reason, bytes)) {
-                    rearmed = false;
-                    miss_reason = reason;
-                    break;
-                }
-                kv_cleared_bytes += bytes;
+    // One physical HTP Graph generation may contain several different
+    // prompt/chunk shapes. Every graph has a unique fixed UID, persistent
+    // tensor metadata and a private KV allocation. A new logical request
+    // may reuse any matching standby template, independent of the order in
+    // which the templates were first encountered.
+    const auto flush_standby = [&](const char * reason) {
+        if (phone_owned_standby.empty()) { return; }
+        uint64_t bytes = 0;
+        for (const auto & entry : phone_owned_standby) {
+            bytes += entry.resident_bytes;
+        }
+        GGML_LOG_INFO(
+            "[JUPITER_PHONE_OWNED] CACHE_EVICT reason=%s"
+            " entries=%zu resident_mib=%.3f action=FULL_GENERATION\n",
+            reason, phone_owned_standby.size(), bytes/1048576.0);
+        // Hexagon exposes a Session-wide fixed Graph cache clear. All
+        // compiled opnodes may retain tensor addresses; invalidate them
+        // before releasing any resident Graph/KV/scratch allocation.
+        for (auto & owner : phone_owned_executors) {
+            if (owner) { owner->release_owned_htp_graphs(); }
+        }
+        phone_owned_standby.clear();
+    };
+
+    size_t hit_index = phone_owned_standby.size();
+    if (jupiter_phone_owned_persistence_enabled()) {
+        for (size_t i = 0; i < phone_owned_standby.size(); ++i) {
+            const auto & candidate = phone_owned_standby[i];
+            if (ggml_phone_owned::same_execution_template(
+                    candidate.plan, plan) &&
+                    candidate.devices == mapping) {
+                hit_index = i;
+                break;
             }
+        }
+    }
+    if (hit_index < phone_owned_standby.size()) {
+        const uint64_t physical_run_id =
+            phone_owned_standby[hit_index].physical_run_id;
+        const uint64_t resident_bytes =
+            phone_owned_standby[hit_index].resident_bytes;
+        bool rearmed = true;
+        uint64_t kv_cleared_bytes = 0;
+        std::string miss_reason = "NONE";
+        for (uint32_t offset = 0; offset < count; ++offset) {
+            const uint32_t device = mapping[offset];
+            if (device >= phone_owned_executors.size() ||
+                    !phone_owned_executors[device]) {
+                rearmed = false;
+                miss_reason = "RESIDENT_EXECUTOR_MISSING";
+                break;
+            }
+            const auto child =
+                ggml_phone_owned::single_layer_plan(plan, offset);
+            std::string reason;
+            size_t bytes = 0;
+            if (!phone_owned_executors[device]->rearm_native_prefill_graphs(
+                    physical_run_id, child.region, child, reason, bytes)) {
+                rearmed = false;
+                miss_reason = reason;
+                break;
+            }
+            kv_cleared_bytes += bytes;
         }
         if (rearmed) {
             phone_owned_chain chain {};
             chain.plan = plan;
             chain.devices = std::move(mapping);
-            chain.physical_run_id = phone_owned_standby->physical_run_id;
+            chain.physical_run_id = physical_run_id;
+            chain.resident_bytes = resident_bytes;
             phone_owned_chains.emplace(key, std::move(chain));
-            phone_owned_standby.reset();
+            phone_owned_standby.erase(
+                phone_owned_standby.begin() + hit_index);
             response.ok = 1;
-            response.graphs = uint32_t(count *
-                ggml_phone_owned::chunk_count(plan));
+            response.graphs = uint32_t(
+                count * ggml_phone_owned::chunk_count(plan));
             response.wall_ms = (ggml_time_us() - begin_us)/1000.0;
             GGML_LOG_INFO(
                 "[JUPITER_PHONE_OWNED] PREPARE_CACHE status=HIT"
                 " run=%" PRIu64 " physical_run=%" PRIu64
-                " layers=%zu graphs=%u kv_cleared_bytes=%zu"
-                " wall_ms=%.3f\n",
-                plan.run_id,
-                phone_owned_chains.at(key).physical_run_id,
-                count, response.graphs, kv_cleared_bytes,
+                " layers=%zu graphs=%u kv_cleared_bytes=%" PRIu64
+                " retained_other_templates=%zu wall_ms=%.3f\n",
+                plan.run_id, physical_run_id, count, response.graphs,
+                kv_cleared_bytes, phone_owned_standby.size(),
                 response.wall_ms);
             return true;
         }
-        // A different prompt/chunk/session topology cannot reuse the old
-        // fixed tensor pointers. Invalidate Hexagon's compiled UID cache
-        // before freeing Graph/KV/scratch, then prepare a fresh set.
-        GGML_LOG_INFO(
-            "[JUPITER_PHONE_OWNED] PREPARE_CACHE status=MISS"
+        GGML_LOG_WARN(
+            "[JUPITER_PHONE_OWNED] PREPARE_CACHE status=INVALID"
             " run=%" PRIu64 " reason=%s action=REBUILD\n",
             plan.run_id, miss_reason.c_str());
-        for (auto & owner : phone_owned_executors) {
-            if (owner) { owner->release_owned_htp_graphs(); }
+        flush_standby("REARM_FAILED");
+    } else if (!phone_owned_standby.empty()) {
+        uint64_t used_bytes = 0;
+        uint64_t estimated_new_bytes = 0;
+        for (const auto & candidate : phone_owned_standby) {
+            used_bytes += candidate.resident_bytes;
+            estimated_new_bytes = std::max(
+                estimated_new_bytes,
+                ggml_phone_owned::estimate_resident_bytes(
+                    candidate.plan, candidate.resident_bytes, plan));
         }
-        phone_owned_standby.reset();
+        const size_t max_entries =
+            jupiter_phone_owned_cache_entries();
+        const uint64_t budget_bytes =
+            jupiter_phone_owned_cache_budget_bytes();
+        if (ggml_phone_owned::must_evict_generation(
+                phone_owned_standby.size(), max_entries, used_bytes,
+                estimated_new_bytes, budget_bytes)) {
+            const char * reason =
+                phone_owned_standby.size() >= max_entries ?
+                "CAPACITY" : "PROJECTED_MEMORY_BUDGET";
+            flush_standby(reason);
+        }
     }
+    GGML_LOG_INFO(
+        "[JUPITER_PHONE_OWNED] PREPARE_CACHE status=MISS"
+        " run=%" PRIu64 " total_tokens=%u chunk_tokens=%u"
+        " retained_other_templates=%zu action=NEW_TEMPLATE\n",
+        plan.run_id, plan.total_tokens, plan.chunk_tokens,
+        phone_owned_standby.size());
 
     const auto rollback = [&]() {
+        // A partial HTP precompile may have invalidated the Session's
+        // fixed-UID cache, so abandon the whole generation on failure.
         for (auto & owner : phone_owned_executors) {
             if (owner) { owner->release_owned_htp_graphs(); }
         }
-        phone_owned_standby.reset();
+        phone_owned_standby.clear();
         response = {};
     };
+    uint64_t new_template_bytes = 0;
     for (uint32_t offset = 0; offset < count; ++offset) {
         const uint32_t device = mapping[offset];
         if (!phone_owned_executors[device]) {
@@ -3099,6 +3155,16 @@ bool rpc_server::phone_owned_prepare(
             rollback();
             return false;
         }
+        // Track actual new HTP allocations (weights are model-lifetime).
+        if (st.graph_storage_bytes > UINT64_MAX - new_template_bytes ||
+                st.kv_bytes >
+                    UINT64_MAX - new_template_bytes - st.graph_storage_bytes) {
+            GGML_LOG_ERROR("[JUPITER_PHONE_OWNED] PREPARE_REJECT"
+                           " reason=RESIDENT_BYTES_OVERFLOW\n");
+            rollback();
+            return false;
+        }
+        new_template_bytes += st.graph_storage_bytes + st.kv_bytes;
         response.graphs += st.chunks;
         response.build_ms += st.cpu_build_ms;
         response.buffer_alloc_ms += st.buffer_alloc_ms;
@@ -3113,6 +3179,7 @@ bool rpc_server::phone_owned_prepare(
     chain.plan = plan;
     chain.devices = std::move(mapping);
     chain.physical_run_id = plan.run_id;
+    chain.resident_bytes = new_template_bytes;
     phone_owned_chains.emplace(key, std::move(chain));
     response.ok = 1;
     response.wall_ms = (ggml_time_us() - begin_us) / 1000.0;
