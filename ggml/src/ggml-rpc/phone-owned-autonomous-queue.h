@@ -100,8 +100,8 @@ public:
     bool abandoned() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return failed_ || stopped_ ||
-            (!finished_ && std::chrono::steady_clock::now() -
-                last_progress_ > std::chrono::minutes(5));
+            std::chrono::steady_clock::now() - last_progress_ >
+                std::chrono::minutes(5);
     }
 
     uint32_t accepted() const {
