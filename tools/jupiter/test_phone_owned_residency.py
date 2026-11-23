@@ -34,6 +34,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--rpc", required=True)
     p.add_argument("--prompt-file", required=True)
     p.add_argument("--sessions", type=int, choices=(1, 2, 3, 4), default=4)
+    p.add_argument("--pc-layers", type=int, default=32)
+    p.add_argument("--cpu-layers", type=int, default=16)
+    p.add_argument("--context", type=int, default=512)
     p.add_argument("--target-tokens", type=int, default=175)
     p.add_argument("--chunks", default="88,87")
     p.add_argument("--runs", type=int, default=3)
@@ -57,6 +60,9 @@ def main() -> int:
             "--exe", args.exe, "--model", args.model,
             "--rpc", args.rpc, "--prompt-file", args.prompt_file,
             "--sessions", str(args.sessions),
+            "--pc-layers", str(args.pc_layers),
+            "--cpu-layers", str(args.cpu_layers),
+            "--context", str(args.context),
             "--target-tokens", str(args.target_tokens),
             "--chunks", args.chunks,
             "--mode", "native", "--out-dir", str(work),
