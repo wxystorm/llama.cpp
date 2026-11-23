@@ -1487,6 +1487,30 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
 
     llama_memory_clear(mem, true);
 
+    // The Phone-owned native Prefill pilot has a one-shot, phone-side KV
+    // lifetime: calling llama_decode() with two artificial tokens here
+    // consumes its only registered native run BEFORE the real Prompt.
+    // --no-warmup does not disable this capability probe. In this opt-in
+    // configuration, query the normal PC-side memory API without executing
+    // the model; the actual Prompt still validates native KV/HTP correctness.
+    const char * native_env  = std::getenv("LLAMA_JUPITER_PHONE_OWNED_NATIVE");
+    const char * prefill_env = std::getenv("LLAMA_JUPITER_PREFILL");
+    const bool native_prefill = native_env != nullptr && std::atoi(native_env) != 0 &&
+                                prefill_env != nullptr && std::atoi(prefill_env) != 0;
+    if (native_prefill) {
+        if (llama_n_rs_seq(ctx) > 0) {
+            res = COMMON_CONTEXT_SEQ_RM_TYPE_RS;
+        } else if (!llama_memory_seq_rm(mem, 0, 1, -1)) {
+            res = COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+        }
+        llama_memory_clear(mem, true);
+        llama_synchronize(ctx);
+        COM_INF("[JUPITER_PHONE_OWNED_PREFILL] phase=SEQ_RM_PROBE"
+                " mode=MEMORY_ONLY result=%d synthetic_decode=SKIPPED\\n",
+                static_cast<int>(res));
+        return res;
+    }
+
     // eval 2 tokens to check if the context is compatible
     std::vector<llama_token> tmp;
     tmp.push_back(0);
