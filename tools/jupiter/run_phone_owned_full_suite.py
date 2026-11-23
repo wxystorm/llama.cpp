@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-command Qwen3-14B Phone-owned Prefill suite over all ShareGPT prompts.
+"""One-command Qwen3-14B/32B Phone-owned Prefill suite over ShareGPT prompts.
 
 Per Prompt: exact chat-templated Token count -> valid Chunk/KV plan ->
 optional same-shape Graph warmup -> Sync/Phone-autonomous native A/B ->
@@ -28,6 +28,7 @@ from pathlib import Path
 from inspect_phone_owned_overlap import prepare_cost
 from run_phone_owned_full_prefill import logits_comparison, read_logits
 from run_phone_owned_multi_prompt import count_model_tokens
+from phone_owned_models import inspect_model, resolve_splits
 from run_prefill_bench import read_plan
 
 PROMPT_NAME = re.compile(r"^prompt_(.+)_(\d+)$", re.IGNORECASE)
@@ -121,15 +122,23 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--exe", required=True, help="rebuilt llama-cli.exe")
     p.add_argument("--tokenizer", required=True, help="matching llama-tokenize.exe")
-    p.add_argument("--model", required=True, help="Qwen3-14B GGUF")
+    p.add_argument("--model", required=True, help="dense Qwen3-14B/32B GGUF")
+    p.add_argument("--model-size", choices=("auto", "14b", "32b"),
+                   default="auto", help="verify GGUF architecture; default auto")
     p.add_argument("--rpc", required=True, help="running Phone host:port")
     p.add_argument("--prompts-dir", required=True,
                    help="directory containing prompt_0_01.txt, etc.")
     p.add_argument("--pattern", default="prompt_*_*.txt")
-    p.add_argument("--out-dir", default="jupiter-autonomous-full-suite")
-    p.add_argument("--layouts", default="32",
-                   help="comma-separated first Phone layers, e.g. 32,34,36,39")
-    p.add_argument("--cpu-layers", type=int, default=16)
+    p.add_argument("--out-dir", default=None,
+                   help="default: jupiter-autonomous-{14b|32b}-dp-2048")
+    p.add_argument("--layouts", default=None,
+                   help="first Phone layers: 14B 32..39; 32B 56..63")
+    p.add_argument("--cpu-layers", type=int, default=None,
+                   help="PC CPU layers (default 16 for 14B, 44 for 32B)")
+    p.add_argument("--cuda-layers", type=int, default=None,
+                   help="PC CUDA layers; derives CPU when not explicitly set")
+    p.add_argument("--phone-layers", type=int, default=None,
+                   help="Phone HTP suffix layer count 1..8; conflicts with --layouts")
     p.add_argument("--sessions", type=int, choices=(1, 2, 3, 4), default=4)
     p.add_argument("--sequence-policy", choices=("jupiter-dp", "fixed-control"),
                    default="jupiter-dp",
@@ -219,7 +228,9 @@ def preflight(args: argparse.Namespace, files: list[Path],
         "format": 1,
         "exe": file_signature(Path(args.exe)),
         "tokenizer": tokenizer_id,
-        "model": model_id,
+        "model": model_id, "model_size": args.model_size,
+        "model_layers": args.model_layers,
+        "phone_layer_counts": [args.model_layers - x for x in layouts],
         "rpc": args.rpc, "prompt_root": str(Path(args.prompts_dir).resolve()),
         "pattern": args.pattern, "layouts": layouts,
         "cpu_layers": args.cpu_layers, "sessions": args.sessions,
@@ -309,6 +320,7 @@ def cli_for_case(args: argparse.Namespace, case: dict,
         str(Path(__file__).with_name("run_phone_owned_full_prefill.py")),
         "--exe", str(Path(args.exe).resolve()),
         "--model", str(Path(args.model).resolve()),
+        "--model-size", args.model_size,
         "--rpc", args.rpc, "--prompt-file", case["path"],
         "--sessions", str(args.sessions),
         "--pc-layers", str(case["layout"]),
@@ -722,12 +734,20 @@ def publish(output: Path, rows: list[dict],
 
 def run() -> int:
     args = parse_args()
-    layouts = list(dict.fromkeys(int(s.strip()) for s in args.layouts.split(",")))
-    if not layouts or any(x < 32 or x > 39 or
-                          args.cpu_layers < 0 or args.cpu_layers >= x
-                          for x in layouts):
-        raise ValueError("Layouts must be first Phone layers 32..39 "
-                         "with CPU prefix < PC layers")
+    # Validate against the GGUF before any expensive Stage2/Stage3 calibration.
+    model = inspect_model(Path(args.model), args.model_size)
+    layouts, args.cpu_layers = resolve_splits(
+        model, layouts=args.layouts, cpu_layers=args.cpu_layers,
+        cuda_layers=args.cuda_layers, phone_layers=args.phone_layers)
+    args.model_size = model.family
+    args.model_layers = model.layers
+    if args.out_dir is None:
+        args.out_dir = f"jupiter-autonomous-{model.family}-dp-2048"
+    print(f"[PHONE_SUITE_MODEL] model=Qwen3-{model.family.upper()}"
+          f" layers={model.layers} CPU={args.cpu_layers}"
+          f" first_phone={layouts} GPU={[x-args.cpu_layers for x in layouts]}"
+          f" HTP={[model.layers-x for x in layouts]}"
+          " context=2048 status=VALIDATED", flush=True)
     if (args.repeats < 1 or args.expected_count < 0 or args.chunk_size < 1 or
             args.timeout_seconds < 0 or args.stage2_repeats < 1 or
             args.q_repeats < 1 or args.refine_repeats < 1 or
@@ -750,7 +770,8 @@ def run() -> int:
                          f"found {len(files)}. Refusing partial experiment.")
     plan = preflight(args, files, layouts, output)
     cases = build_cases(plan, layouts, args.repeats, args.revisit_first)
-    print(f"[PHONE_SUITE] prompts={len(files)} layouts={layouts}"
+    print(f"[PHONE_SUITE] model=Qwen3-{model.family.upper()}"
+          f" prompts={len(files)} layouts={layouts}"
           f" repeats={args.repeats} total_pairs={len(cases)}"
           f" context=2048 batch=2048 sequence_policy={args.sequence_policy}"
           f" warmup={not args.no_warmup} status=PLANNED", flush=True)
