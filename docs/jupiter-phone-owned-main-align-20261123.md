@@ -98,6 +98,40 @@ Check the Phone `[PHONE_OWNED_SCRATCH]` log for
 `mode=REGION_SINGLE_SLOT`, `PREPARE_LAYER` for every assigned Layer,
 `RUN_DONE` for every Chunk, and final PC `output=REAL_LOGITS`.
 
+## Interpreting the first real async A/B
+
+A 175-token two-Chunk run returned exact F32 logits parity
+(151936 elements, max error 0, cosine 1), while the recorded prefill
+times were 11375.64 ms (sync) and 9701.46 ms (async).
+
+**These are observed single-run times, not yet an attributable speedup.**
+The runner executes synchronous first and asynchronous second; warming of
+PC cache, CUDA/model state or Phone resident HTP Graphs is a confound.
+
+The original `phone_rpc_spanned_next_enqueue=0` condition tests only
+whether the next Phone request was enqueued while the previous Phone RPC
+was running. It can be zero even when the previous Phone RPC overlaps
+part of the next PC prefix computation, which occurs BEFORE enqueue.
+
+To analyze the already saved trace without rerunning inference:
+
+```powershell
+python .\tools\jupiter\inspect_phone_owned_overlap.py `
+  --sync-log ".\jupiter-phone-async-ab\sync\native-full-prefill.log" `
+  --async-log ".\jupiter-phone-async-ab\async\native-full-prefill.log" `
+  --out ".\jupiter-phone-async-ab\overlap-inspection.json"
+```
+
+The offline tool intersects the previous Phone RPC run interval with
+the next PC **ubatch processing window**. This is stronger evidence of
+host-side overlap, but a GPU/NPU hardware timeline is still necessary
+for device-kernel overlap claims. It also compares the prepare phase
+costs for cold/warm bias.
+
+For a performance conclusion, prewarm both variants and rerun in
+reversed or alternating sync/async order with matching Graph cache
+states. Only compare repeated, comparable warm runs.
+
 ## Remaining integration to match the reference Runtime
 
 The Region Ring reference uses `RPC_CMD_PHONE_INPUT_STREAM_RUN`,
