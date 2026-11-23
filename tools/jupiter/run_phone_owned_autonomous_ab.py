@@ -15,23 +15,37 @@ from pathlib import Path
 
 from inspect_phone_owned_overlap import prepare_cost
 from run_phone_owned_full_prefill import logits_comparison, read_logits
+from phone_owned_models import inspect_model, resolve_splits
 
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--exe", required=True)
     p.add_argument("--model", required=True)
+    p.add_argument("--model-size", choices=("auto", "14b", "32b"), default="auto")
     p.add_argument("--rpc", required=True)
     p.add_argument("--prompt-file", required=True)
     p.add_argument("--sessions", type=int, choices=(1, 2, 3, 4), default=4)
-    p.add_argument("--pc-layers", type=int, default=32)
-    p.add_argument("--cpu-layers", type=int, default=16)
+    p.add_argument("--pc-layers", type=int, default=None)
+    p.add_argument("--cpu-layers", type=int, default=None)
+    p.add_argument("--cuda-layers", type=int, default=None)
+    p.add_argument("--phone-layers", type=int, default=None)
     p.add_argument("--context", type=int, default=512)
     p.add_argument("--target-tokens", type=int, default=175)
     p.add_argument("--chunks", default="88,87")
     p.add_argument("--out-dir", default="jupiter-autonomous-ab")
     p.add_argument("--reverse-order", action="store_true")
     args = p.parse_args()
+    spec = inspect_model(Path(args.model), args.model_size)
+    layout, cpu = resolve_splits(
+        spec, layouts=str(args.pc_layers) if args.pc_layers is not None else None,
+        cpu_layers=args.cpu_layers, cuda_layers=args.cuda_layers,
+        phone_layers=args.phone_layers)
+    args.pc_layers, args.cpu_layers = layout[0], cpu
+    args.model_size = spec.family
+    print(f"[PHONE_AUTONOMOUS_AB] model=Qwen3-{spec.family.upper()}"
+          f" CPU={cpu} CUDA={args.pc_layers-cpu}"
+          f" HTP={spec.layers-args.pc_layers}", flush=True)
 
     chunks = [int(x) for x in args.chunks.split(",")]
     if len(chunks) < 1 or sum(chunks) != args.target_tokens:
@@ -50,6 +64,7 @@ def main() -> int:
             sys.executable, str(runner),
             "--exe", args.exe,
             "--model", args.model,
+            "--model-size", args.model_size,
             "--rpc", args.rpc,
             "--prompt-file", args.prompt_file,
             "--sessions", str(args.sessions),
@@ -102,6 +117,11 @@ def main() -> int:
     auto_ms = results["autonomous"]["prompt_eval_ms"]
     record = {
         "order": list(order),
+        "model": "Qwen3-" + spec.family.upper(),
+        "model_layers": spec.layers,
+        "cpu_layers": cpu,
+        "cuda_layers": args.pc_layers-cpu,
+        "phone_layers": spec.layers-args.pc_layers,
         "status": "PASS" if correct else "FAIL",
         "parity_input_a": "sync_native",
         "parity_input_b": "phone_autonomous",
