@@ -315,19 +315,19 @@ struct jupiter_phone_owned_native_state {
                 std::getenv("LLAMA_JUPITER_HTP_SESSIONS")) {
             sessions = (uint32_t) std::atoi(sessions_env);
         }
-        if (sessions != 1 && sessions != 4) {
-            fail("PILOT_REQUIRES_HTP_SESSIONS_1_OR_4");
+        if (sessions < 1 || sessions > 4) {
+            fail("PILOT_REQUIRES_HTP_SESSIONS_1_TO_4");
             return false;
         }
         phone_first_layer = uint32_t(native_first);
         phone_layers = 40 - phone_first_layer;
+        const uint32_t active_sessions = std::min(sessions, phone_layers);
         std::vector<uint32_t> devices(phone_layers, 0);
-        if (sessions == 4) {
-            for (uint32_t i = 0; i < phone_layers; ++i) {
-                // Contiguous, balanced mapping; the original 8-layer
-                // pilot remains [0,0,1,1,2,2,3,3].
-                devices[i] = (i * 4) / phone_layers;
-            }
+        for (uint32_t i = 0; i < phone_layers; ++i) {
+            // Contiguous, balanced mapping; the original eight-layer S4
+            // pilot remains [0,0,1,1,2,2,3,3]. Skip unused Sessions when
+            // fewer Phone Layers exist than HTP devices.
+            devices[i] = (i * active_sessions) / phone_layers;
         }
 
         // Exact scalar parameters of the regular Qwen3 graph. No weight,
