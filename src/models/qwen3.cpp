@@ -62,9 +62,15 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
     const bool phone_native = params.jupiter_phone_owned_op != nullptr;
     const int phone_first = phone_native ? params.jupiter_phone_first_layer : int(n_layer);
     if (phone_native) {
-        GGML_ASSERT(n_layer == 40 && n_embd == 5120 &&
-                    phone_first >= 32 && phone_first < n_layer &&
-                    "Phone-owned Prefill supports 1..8 Qwen3-14B suffix layers");
+        const bool dense_qwen3_supported =
+            ((n_layer == 40 && n_head == 40) ||
+             (n_layer == 64 && n_head == 64)) && n_embd == 5120 &&
+            n_head_kv == 8 && n_embd_head == 128;
+        GGML_ASSERT(dense_qwen3_supported &&
+                    phone_first >= int(n_layer) - 8 &&
+                    phone_first < int(n_layer) &&
+                    "Phone-owned Prefill supports Qwen3-14B/32B"
+                    " 1..8 contiguous final HTP layers");
     }
 
     inpL = build_inp_embd(model.tok_embd);
