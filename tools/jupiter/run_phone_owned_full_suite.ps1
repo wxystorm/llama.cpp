@@ -22,6 +22,7 @@ param(
     [string]$Model = "",
     [string]$Rpc = "10.71.109.52:10140",
     [string]$PromptsDir = "E:\llama\datasets\sharegpt\sharegpt40",
+    [string]$Pattern = "prompt_*_*.txt",
     [string]$OutDir = "",
     [ValidateSet("jupiter-dp", "fixed-control")]
     [string]$SequencePolicy = "jupiter-dp",
@@ -74,6 +75,7 @@ try {
         "--model-size", $ModelSize,
         "--rpc", $Rpc,
         "--prompts-dir", $PromptsDir,
+        "--pattern", $Pattern,
         "--sequence-policy", $SequencePolicy,
         "--expected-count", [string]$ExpectedCount,
         "--repeats", [string]$Repeats,
