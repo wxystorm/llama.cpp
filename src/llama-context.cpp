@@ -16,6 +16,7 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <array>
 #include <condition_variable>
 #include <deque>
 #include <cinttypes>
@@ -161,6 +162,8 @@ struct jupiter_phone_owned_native_state {
     uint64_t run_id = 0;
     uint32_t total_tokens = 0;
     uint32_t chunk_tokens = 0;
+    uint32_t chunk_count = 0;
+    std::array<uint32_t, 16> chunk_schedule {};
     uint32_t next_chunk = 0;
     uint32_t phone_first_layer = 32;
     uint32_t phone_layers = 8;
@@ -201,7 +204,7 @@ struct jupiter_phone_owned_native_state {
     }
 
     void async_loop() {
-        const uint32_t last = (total_tokens + chunk_tokens - 1) / chunk_tokens - 1;
+        const uint32_t last = chunk_count - 1;
         for (;;) {
             async_job job;
             {
@@ -274,9 +277,7 @@ struct jupiter_phone_owned_native_state {
         const auto & hp = model.hparams;
         const int native_first = llama_jupiter::model_pc_layers(32);
         const uint32_t native_ctx = cparams.n_ctx_seq;
-        const uint32_t n_chunks = first_chunk == 0 ? 0 :
-            (tokens + first_chunk - 1) / first_chunk;
-        if (model.arch != LLM_ARCH_QWEN3 || hp.n_layer() != 40 ||
+         if (model.arch != LLM_ARCH_QWEN3 || hp.n_layer() != 40 ||
                 hp.n_embd != 5120 || hp.n_head() != 40 ||
                 hp.n_head_kv() != 8 || hp.n_embd_head_k() != 128 ||
                 native_first < 32 || native_first >= 40 ||
@@ -284,7 +285,7 @@ struct jupiter_phone_owned_native_state {
                 native_ctx < 256 || native_ctx > 4096 ||
                 tokens < 2 || tokens > native_ctx ||
                 first_chunk == 0 || first_chunk > tokens ||
-                first_chunk > 4096 || n_chunks > 16 ||
+                first_chunk > 4096 ||
                 !model.output || !model.output_norm) {
             fail("UNSUPPORTED_QWEN3_14B_FRESH_PREFILL_SHAPE_OR_KV");
             return false;
@@ -359,7 +360,52 @@ struct jupiter_phone_owned_native_state {
         plan.region = 0;
         plan.layer = phone_first_layer;
         plan.total_tokens = tokens;
-        plan.chunk_tokens = first_chunk;
+        // The original Jupiter Sequence DP may select unequal Chunk widths.
+        // Use the exact explicit sequence that llama.cpp's balloc applies.
+        // Without an override, preserve the older uniform + tail path.
+        std::vector<uint32_t> cuts;
+        if (const char * requested = std::getenv("LLAMA_JUPITER_SEQUENCE_PLAN")) {
+            if (*requested) {
+                const char * cursor = requested;
+                for (;;) {
+                    char * end = nullptr;
+                    const unsigned long value = std::strtoul(cursor, &end, 10);
+                    if (end == cursor || value == 0 || value > 4096 ||
+                            cuts.size() >= chunk_schedule.size()) {
+                        fail("INVALID_JUPITER_EXPLICIT_DP_CHUNKS");
+                        return false;
+                    }
+                    cuts.push_back(uint32_t(value));
+                    if (*end == '\0') { break; }
+                    if (*end != ',' || end[1] == '\0') {
+                        fail("INVALID_JUPITER_EXPLICIT_DP_DELIMITER");
+                        return false;
+                    }
+                    cursor = end + 1;
+                }
+            }
+        }
+        if (cuts.empty()) {
+            for (uint32_t remaining = tokens; remaining;) {
+                cuts.push_back(std::min(first_chunk, remaining));
+                remaining -= cuts.back();
+            }
+        }
+        uint64_t sum = 0;
+        for (uint32_t x : cuts) { sum += x; }
+        if (cuts.empty() || cuts.size() > chunk_schedule.size() ||
+                cuts.front() != first_chunk || sum != tokens) {
+            fail("JUPITER_DP_PLAN_MISMATCH_WITH_ACTUAL_UBATCH");
+            return false;
+        }
+        chunk_schedule.fill(0);
+        std::copy(cuts.begin(), cuts.end(), chunk_schedule.begin());
+        chunk_count = uint32_t(cuts.size());
+        plan.schedule_count = chunk_count;
+        for (uint32_t i = 0; i < chunk_count; ++i) {
+            plan.schedule[i] = chunk_schedule[i];
+        }
+        plan.chunk_tokens = *std::max_element(cuts.begin(), cuts.end());
         plan.n_embd = hp.n_embd;
         plan.position_base = 0;
         plan.kv_capacity = cparams.n_ctx_seq;
@@ -393,6 +439,10 @@ struct jupiter_phone_owned_native_state {
         total_tokens = tokens;
         chunk_tokens = first_chunk;
         prepared = true;
+        LLAMA_LOG_INFO("[JUPITER_PHONE_OWNED_PREFILL] phase=JUPITER_DP_SCHEDULE"
+                       " run=%" PRIu64 " chunks=%u first=%u max=%u"
+                       " source=LLAMA_JUPITER_SEQUENCE_PLAN_OR_DEFAULT status=READY\n",
+                       run_id, chunk_count, first_chunk, plan.chunk_tokens);
         if (const char * setting = std::getenv("LLAMA_JUPITER_PHONE_OWNED_AUTONOMOUS")) {
             autonomous_enabled = std::strcmp(setting, "1") == 0;
         }
@@ -458,16 +508,12 @@ struct jupiter_phone_owned_native_state {
                 src->ne[0] != 5120 || dst->ne[0] != 5120 ||
                 src->ne[1] != dst->ne[1] ||
                 ggml_nbytes(src) != ggml_nbytes(dst) ||
-                state->next_chunk >=
-                    (state->total_tokens + state->chunk_tokens - 1) /
-                    state->chunk_tokens) {
+                state->next_chunk >= state->chunk_count) {
             state->fail("INVALID_NATIVE_GRAPH_CALLBACK_LAYOUT_OR_FIFO");
             zero_output();
             return;
         }
-        const uint32_t token_begin = state->next_chunk * state->chunk_tokens;
-        const uint32_t expected_tokens = std::min(
-            state->chunk_tokens, state->total_tokens - token_begin);
+        const uint32_t expected_tokens = state->chunk_schedule[state->next_chunk];
         if (src->ne[1] != (int64_t) expected_tokens) {
             state->fail("CHUNK_SCHEDULE_MISMATCH");
             zero_output();
@@ -476,9 +522,7 @@ struct jupiter_phone_owned_native_state {
         const size_t n_floats = size_t(expected_tokens)*5120;
         if (state->autonomous_enabled) {
             const uint32_t chunk = state->next_chunk;
-            const uint32_t last = (state->total_tokens +
-                                   state->chunk_tokens - 1) /
-                                   state->chunk_tokens - 1;
+            const uint32_t last = state->chunk_count - 1;
             const int64_t begin_us = ggml_time_us();
             if (!state->auto_push_fn(
                     state->endpoint.c_str(), state->run_id, state->run_id,
@@ -526,8 +570,7 @@ struct jupiter_phone_owned_native_state {
         }
         if (state->async_enabled) {
             const uint32_t this_chunk = state->next_chunk;
-            const uint32_t last = (state->total_tokens + state->chunk_tokens - 1) /
-                state->chunk_tokens - 1;
+            const uint32_t last = state->chunk_count - 1;
             {
                 std::unique_lock<std::mutex> lock(state->async_mutex);
                 state->async_cv.wait(lock, [&] {
@@ -3086,8 +3129,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     if (jupiter_phone_native) {
         const auto & state = *jupiter_phone_native;
-        const uint32_t expected =
-            (state.total_tokens + state.chunk_tokens - 1) / state.chunk_tokens;
+        const uint32_t expected = state.chunk_count;
         if (state.failed || !state.prepared ||
                 state.next_chunk != expected) {
             LLAMA_LOG_ERROR(
