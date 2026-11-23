@@ -477,7 +477,7 @@ def exact_jupiter_dp_plan(args: argparse.Namespace, case: dict,
             int(lines.get("model.cpu_layers", 0)) != args.cpu_layers):
         raise ValueError(f"Jupiter model/CPU placement mismatch: {plan_file}")
     chunks = read_plan(plan_file).get(case["tokens"])
-    if (not chunks or len(chunks) < 2 or len(chunks) > 16 or
+    if (not chunks or len(chunks) > 16 or
             sum(chunks) != case["tokens"] or
             chunks != summary.get("chunks") or
             max(chunks) > args.max_chunk):
