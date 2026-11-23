@@ -35,6 +35,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--require-revisit-hit", action="store_true",
                    help="fail if the replayed first shape was evicted")
     p.add_argument("--sessions", type=int, choices=(1, 4), default=4)
+    p.add_argument("--pc-layers", type=int, default=32)
+    p.add_argument("--cpu-layers", type=int, default=16)
+    p.add_argument("--context", type=int, default=512)
     p.add_argument("--chunk-size", type=int, default=88)
     p.add_argument("--out-dir", default="phone-owned-multi-prompt-s4")
     return p.parse_args()
@@ -69,9 +72,9 @@ def count_model_tokens(
 
 
 def chunks_for(n_tokens: int, size: int) -> list[int]:
-    if not 2 <= n_tokens <= 512 or not 1 <= size <= 128:
+    if not 2 <= n_tokens <= 4096 or not 1 <= size <= 4096:
         raise ValueError(
-            f"pilot requires 2..512 tokens and chunk size 1..128; "
+            f"native requires 2..4096 tokens and chunk size 1..4096; "
             f"got {n_tokens} and {size}"
         )
     chunks = [size] * (n_tokens // size)
@@ -86,8 +89,12 @@ def run() -> int:
     args = parse_args()
     if args.require_revisit_hit and not args.revisit_first:
         raise ValueError("--require-revisit-hit needs --revisit-first")
-    if not 1 <= args.chunk_size <= 128:
-        raise ValueError("--chunk-size must be 1..128")
+    if not 1 <= args.chunk_size <= 4096:
+        raise ValueError("--chunk-size must be 1..4096")
+    if not 256 <= args.context <= 4096 or args.context % 256 != 0:
+        raise ValueError("--context must be 256..4096 and divisible by 256")
+    if not 32 <= args.pc_layers <= 39 or not 0 <= args.cpu_layers < args.pc_layers:
+        raise ValueError("--pc-layers must be 32..39 and CPU prefix must be smaller")
     exe = Path(args.exe).resolve()
     tokenizer = Path(args.tokenizer).resolve()
     model = Path(args.model).resolve()
@@ -108,6 +115,8 @@ def run() -> int:
         if not prompt:
             raise ValueError(f"empty Prompt: {path}")
         token_counts[path] = count_model_tokens(tokenizer, model, prompt)
+        if token_counts[path] > args.context:
+            raise ValueError(f"{path.name}: tokens exceed context {args.context}")
         chunks = chunks_for(token_counts[path], args.chunk_size)
         print(f"[PHONE_MULTI_PROMPT] prompt={path.name} "
               f"tokens={token_counts[path]} chunks={chunks}", flush=True)
@@ -132,6 +141,9 @@ def run() -> int:
             "--exe", str(exe), "--model", str(model),
             "--rpc", args.rpc, "--prompt-file", str(path),
             "--sessions", str(args.sessions),
+            "--pc-layers", str(args.pc_layers),
+            "--cpu-layers", str(args.cpu_layers),
+            "--context", str(args.context),
             "--target-tokens", str(n_tokens),
             "--chunks", ",".join(map(str, chunks)),
             "--mode", "native", "--out-dir", str(work),
