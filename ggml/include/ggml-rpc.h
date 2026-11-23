@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    6
+#define RPC_PROTO_PATCH_VERSION    7
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -32,6 +32,9 @@ struct ggml_rpc_phone_owned_plan {
     uint32_t layer;
     uint32_t total_tokens;
     uint32_t chunk_tokens;
+    // Exact Jupiter Sequence DP cuts (0 = legacy uniform-width plan).
+    uint32_t schedule_count;
+    uint32_t schedule[16];
     uint32_t n_embd;
     uint32_t position_base;
     uint32_t kv_capacity;
