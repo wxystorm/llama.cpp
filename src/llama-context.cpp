@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <map>
@@ -27,6 +28,97 @@
 #include <string>
 #include <unordered_set>
 
+
+// Optional single-request CPU/CUDA checkpoint extraction for full-accuracy
+// parity. The GGML scheduler's evaluation callback synchronizes the owning
+// backend immediately before invoking us with ask=false. This preserves
+// original model operations, although it deliberately disables benchmark
+// timing equivalence (a callback creates more compute subgraphs).
+struct jupiter_stage_dump_state {
+    std::filesystem::path dir;
+    uint32_t target_tokens = 175;
+    uint32_t active_tokens = 0;
+    bool active = false;
+    bool failed = false;
+    std::map<std::string, uint32_t> seen;
+
+    explicit jupiter_stage_dump_state(const std::string & dir_in, uint32_t tokens) :
+        dir(dir_in), target_tokens(tokens) {}
+
+    static bool observe(ggml_tensor * t, bool ask, void * user_data) {
+        auto * st = static_cast<jupiter_stage_dump_state *>(user_data);
+        if (!st || !st->active || !t) { return false == ask; }
+        const std::string stage(t->name);
+        const bool selected = stage == "l_out-31" ||
+                              stage == "l_out-32" ||
+                              stage == "l_out-39" ||
+                              stage == "phone_owned_hidden";
+        if (ask) { return selected; }
+        if (!selected) { return true; }
+        if (t->type != GGML_TYPE_F32 || t->ne[0] != 5120 ||
+                !ggml_is_contiguous(t) || t->buffer == nullptr) {
+            st->failed = true;
+            LLAMA_LOG_ERROR("[JUPITER_STAGE_DUMP] stage=%s status=FAIL"
+                            " reason=UNSUPPORTED_TENSOR_LAYOUT type=%d ne0=%" PRId64 "\n",
+                            stage.c_str(), (int)t->type, t->ne[0]);
+            return true;
+        }
+        const size_t bytes = ggml_nbytes(t);
+        if (bytes == 0 || bytes % sizeof(float) != 0 ||
+                bytes > size_t(512)*5120*sizeof(float)) {
+            st->failed = true;
+            LLAMA_LOG_ERROR("[JUPITER_STAGE_DUMP] stage=%s status=FAIL"
+                            " reason=BAD_TENSOR_SIZE bytes=%zu\n",
+                            stage.c_str(), bytes);
+            return true;
+        }
+        std::vector<float> values(bytes/sizeof(float));
+        ggml_backend_tensor_get(t, values.data(), 0, bytes);
+        size_t nonfinite = 0;
+        long double square_sum = 0.0;
+        float min_value = std::numeric_limits<float>::infinity();
+        float max_value = -std::numeric_limits<float>::infinity();
+        for (float value : values) {
+            if (!std::isfinite(value)) {
+                ++nonfinite;
+            } else {
+                square_sum += double(value)*double(value);
+                min_value = std::min(min_value, value);
+                max_value = std::max(max_value, value);
+            }
+        }
+        std::error_code ec;
+        std::filesystem::create_directories(st->dir, ec);
+        const auto file = st->dir / (stage + ".f32");
+        const bool first = st->seen[stage] == 0;
+        std::ofstream stream(
+            file, std::ios::binary | (first ? std::ios::trunc : std::ios::app));
+        if (!ec && stream) {
+            stream.write(reinterpret_cast<const char *>(values.data()),
+                         std::streamsize(bytes));
+            stream.close();
+        }
+        if (ec || !stream) {
+            st->failed = true;
+            LLAMA_LOG_ERROR("[JUPITER_STAGE_DUMP] stage=%s status=FAIL"
+                            " reason=FILE_WRITE path=%s\n",
+                            stage.c_str(), file.string().c_str());
+            return true;
+        }
+        ++st->seen[stage];
+        const uint32_t tokens = uint32_t(values.size()/5120);
+        LLAMA_LOG_INFO(
+            "[JUPITER_STAGE_DUMP] stage=%s part=%u tokens=%u"
+            " nonfinite=%zu rms=%.7f min=%.7f max=%.7f"
+            " path=%s status=PASS\n",
+            stage.c_str(), st->seen[stage]-1, tokens, nonfinite,
+            std::sqrt(double(square_sum/values.size())),
+            nonfinite == values.size() ? 0.0 : double(min_value),
+            nonfinite == values.size() ? 0.0 : double(max_value),
+            file.string().c_str());
+        return true;
+    }
+};
 
 // Native Phone-owned Prefill (Qwen3-14B pilot). Unlike the legacy Jupiter
 // path, the CPU GGML custom op calls the Phone Graph that owns the final
@@ -357,6 +449,35 @@ llama_context::llama_context(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+
+    // Debug-only per-layer F32 checkpoint. This intentionally changes
+    // scheduler split/timing behavior: NEVER enable for speed benchmarks.
+    if (const char * dump_dir = std::getenv("LLAMA_JUPITER_STAGE_DUMP_DIR")) {
+        if (*dump_dir) {
+            if (cparams.cb_eval) {
+                throw std::runtime_error(
+                    "Jupiter Stage Dump cannot replace an existing eval callback");
+            }
+            uint32_t target = 175;
+            if (const char * target_env =
+                    std::getenv("LLAMA_JUPITER_STAGE_DUMP_TOKENS")) {
+                const int parsed = std::atoi(target_env);
+                if (parsed <= 0 || parsed > 512) {
+                    throw std::runtime_error(
+                        "LLAMA_JUPITER_STAGE_DUMP_TOKENS must be in 1..512");
+                }
+                target = uint32_t(parsed);
+            }
+            jupiter_stage_dump =
+                std::make_unique<jupiter_stage_dump_state>(dump_dir, target);
+            cparams.cb_eval = jupiter_stage_dump_state::observe;
+            cparams.cb_eval_user_data = jupiter_stage_dump.get();
+            LLAMA_LOG_INFO(
+                "[JUPITER_STAGE_DUMP] mode=ENABLED expected_tokens=%u"
+                " dir=%s timing=NOT_COMPARABLE\n",
+                target, dump_dir);
+        }
+    }
 
     cparams.ctx_other = nullptr;
 
@@ -2176,6 +2297,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
+
+    if (jupiter_stage_dump) {
+        // Do not record the llama-server two-token seq_rm capability probe;
+        // record only the full Prompt whose exact token count was requested.
+        jupiter_stage_dump->active =
+            n_tokens_all == jupiter_stage_dump->target_tokens;
+        if (jupiter_stage_dump->active) {
+            LLAMA_LOG_INFO(
+                "[JUPITER_STAGE_DUMP] phase=ARM"
+                " tokens=%u outputs=%u status=PASS\n",
+                n_tokens_all, n_outputs_all);
+        }
+    }
 
     if (output_all) {
         // require that all tokens are output
