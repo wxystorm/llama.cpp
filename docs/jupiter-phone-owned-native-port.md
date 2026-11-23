@@ -166,6 +166,48 @@ Each client must rebuild its RPC library and the Phone must rebuild and
 restart the v4.0.5 server. Never combine this RPC version with an older
 Phone instance in native mode.
 
+## Debug: full-Prefill numerical checkpoint parity
+
+The first native real Prompt run produced finite logits but a different
+Top-1 ID and cosine -0.07496 compared with the correct pure-CPU baseline.
+A non-NaN output is not proof of model correctness.
+
+The branch now provides two entirely optional debugging interfaces:
+
+- PC: LLAMA_JUPITER_STAGE_DUMP_DIR=<absolute local directory> and
+  LLAMA_JUPITER_STAGE_DUMP_TOKENS=175. GGML scheduler eval callback
+  saves L31/L32/L39 F32 stage outputs only during the 175-token request,
+  not the synthetic two-token startup probe.
+- Phone: GGML_RPC_PHONE_OWNED_STAGE_DUMP_DIR=<Termux directory> set before
+  starting the rebuilt RPC server. When running native HTP Layers 32 and 39
+  it writes l_out-32-chunk0.f32, l_out-32-chunk1.f32,
+  l_out-39-chunk0.f32 and l_out-39-chunk1.f32.
+- Native PC: add --stage-dump to run_phone_owned_full_prefill.py;
+  this saves native-pc-stages/l_out-31.f32 and phone_owned_hidden.f32.
+
+Rebuild PC llama-cli and Phone ggml-rpc-server from this branch before
+enabling checkpoints. The phone file export requires restarting the server
+with the GGML_RPC_PHONE_OWNED_STAGE_DUMP_DIR environment variable.
+
+To get reference intermediate tensors, run normal pure-CPU llama-cli on
+the same real Prompt (175 tokens), with -ngl 0, --flash-attn on, -n 1,
+context 512, and LLAMA_JUPITER_PREFILL=0, while the PC dump variables
+are enabled. The expected files are l_out-31.f32, l_out-32.f32 and
+l_out-39.f32. Use a different directory for the native PC dump.
+Transfer four phone HTP checkpoint files into one local PC directory.
+
+Use compare_phone_owned_stages.py with --cpu-dir, --native-dir and
+--phone-dir. It prints cosine, relative RMSE, absolute error and per-chunk
+(88 and 87 tokens) differences at four comparison points:
+
+1. CPU L31 versus native PC L31 (PC prefix correctness).
+2. CPU L32 versus HTP L32 (first Phone layer correctness).
+3. CPU L39 versus HTP L39 (full Phone suffix correctness).
+4. HTP L39 versus native PC phone_owned_hidden (RPC transfer parity).
+
+Do NOT use these debug runs for performance claims. Scheduler eval
+callbacks synchronize and split compute; phone dumps add file I/O.
+
 ## Next verification before performance claims
 
 1. Check compilation on Windows MSVC and Termux HTP.
