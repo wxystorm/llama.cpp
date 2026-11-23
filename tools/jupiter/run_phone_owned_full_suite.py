@@ -33,6 +33,9 @@ from run_prefill_bench import read_plan
 
 PROMPT_NAME = re.compile(r"^prompt_(.+)_(\d+)$", re.IGNORECASE)
 CHUNK_BUCKETS = (32, 64, 88, 96, 128, 192, 256, 384, 512, 768, 1024, 2048, 4096)
+# ShareGPT40: exactly five Prompt-length groups, ten prompts each.
+# Do not accidentally include the separate 2048 / 2048-4000 group.
+DEFAULT_GROUPS = "0,128,256,512,1024"
 FIELDNAMES = (
     "layout", "group", "prompt", "kind", "repeat", "status", "tokens",
     "context", "chunks", "chunk_size", "n_chunks",
@@ -129,6 +132,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--prompts-dir", required=True,
                    help="directory containing prompt_0_01.txt, etc.")
     p.add_argument("--pattern", default="prompt_*_*.txt")
+    p.add_argument("--groups", default=DEFAULT_GROUPS,
+                   help="comma-separated filename groups to test; default "
+                        "0,128,256,512,1024 (5x10=50); 'all' opts in to "
+                        "other groups including 2048")
     p.add_argument("--out-dir", default=None,
                    help="default: jupiter-autonomous-{14b|32b}-dp-2048")
     p.add_argument("--layouts", default=None,
@@ -176,18 +183,28 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def discover(root: Path, pattern: str) -> list[Path]:
+def discover(root: Path, pattern: str,
+             groups: set[str] | None = None) -> list[Path]:
     if not root.is_dir():
         raise NotADirectoryError(root)
-    files = sorted(
+    candidates = sorted(
         (p.resolve() for p in root.glob(pattern) if p.is_file()),
         key=lambda p: group_key(p.name))
-    if not files:
+    if not candidates:
         raise ValueError(f"No Prompt files matching {pattern!r} in {root}")
-    if len({p.name.lower() for p in files}) != len(files):
+    if len({p.name.lower() for p in candidates}) != len(candidates):
         raise ValueError("Duplicate Prompt filenames")
-    for path in files:
-        group_of(path)
+    files = [p for p in candidates if groups is None or group_of(p) in groups]
+    if not files:
+        raise ValueError(f"No Prompt files in requested groups {groups}; "
+                         f"pattern={pattern!r}, directory={root}")
+    if groups is not None:
+        actual_groups = sorted({group_of(p) for p in files},
+                               key=lambda s: group_key(f"prompt_{s}_01.txt"))
+        print(f"[PHONE_SUITE_DISCOVER] selected={len(files)} "
+              f"excluded={len(candidates)-len(files)} "
+              f"groups={','.join(actual_groups)} "
+              f"status=FILTERED_BEFORE_TOKENIZATION", flush=True)
     return files
 
 
@@ -232,7 +249,8 @@ def preflight(args: argparse.Namespace, files: list[Path],
         "model_layers": args.model_layers,
         "phone_layer_counts": [args.model_layers - x for x in layouts],
         "rpc": args.rpc, "prompt_root": str(Path(args.prompts_dir).resolve()),
-        "pattern": args.pattern, "layouts": layouts,
+        "pattern": args.pattern, "groups": args.groups,
+        "layouts": layouts,
         "cpu_layers": args.cpu_layers, "sessions": args.sessions,
         "sequence_policy": args.sequence_policy,
         "chunk_size": args.chunk_size, "context": 2048, "batch": 2048,
@@ -764,7 +782,21 @@ def run() -> int:
             raise FileNotFoundError(getattr(args, name))
     output = Path(args.out_dir).resolve()
     output.mkdir(parents=True, exist_ok=True)
-    files = discover(Path(args.prompts_dir), args.pattern)
+    group_arg = args.groups.strip()
+    if not group_arg:
+        raise ValueError("--groups must be a comma-separated list or 'all'")
+    groups = None if group_arg.lower() == "all" else {
+        x.strip() for x in group_arg.split(",") if x.strip()
+    }
+    if groups is not None and (not groups or len(groups) != len(group_arg.split(","))):
+        raise ValueError("--groups contains an empty or repeated group")
+    files = discover(Path(args.prompts_dir), args.pattern, groups=groups)
+    if (args.expected_count == 50 and groups == set(DEFAULT_GROUPS.split(","))
+            and args.pattern == "prompt_*_*.txt"):
+        counts = {g: sum(group_of(p) == g for p in files) for g in groups}
+        if any(n != 10 for n in counts.values()):
+            raise ValueError(f"ShareGPT40 requires exactly 10 prompts per "
+                             f"group 0/128/256/512/1024; found {counts}")
     if args.expected_count and len(files) != args.expected_count:
         raise ValueError(f"Expected {args.expected_count} unique Prompts, "
                          f"found {len(files)}. Refusing partial experiment.")
