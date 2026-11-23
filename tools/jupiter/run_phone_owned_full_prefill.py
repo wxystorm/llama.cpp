@@ -32,7 +32,8 @@ def arguments() -> argparse.Namespace:
     p.add_argument("--sessions", type=int, choices=(1, 2, 3, 4), default=1)
     p.add_argument("--pc-layers", type=int, default=32, help="first Phone HTP layer, 32..39")
     p.add_argument("--cpu-layers", type=int, default=16, help="PC CPU prefix layer count")
-    p.add_argument("--context", type=int, default=2048, help="fixed Jupiter Prefill KV/context: 2048")
+    p.add_argument("--context", type=int, default=2048,
+                   help="KV capacity, 256..4096; formal full suite locks 2048")
     p.add_argument("--target-tokens", type=int, default=175)
     p.add_argument("--chunks", default="88,87")
     p.add_argument("--mode", choices=("both", "legacy", "native"), default="both")
@@ -110,8 +111,8 @@ def main() -> int:
         raise ValueError("Phone overlap requires at least two Prompt chunks")
     if not 32 <= args.pc_layers <= 39 or not 0 <= args.cpu_layers < args.pc_layers:
         raise ValueError("native requires 32..39 PC layers and 0 <= CPU layers < PC layers")
-    if args.context != 2048:
-        raise ValueError("full Jupiter suite uses fixed Context=2048 for every Prompt")
+    if not 256 <= args.context <= 4096 or args.context % 256 != 0:
+        raise ValueError("native requires 256..4096 Context divisible by 256")
     if args.target_tokens > args.context or args.target_tokens < 2 or len(chunks) > 16:
         raise ValueError("native requires 2..context tokens and at most 16 chunks")
     prompt = prompt_path.read_text(encoding="utf-8-sig").rstrip("\r\n")
