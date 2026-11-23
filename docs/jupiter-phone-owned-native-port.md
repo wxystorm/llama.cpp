@@ -31,8 +31,9 @@ setting it to `0`), leaving the legacy Jupiter path unchanged.
 
 ### Limitations (important)
 
-**Code integrated and committed, but full Prefill runtime correctness and
-performance have NOT yet been verified on physical PC/Phone.**
+**The original S1/S4 175-token native Prefill has completed on physical
+PC/Phone with the expected final Top-1. Cross-request Graph residency is a
+new implementation and still requires a Phone rebuild and repeat-run validation.**
 
 - Strict pilot: dense Qwen3-14B, 40 layers, hidden size 5120, 40 Q heads,
   8 KV heads, head dimension 128, context exactly **512**, Flash Attention
@@ -44,13 +45,83 @@ performance have NOT yet been verified on physical PC/Phone.**
   rejected, rather than silently producing incorrect tokens.
 - The PC still allocates CPU/CUDA Scheduler graphs for the first 32 layers
   and output head; only the **remote HTP suffix** is removed.
-- Preparation/HTP weight load and HTP graph compilation happen during the
-  first native Prefill request in this prototype; reported prompt-eval
-  latency includes this cost. Moving prepare to model load is a later step.
+- The **first** native request still performs Phone-side weight load,
+  Graph allocation and compilation. The **next matching** request can reuse
+  the resident fixed Graphs after clearing the private F16 KV. Unmatched
+  topologies fall back to cold Graph preparation. Model-startup prewarming
+  remains separate work.
 - Real logits output doesn't imply numerical parity. Compare with baseline
   using the supplied binary logits A/B runner before reporting speedup.
 - No async overlap, prefix reuse, KV shift, additional sequences, LoRA,
   or automatic mixed-context decoding in the pilot.
+
+## Cross-request Phone-owned HTP Graph residency
+
+The Phone RPC process owns a persistent `rpc_server` shared by independent
+client connections. When a **completed** native run sends `PHONE_OWNED_RESET`,
+the server discards its logical request ID but retains one bounded set of
+fixed-UID HTP Graphs, immutable weights, KV allocations and graph scratch.
+
+For the next `PHONE_OWNED_PREPARE`:
+
+- **HIT:** every scalar that affects graph construction matches (including
+  token count, chunk size, KV capacity, layer and attention parameters),
+  and the per-layer HTP Session mapping is identical. The server synchronizes
+  each Session, **zeros every layer's F16 K/V buffer**, resets the per-layer
+  chunk cursor, and maps the new logical run ID to the original physical
+  Graph key. All model load, Graph build, allocation and precompile phases
+  are skipped. The RPC message ABI is unchanged.
+- **MISS:** a changed execution template or device mapping invalidates
+  the old fixed Hexagon cache *before* releasing its Graph/KV/scratch buffers;
+  the request then builds new Graphs. Only **one** template is resident at a
+  time; this is not a multi-shape cache.
+- **FAILED / INCOMPLETE:** RESET releases temporary Graphs rather than caching
+  a partial run. The server rejects overlapping native requests until the
+  previous run resets. The regular legacy RPC path is unchanged.
+
+With persistence enabled (the default), Phone RPC logs:
+
+```text
+[JUPITER_PHONE_OWNED] RESET ... graph_cache=RESIDENT ...
+[PHONE_OWNED_RESIDENCY] event=KV_RESET layer=32 ... status=PASS
+...
+[PHONE_OWNED_RESIDENCY] event=KV_RESET layer=39 ... status=PASS
+[JUPITER_PHONE_OWNED] PREPARE_CACHE status=HIT ... graphs=16 ...
+```
+
+On a warm hit the PC `PREPARE_DONE` report must show
+`load_ms=0.000 build_ms=0.000 buffer_ms=0.000 precompile_ms=0.000`,
+with nonzero `graphs=16` and a small `pc_wall_ms` for RPC + KV reset.
+Do not treat weight-pagecache hits alone as proof of Graph reuse.
+
+To opt out and reproduce the original release-on-RESET path, set
+`GGML_RPC_PHONE_OWNED_PERSIST=0` **before starting** `ggml-rpc-server`.
+The Phone RPC process must stay running across requests; restarting it
+discards all resident HTP resources.
+
+### Cross-process validation (real PC + Phone)
+
+After pulling the new code, **rebuild and restart the Phone RPC Server**;
+rebuilding only the Windows client does not enable residency. Keep the same
+Phone server alive while running three independent `llama-cli` processes:
+
+```powershell
+cd E:\llama\llama-jupiter
+python .\tools\jupiter\test_phone_owned_residency.py `
+  --exe ".\build-phone-owned\bin\Release\llama-cli.exe" `
+  --model "E:\llama\models\Qwen3-14B-Q4_K_M.gguf" `
+  --rpc "10.71.109.52:10140" `
+  --prompt-file "E:\llama\datasets\sharegpt\sharegpt40\prompt_128_01.txt" `
+  --sessions 4 --target-tokens 175 --chunks 88,87 --runs 3 `
+  --out-dir ".\phone-owned-residency-s4"
+```
+
+The harness checks that subsequent runs report zero Graph preparation cost
+and that **same-prompt final logits remain consistent across cleared KV**.
+The first run may already be a hit if the server was prepared earlier.
+Inspect the Phone terminal for `PREPARE_CACHE status=HIT` and all eight
+`KV_RESET` entries. The harness does **not** claim cold-to-warm speedup
+until those real-device checks pass.
 
 ## Build: Windows PC
 
