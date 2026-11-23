@@ -49,13 +49,24 @@ struct jupiter_stage_dump_state {
         auto * st = static_cast<jupiter_stage_dump_state *>(user_data);
         if (!st || !st->active || !t) { return false == ask; }
         const std::string stage(t->name);
-        const bool selected = stage == "l_out-31" ||
-                              stage == "l_out-32" ||
-                              stage == "l_out-39" ||
-                              stage == "phone_owned_hidden";
+        // Capture every local Qwen3 suffix boundary so the first
+        // divergence can be found without repeatedly rebuilding the Phone.
+        bool layer_checkpoint = false;
+        if (stage.rfind("l_out-", 0) == 0) {
+            char * end = nullptr;
+            const long layer = std::strtol(stage.c_str() + 6, &end, 10);
+            layer_checkpoint = end && *end == '\0' &&
+                               layer >= 31 && layer <= 39;
+        }
+        const bool selected = layer_checkpoint ||
+                              stage == "phone_owned_hidden" ||
+                              stage == "result_norm" ||
+                              stage == "result_output";
         if (ask) { return selected; }
         if (!selected) { return true; }
-        if (t->type != GGML_TYPE_F32 || t->ne[0] != 5120 ||
+        const int64_t expected_width =
+            stage == "result_output" ? 151936 : 5120;
+        if (t->type != GGML_TYPE_F32 || t->ne[0] != expected_width ||
                 !ggml_is_contiguous(t)) {
             st->failed = true;
             LLAMA_LOG_ERROR("[JUPITER_STAGE_DUMP] stage=%s status=FAIL"
@@ -117,7 +128,7 @@ struct jupiter_stage_dump_state {
             return true;
         }
         ++st->seen[stage];
-        const uint32_t tokens = uint32_t(values.size()/5120);
+        const uint32_t tokens = uint32_t(values.size()/expected_width);
         LLAMA_LOG_INFO(
             "[JUPITER_STAGE_DUMP] stage=%s part=%u tokens=%u"
             " nonfinite=%zu rms=%.7f min=%.7f max=%.7f"
