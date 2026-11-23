@@ -3140,7 +3140,7 @@ bool rpc_server::phone_owned_prepare(
     jupiter_phone_owned_copy_plan(plan, request.plan);
     const char * why = "NONE";
     const size_t count = ggml_phone_owned::layer_count(plan);
-    if (!ggml_phone_owned::validate(plan, why) || count == 0 || count > 8 ||
+    if (!ggml_phone_owned::validate(plan, why) || count == 0 || count > 16 ||
             ggml_phone_owned::chunk_count(plan) > 16 ||
             local_tensor_source.get_info == nullptr ||
             local_tensor_source.read == nullptr) {
