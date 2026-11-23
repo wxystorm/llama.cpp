@@ -3011,7 +3011,7 @@ static bool jupiter_phone_owned_dump_stage(
         const std::vector<float> & values) {
     const char * directory =
         std::getenv("GGML_RPC_PHONE_OWNED_STAGE_DUMP_DIR");
-    if (!directory || !*directory || (layer != 32 && layer != 39)) {
+    if (!directory || !*directory || layer < 32 || layer > 39) {
         return true;
     }
     if (values.empty() || values.size() % 5120 != 0) {
