@@ -3162,7 +3162,7 @@ bool rpc_server::phone_owned_prepare(
         response.model_load_ms += (ggml_time_us() - load_begin_us) / 1000.0;
 
         ggml_phone_npu_serial::full_region_executor::local_htp_prepare_stats st {};
-        if (!owner.prepare_owned_htp_graphs(child, reason, st)) {
+        if (!owner.prepare_owned_htp_graphs(child, reason, st, nullptr, true)) {
             GGML_LOG_ERROR("[JUPITER_PHONE_OWNED] PREPARE_REJECT"
                            " layer=%u device=%u reason=%s\n",
                            child.layer, device, reason.c_str());
