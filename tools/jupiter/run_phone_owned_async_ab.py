@@ -21,7 +21,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--model", required=True)
     p.add_argument("--rpc", required=True)
     p.add_argument("--prompt-file", required=True)
-    p.add_argument("--sessions", type=int, choices=(1, 4), default=4)
+    p.add_argument("--sessions", type=int, choices=(1, 2, 3, 4), default=4)
     p.add_argument("--pc-layers", type=int, default=32)
     p.add_argument("--cpu-layers", type=int, default=16)
     p.add_argument("--context", type=int, default=512)
