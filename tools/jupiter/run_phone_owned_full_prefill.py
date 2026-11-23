@@ -162,8 +162,8 @@ def main() -> int:
                 )
             prepared_tokens = [
                 int(x) for x in re.findall(
-                    r"\\[JUPITER_PHONE_OWNED_PREFILL\\] phase=PREPARE_BEGIN"
-                    r"[^\\n]*?\\btokens=(\\d+)", log
+                    r"\[JUPITER_PHONE_OWNED_PREFILL\] phase=PREPARE_BEGIN"
+                    r"[^\n]*?\btokens=(\d+)", log
                 )
             ]
             if prepared_tokens != [args.target_tokens]:
