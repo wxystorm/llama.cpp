@@ -15,17 +15,21 @@ from pathlib import Path
 
 from run_phone_owned_full_prefill import logits_comparison, read_logits
 from inspect_phone_owned_overlap import analyze as inspect_overlap
+from phone_owned_models import inspect_model, resolve_splits
 
 
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--exe", required=True)
     p.add_argument("--model", required=True)
+    p.add_argument("--model-size", choices=("auto", "14b", "32b"), default="auto")
     p.add_argument("--rpc", required=True)
     p.add_argument("--prompt-file", required=True)
     p.add_argument("--sessions", type=int, choices=(1, 2, 3, 4), default=4)
-    p.add_argument("--pc-layers", type=int, default=32)
-    p.add_argument("--cpu-layers", type=int, default=16)
+    p.add_argument("--pc-layers", type=int, default=None)
+    p.add_argument("--cpu-layers", type=int, default=None)
+    p.add_argument("--cuda-layers", type=int, default=None)
+    p.add_argument("--phone-layers", type=int, default=None)
     p.add_argument("--context", type=int, default=512)
     p.add_argument("--target-tokens", type=int, default=175)
     p.add_argument("--chunks", default="88,87")
@@ -37,6 +41,13 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = parser().parse_args()
+    spec = inspect_model(Path(args.model), args.model_size)
+    boundaries, cpu = resolve_splits(
+        spec, layouts=str(args.pc_layers) if args.pc_layers is not None else None,
+        cpu_layers=args.cpu_layers, cuda_layers=args.cuda_layers,
+        phone_layers=args.phone_layers)
+    args.pc_layers, args.cpu_layers = boundaries[0], cpu
+    args.model_size = spec.family
     parts = [int(x) for x in args.chunks.split(",")]
     if len(parts) < 2:
         raise ValueError("async overlap A/B requires at least two Chunks")
@@ -52,6 +63,7 @@ def main() -> int:
             sys.executable, str(runner),
             "--exe", args.exe,
             "--model", args.model,
+            "--model-size", args.model_size,
             "--rpc", args.rpc,
             "--prompt-file", args.prompt_file,
             "--sessions", str(args.sessions),
