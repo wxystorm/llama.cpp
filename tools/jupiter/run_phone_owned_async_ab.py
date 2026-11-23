@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -80,11 +81,36 @@ def main() -> int:
         else:
             if "phase=ASYNC_ENQUEUE" in log:
                 raise RuntimeError("sync control accidentally enabled overlap")
+    # A queued RPC on its own thread is not automatically evidence of
+    # useful overlap. Record whether the previous Phone RPC spans the
+    # enqueue of the next PC-produced Chunk; this is a timing hint, not
+    # an exclusive PC-compute measurement.
+    async_log = logs["async"]
+    enqueued = {
+        int(m.group(1)): int(m.group(2))
+        for m in re.finditer(
+            r"phase=ASYNC_ENQUEUE chunk=(\\d+) tokens=\\d+ t_us=(\\d+)",
+            async_log)
+    }
+    completed = {
+        int(m.group(1)): (int(m.group(2)), int(m.group(3)))
+        for m in re.finditer(
+            r"phase=CHUNK_DONE mode=ASYNC[^\\n]*?chunk=(\\d+)"
+            r"[^\\n]*?t_begin_us=(\\d+) t_done_us=(\\d+)",
+            async_log)
+    }
+    overlap_windows = sum(
+        1 for chunk in range(1, len(parts))
+        if chunk in enqueued and chunk - 1 in completed and
+        completed[chunk - 1][0] < enqueued[chunk] < completed[chunk - 1][1]
+    )
     sync_logits = read_logits(output / "sync" / "native-logits.f32")
     async_logits = read_logits(output / "async" / "native-logits.f32")
     parity = logits_comparison(sync_logits, async_logits)
     report = {
         "parity": parity,
+        "phone_rpc_spanned_next_enqueue": overlap_windows,
+        "candidate_overlap_boundaries": len(parts) - 1,
         "sync_prefill_ms": results["sync"]["prompt_eval_ms"],
         "async_prefill_ms": results["async"]["prompt_eval_ms"],
         "sync_log": str(output / "sync" / "native-full-prefill.log"),
