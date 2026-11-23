@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real Qwen3-14B full-Prefill A/B (PC CPU16/CUDA16 + Phone HTP8).
+"""Real dense Qwen3-14B/32B full-Prefill native Phone A/B.
 
 Legacy and native runs use the SAME raw prompt and token schedule.
 Native mode changes the actual llama.cpp model graph, not just a smoke RPC.
@@ -16,6 +16,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from phone_owned_models import inspect_model, resolve_splits
 
 PLAN_RE = re.compile(r"\[JUPITER_SEQUENCE_PLAN\].*?total=(\d+).*?chunks=([0-9,]+)")
 TIMING_RE = re.compile(r"prompt eval time\s*=\s*([\d.]+)\s*ms\s*/\s*(\d+)\s*tokens")
@@ -27,11 +28,19 @@ def arguments() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--exe", required=True, help="rebuilt native-branch llama-cli.exe")
     p.add_argument("--model", required=True)
+    p.add_argument("--model-size", choices=("auto", "14b", "32b"), default="auto",
+                   help="verify actual GGUF Qwen3 model; default auto-detect")
     p.add_argument("--rpc", required=True, help="same endpoint used for --rpc")
     p.add_argument("--prompt-file", required=True)
     p.add_argument("--sessions", type=int, choices=(1, 2, 3, 4), default=1)
-    p.add_argument("--pc-layers", type=int, default=32, help="first Phone HTP layer, 32..39")
-    p.add_argument("--cpu-layers", type=int, default=16, help="PC CPU prefix layer count")
+    p.add_argument("--pc-layers", type=int, default=None,
+                   help="first Phone HTP layer (14B 32..39, 32B 56..63)")
+    p.add_argument("--cpu-layers", type=int, default=None,
+                   help="PC CPU prefix; auto 16 for 14B / 44 for 32B")
+    p.add_argument("--cuda-layers", type=int, default=None,
+                   help="number of PC CUDA layers, derives CPU count")
+    p.add_argument("--phone-layers", type=int, default=None,
+                   help="number of Phone HTP suffix layers (1..8)")
     p.add_argument("--context", type=int, default=2048,
                    help="KV capacity, 256..4096; formal full suite locks 2048")
     p.add_argument("--target-tokens", type=int, default=175)
@@ -44,7 +53,7 @@ def arguments() -> argparse.Namespace:
     p.add_argument("--stage-dump", action="store_true",
                    help="debug only: export PC intermediate F32 stage tensors "
                         "(inserts scheduler synchronization; not for timing)")
-    p.add_argument("--out-dir", default="phone-owned-full-prefill-14b")
+    p.add_argument("--out-dir", default="phone-owned-full-prefill")
     p.add_argument("--verbosity", type=int, default=4)
     return p.parse_args()
 
@@ -110,8 +119,18 @@ def main() -> int:
     if args.async_phone and len(chunks) < 2:
         raise ValueError("PC-worker overlap requires at least two Prompt Chunks; "
                          "Phone-autonomous Jupiter DP accepts a single Chunk")
-    if not 32 <= args.pc_layers <= 39 or not 0 <= args.cpu_layers < args.pc_layers:
-        raise ValueError("native requires 32..39 PC layers and 0 <= CPU layers < PC layers")
+    spec = inspect_model(model, args.model_size)
+    positions, cpu_layers = resolve_splits(
+        spec, layouts=str(args.pc_layers) if args.pc_layers is not None else None,
+        cpu_layers=args.cpu_layers, cuda_layers=args.cuda_layers,
+        phone_layers=args.phone_layers)
+    args.pc_layers = positions[0]
+    args.cpu_layers = cpu_layers
+    print(f"[PHONE_NATIVE_MODEL] model=Qwen3-{spec.family.upper()}"
+          f" layers={spec.layers} hidden={spec.hidden} heads={spec.heads}"
+          f" placement=CPU[0,{cpu_layers})"
+          f" CUDA[{cpu_layers},{args.pc_layers})"
+          f" HTP[{args.pc_layers},{spec.layers}) status=VALIDATED", flush=True)
     if not 256 <= args.context <= 4096 or args.context % 256 != 0:
         raise ValueError("native requires 256..4096 Context divisible by 256")
     if args.target_tokens > args.context or args.target_tokens < 2 or len(chunks) > 16:
