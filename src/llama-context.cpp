@@ -2619,7 +2619,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         // back to the old RPC graph after a native registration fails.
         const auto & complete = balloc->get_batch();
         bool fresh = n_outputs_all == 1 && !output_all && !has_samplers &&
-                     n_tokens_all > 1 && cparams.n_ctx == 512 &&
+                     n_tokens_all > 1 && cparams.n_ctx >= n_tokens_all &&
+                     cparams.n_ctx <= 4096 &&
                      complete.n_tokens == (int32_t) n_tokens_all &&
                      complete.pos != nullptr;
         for (uint32_t i = 0; fresh && i < n_tokens_all; ++i) {
