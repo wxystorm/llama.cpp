@@ -54,6 +54,25 @@ class TestPlanning(unittest.TestCase):
                 suite.group_of(base / "prompt_2048-4000_01.txt"),
                 "2048-4000")
 
+    def test_default_full50_ignores_2048_group_even_when_files_exist(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            for group in ("0", "128", "256", "512", "1024", "2048",
+                          "2048-4000"):
+                for index in range(1, 11):
+                    (base / f"prompt_{group}_{index:02d}.txt").write_text(
+                        "sample", encoding="utf-8")
+            included = suite.discover(
+                base, "prompt_*_*.txt",
+                groups=set(suite.DEFAULT_GROUPS.split(",")))
+            self.assertEqual(len(included), 50)
+            self.assertEqual({suite.group_of(x) for x in included},
+                             {"0", "128", "256", "512", "1024"})
+            self.assertTrue(all(suite.group_of(x) not in
+                                {"2048", "2048-4000"} for x in included))
+            self.assertEqual(included[0].name, "prompt_0_01.txt")
+            self.assertEqual(included[-1].name, "prompt_1024_10.txt")
+
     def test_aba_selects_different_graph_shape(self):
         a = {"name": "prompt_128_01.txt", "path": "a", "tokens": 175,
              "context": 512, "chunks": [88, 87], "group": "128"}
@@ -159,7 +178,8 @@ class TestResume(unittest.TestCase):
             args = argparse.Namespace(
                 exe=str(exe), tokenizer=str(tok), model=str(model),
                 rpc="127.0.0.1:10140", prompts_dir=str(prompts),
-                pattern="prompt_*_*.txt", out_dir=str(out),
+                pattern="prompt_*_*.txt",
+                groups="0,128,256,512,1024", out_dir=str(out),
                 model_size="auto", layouts="32", cpu_layers=16,
                 cuda_layers=None, phone_layers=None,
                 sessions=4, chunk_size=88,
@@ -237,6 +257,7 @@ class Test32BFullSuite(unittest.TestCase):
                 exe=str(exe), tokenizer=str(tok), model=str(model),
                 model_size="32b", rpc="127.0.0.1:10140",
                 prompts_dir=str(prompts), pattern="prompt_256_01.txt",
+                groups="0,128,256,512,1024",
                 out_dir=str(base / "output"), layouts=None,
                 cpu_layers=None, cuda_layers=12, phone_layers=8,
                 sessions=4, chunk_size=128,
