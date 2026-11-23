@@ -23,6 +23,7 @@ param(
     [string]$Rpc = "10.71.109.52:10140",
     [string]$PromptsDir = "E:\llama\datasets\sharegpt\sharegpt40",
     [string]$Pattern = "prompt_*_*.txt",
+    [string]$Groups = "0,128,256,512,1024",
     [string]$OutDir = "",
     [ValidateSet("jupiter-dp", "fixed-control")]
     [string]$SequencePolicy = "jupiter-dp",
@@ -76,6 +77,7 @@ try {
         "--rpc", $Rpc,
         "--prompts-dir", $PromptsDir,
         "--pattern", $Pattern,
+        "--groups", $Groups,
         "--sequence-policy", $SequencePolicy,
         "--expected-count", [string]$ExpectedCount,
         "--repeats", [string]$Repeats,
@@ -101,6 +103,7 @@ try {
     if ($ContinueOnError) { $argsList += "--continue-on-error" }
 
     Write-Host "[JUPITER_FULL_SUITE] model=$Model model_size=$ModelSize context=2048 batch=2048"
+    Write-Host "[JUPITER_FULL_SUITE] groups=$Groups (default ShareGPT40: 0/128/256/512/1024, 10 each)"
     Write-Host "[JUPITER_FULL_SUITE] layouts=$Layouts cpu=$CpuLayers cuda=$CudaLayers phone=$PhoneLayers sessions=$Sessions"
     & python @argsList
     $rc = $LASTEXITCODE
