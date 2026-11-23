@@ -77,9 +77,8 @@ python .\tools\jupiter\run_phone_owned_full_prefill.py `
   --mode native --out-dir ".\jupiter-native-l34-175"
 ```
 
-The two-layer Phone suffix in this example is L34–39 (six layers).
-The description above is authoritative; the command is for a **six-layer**
-Phone suffix and must not be interpreted as two Phone layers.
+This example uses a **six-layer Phone suffix**, L34–39, while the PC
+executes layers 0–33.
 
 Check the Phone `[PHONE_OWNED_SCRATCH]` log for
 `mode=REGION_SINGLE_SLOT`, `PREPARE_LAYER` for every assigned Layer,
