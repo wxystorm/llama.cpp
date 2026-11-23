@@ -28,6 +28,7 @@ from pathlib import Path
 from inspect_phone_owned_overlap import prepare_cost
 from run_phone_owned_full_prefill import logits_comparison, read_logits
 from run_phone_owned_multi_prompt import count_model_tokens
+from run_prefill_bench import read_plan
 
 PROMPT_NAME = re.compile(r"^prompt_(.+)_(\d+)$", re.IGNORECASE)
 CHUNK_BUCKETS = (32, 64, 88, 96, 128, 192, 256, 384, 512, 768, 1024, 2048, 4096)
@@ -78,14 +79,13 @@ def choose_chunks(tokens: int, preferred: int = 88,
     return plan
 
 
-def choose_context(tokens: int, floor: int = 512, cap: int = 4096) -> int:
-    if tokens < 2 or cap < 256 or cap % 256 or floor < 256 or floor % 256:
-        raise ValueError("Context must be >=256 and a multiple of 256")
-    ctx = max(floor, math.ceil(tokens / 256) * 256)
-    if ctx > cap:
+def choose_context(tokens: int) -> int:
+    # Jupiter baseline: fixed Context and Batch, not per-Prompt dynamic KV.
+    if tokens < 2 or tokens > 2048:
         raise ValueError(
-            f"Prompt requires KV context {ctx}, exceeding configured cap {cap}")
-    return ctx
+            f"Actual chat-formatted Prompt has {tokens} tokens; "
+            "fixed Jupiter Context=2048 cannot fit it")
+    return 2048
 
 
 def file_signature(path: Path) -> dict:
@@ -130,10 +130,20 @@ def parse_args() -> argparse.Namespace:
                    help="comma-separated first Phone layers, e.g. 32,34,36,39")
     p.add_argument("--cpu-layers", type=int, default=16)
     p.add_argument("--sessions", type=int, choices=(1, 2, 3, 4), default=4)
-    p.add_argument("--chunk-size", type=int, default=88,
-                   help="preferred Chunk; increases to keep <=16 Chunks")
-    p.add_argument("--context-floor", type=int, default=512)
-    p.add_argument("--context-cap", type=int, default=4096)
+    p.add_argument("--sequence-policy", choices=("jupiter-dp", "fixed-control"),
+                   default="jupiter-dp",
+                   help="default: original Jupiter Stage2 b + measured q(x,y) Sequence DP")
+    p.add_argument("--chunk-size", type=int, default=128,
+                   help="used only for explicitly labeled fixed-control ablation")
+    p.add_argument("--min-chunk-json", default=None,
+                   help="optional original Stage2 min-chunk.json; without it, "
+                        "measure Stage2 on the same PC/Phone model split")
+    p.add_argument("--stage2-repeats", type=int, default=2)
+    p.add_argument("--q-repeats", type=int, default=2)
+    p.add_argument("--refine-repeats", type=int, default=2)
+    p.add_argument("--max-rounds", type=int, default=6)
+    p.add_argument("--max-chunk", type=int, default=128,
+                   help="original Jupiter q(x,y) max UBatch/Chunk size")
     p.add_argument("--repeats", type=int, default=1,
                    help="complete Sync/Auto A/B pairs per Prompt")
     p.add_argument("--expected-count", type=int, default=0,
@@ -193,9 +203,9 @@ def preflight(args: argparse.Namespace, files: list[Path],
                 Path(args.tokenizer), Path(args.model), content)
             write_json(cache_file, cache)
         n_tokens = int(cache[cache_key])
-        ctx = choose_context(
-            n_tokens, args.context_floor, args.context_cap)
-        chunks = choose_chunks(n_tokens, args.chunk_size)
+        ctx = choose_context(n_tokens)
+        chunks = (choose_chunks(n_tokens, args.chunk_size)
+                  if args.sequence_policy == "fixed-control" else [])
         row = {"name": prompt_file.name, "path": str(prompt_file),
                "sha256": sha, "group": group_of(prompt_file),
                "tokens": n_tokens, "context": ctx, "chunks": chunks}
@@ -203,7 +213,7 @@ def preflight(args: argparse.Namespace, files: list[Path],
         groups[row["group"]].append(row)
         print(f"[PHONE_SUITE_PLAN] {index}/{len(files)} "
               f"group={row['group']} prompt={prompt_file.name}"
-              f" tokens={n_tokens} ctx={ctx} chunks={chunks}", flush=True)
+              f" tokens={n_tokens} ctx={ctx} chunks={chunks or 'JUPITER_DP_PENDING'}", flush=True)
     config = {
         "format": 1,
         "exe": file_signature(Path(args.exe)),
@@ -212,8 +222,14 @@ def preflight(args: argparse.Namespace, files: list[Path],
         "rpc": args.rpc, "prompt_root": str(Path(args.prompts_dir).resolve()),
         "pattern": args.pattern, "layouts": layouts,
         "cpu_layers": args.cpu_layers, "sessions": args.sessions,
-        "chunk_size": args.chunk_size,
-        "context_floor": args.context_floor, "context_cap": args.context_cap,
+        "sequence_policy": args.sequence_policy,
+        "chunk_size": args.chunk_size, "context": 2048, "batch": 2048,
+        "min_chunk_json": (file_signature(Path(args.min_chunk_json))
+                           if args.min_chunk_json else None),
+        "stage2_repeats": args.stage2_repeats,
+        "q_repeats": args.q_repeats,
+        "refine_repeats": args.refine_repeats,
+        "max_rounds": args.max_rounds, "max_chunk": args.max_chunk,
         "repeats": args.repeats,
         "mode_order": args.mode_order, "warmup": not args.no_warmup,
         "revisit_first": args.revisit_first,
@@ -544,9 +560,17 @@ def run() -> int:
                           for x in layouts):
         raise ValueError("Layouts must be first Phone layers 32..39 "
                          "with CPU prefix < PC layers")
-    if args.repeats < 1 or args.expected_count < 0 or args.chunk_size < 1 or \
-            args.timeout_seconds < 0:
+    if (args.repeats < 1 or args.expected_count < 0 or args.chunk_size < 1 or
+            args.timeout_seconds < 0 or args.stage2_repeats < 1 or
+            args.q_repeats < 1 or args.refine_repeats < 1 or
+            args.max_rounds < 1 or args.max_chunk < 1 or
+            args.max_chunk > 2048):
         raise ValueError("Invalid repeat, expected-count, Chunk or timeout")
+    if args.min_chunk_json and not Path(args.min_chunk_json).is_file():
+        raise FileNotFoundError(args.min_chunk_json)
+    if args.min_chunk_json and len(layouts) != 1:
+        raise ValueError("--min-chunk-json is layout-specific; use one layout "
+                         "or let Stage2 measure each layout separately")
     for name in ("exe", "tokenizer", "model"):
         if not Path(getattr(args, name)).is_file():
             raise FileNotFoundError(getattr(args, name))
