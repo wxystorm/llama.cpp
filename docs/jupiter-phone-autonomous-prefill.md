@@ -134,6 +134,28 @@ until executed on the user's Windows PC and Snapdragon Phone**.
 
 No Prefill-to-Decode KV handoff is implemented or required.
 
+## Qwen3-32B Native and explicit device layers
+
+The same Prefill-only Phone task FIFO/P2C protocol now supports dense
+Qwen3-32B (64 layers, 5120 hidden, 64 Q Heads and 8 KV Heads) in addition
+to Qwen3-14B. The PC Graph stops at the model-dependent Phone boundary;
+the Phone independently compiles the real Qwen3 32B HTP Graph, and the
+final LM Head stays on PC CUDA. Both model families use Context=2048 in
+the formal ShareGPT full suite, and use Jupiter's original measured
+Stage2 minimum Chunk + Stage3 q(x,y)/Sequence DP.
+
+The default 32B candidate is CPU L0-43, PC CUDA L44-55 and Phone HTP
+L56-63 (S4, two layers each). It is **not validated for GPU/Phone memory
+on the user's devices**. You can explicitly override counts using
+`-CpuLayers`, `-CudaLayers`, `-PhoneLayers` or first Phone
+boundaries via `-Layouts` in the PowerShell wrapper. GGUF metadata must
+match the selected 14B/32B family; the Phone server must load the same
+model GGUF. Do not mix 14B and 32B resident HTP Graph generations on the
+same live server. Build and restart both Phone/PC binaries (RPC patch 7).
+
+All 32B real F32-logit parity, cache-residency and measured-latency
+claims remain pending a real PC + Phone run.
+
 ## Full ShareGPT Prompt suite
 
 For a complete one-command run instead of repeating the single-Prompt A/B
