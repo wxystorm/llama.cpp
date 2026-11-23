@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -27,6 +28,7 @@ static constexpr uint32_t k_max_regions =
     k_internal_region_base +
     k_wire_region_limit * k_max_phone_layers_per_region;
 static constexpr uint32_t k_max_chunks = 4096;
+static constexpr uint32_t k_native_schedule_slots = 16;
 static constexpr uint64_t k_max_activation_bytes = 128ULL * 1024 * 1024;
 
 struct region_plan {
@@ -38,6 +40,11 @@ struct region_plan {
     uint32_t layer = 0;
     uint32_t total_tokens = 0;
     uint32_t chunk_tokens = 0;
+    // Optional Jupiter q(x,y) / Sequence DP schedule. Zero preserves the
+    // original uniform-width + tail Graph plan; N>0 describes N exact
+    // ordered Chunks and their KV prefix positions, without changing Qwen3.
+    uint32_t schedule_count = 0;
+    std::array<uint32_t, k_native_schedule_slots> schedule {};
     uint32_t n_embd = 0;
     uint32_t position_base = 0;
     uint32_t kv_capacity = 0;
@@ -91,7 +98,9 @@ inline bool equal(const region_plan & a, const region_plan & b) {
         a.run_id == b.run_id && a.p2c_run_id == b.p2c_run_id &&
         a.region == b.region && a.layer == b.layer &&
         a.total_tokens == b.total_tokens &&
-        a.chunk_tokens == b.chunk_tokens && a.n_embd == b.n_embd &&
+        a.chunk_tokens == b.chunk_tokens &&
+        a.schedule_count == b.schedule_count && a.schedule == b.schedule &&
+        a.n_embd == b.n_embd &&
         a.position_base == b.position_base &&
         a.kv_capacity == b.kv_capacity &&
         a.n_heads == b.n_heads && a.n_heads_kv == b.n_heads_kv &&
@@ -118,6 +127,25 @@ inline bool same_execution_template(
     return equal(cached, normalized);
 }
 
+inline uint32_t chunk_count(const region_plan & p) {
+    return p.schedule_count ? p.schedule_count :
+        uint32_t((uint64_t(p.total_tokens) + p.chunk_tokens - 1) /
+                 std::max<uint32_t>(p.chunk_tokens, 1));
+}
+
+inline uint32_t chunk_begin(const region_plan & p, uint32_t chunk) {
+    if (!p.schedule_count) { return chunk * p.chunk_tokens; }
+    uint32_t result = 0;
+    for (uint32_t i = 0; i < chunk; ++i) { result += p.schedule[i]; }
+    return result;
+}
+
+inline uint32_t chunk_size(const region_plan & p, uint32_t chunk) {
+    if (p.schedule_count) { return p.schedule[chunk]; }
+    const uint32_t begin = chunk_begin(p, chunk);
+    return std::min(p.chunk_tokens, p.total_tokens - begin);
+}
+
 inline bool validate(const region_plan & p, const char * & reason) {
     reason = "NONE";
     const uint32_t layers = layer_count(p);
@@ -140,10 +168,34 @@ inline bool validate(const region_plan & p, const char * & reason) {
     }
     if (!p.total_tokens || !p.chunk_tokens ||
             p.chunk_tokens > p.total_tokens || p.chunk_tokens > 4096 ||
-            (uint64_t(p.total_tokens) + p.chunk_tokens - 1) /
-                p.chunk_tokens > k_max_chunks) {
+            p.schedule_count > k_native_schedule_slots ||
+            chunk_count(p) > k_max_chunks) {
         reason = "INVALID_CHUNK_SCHEDULE";
         return false;
+    }
+    if (p.schedule_count) {
+        uint64_t total = 0;
+        uint32_t maximum = 0;
+        for (uint32_t i = 0; i < k_native_schedule_slots; ++i) {
+            const uint32_t size = p.schedule[i];
+            if (i >= p.schedule_count) {
+                if (size != 0) {
+                    reason = "NONZERO_UNUSED_JUPITER_CHUNK";
+                    return false;
+                }
+            } else {
+                if (size == 0 || size > 4096) {
+                    reason = "INVALID_JUPITER_DP_CHUNK";
+                    return false;
+                }
+                total += size;
+                maximum = std::max(maximum, size);
+            }
+        }
+        if (total != p.total_tokens || maximum != p.chunk_tokens) {
+            reason = "JUPITER_DP_PLAN_SUM_OR_MAX_MISMATCH";
+            return false;
+        }
     }
     if (!p.n_embd || p.n_embd > 65536 ||
             !p.n_heads || !p.n_heads_kv ||
@@ -180,11 +232,6 @@ inline bool validate(const region_plan & p, const char * & reason) {
         return false;
     }
     return true;
-}
-
-inline uint32_t chunk_count(const region_plan & p) {
-    return (uint64_t(p.total_tokens) + p.chunk_tokens - 1) /
-        p.chunk_tokens;
 }
 
 // Guard the fresh 0-based KV cache contract before HTP-only compute.
@@ -226,9 +273,8 @@ inline bool matches_chunk(const region_plan & p, uint32_t chunk,
                           uint64_t p2c_run_id,
                           uint64_t input_bytes, uint64_t output_bytes) {
     if (chunk >= chunk_count(p)) { return false; }
-    const uint64_t expected_begin = uint64_t(chunk) * p.chunk_tokens;
-    const uint32_t expected_tokens =
-        std::min<uint64_t>(p.chunk_tokens, p.total_tokens - expected_begin);
+    const uint64_t expected_begin = chunk_begin(p, chunk);
+    const uint32_t expected_tokens = chunk_size(p, chunk);
     const uint64_t expected_bytes =
         uint64_t(expected_tokens) * p.n_embd * sizeof(float);
     return begin == expected_begin && tokens == expected_tokens &&
