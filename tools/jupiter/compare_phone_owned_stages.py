@@ -55,9 +55,14 @@ def compare(a: array.array, b: array.array) -> dict:
     sq_ref = math.fsum(float(x)**2 for x in a)
     sq_test = math.fsum(float(y)**2 for y in b)
     dot = math.fsum(float(x)*float(y) for x, y in zip(a, b))
-    max_abs = max(abs(float(x)-float(y)) for x, y in zip(a, b))
+    max_index = max(
+        range(n), key=lambda i: abs(float(a[i])-float(b[i])))
+    max_abs = abs(float(a[max_index])-float(b[max_index]))
     return {
         "elements": n,
+        "max_abs_index": max_index,
+        "max_abs_ref": float(a[max_index]),
+        "max_abs_test": float(b[max_index]),
         "valid": True,
         "rms_ref": math.sqrt(sq_ref/n),
         "rms_test": math.sqrt(sq_test/n),
@@ -150,11 +155,24 @@ def main() -> int:
             # selected output token, not all 175 Prompt positions.
             parts = [{"chunk": len(chunks)-1, "tokens": 1, **summary}]
         summary["per_chunk"] = parts
+        if len(reference) == n_elements and width == args.embd:
+            summary["last_token"] = compare(
+                reference[-args.embd:], candidate[-args.embd:])
+            if summary.get("max_abs_index") is not None:
+                i = summary["max_abs_index"]
+                summary["max_abs_position"] = i // args.embd
+                summary["max_abs_feature"] = i % args.embd
         result["measurements"][title] = summary
         print(f"[PHONE_PARITY] {title}")
         print(f"  cosine={summary.get('cosine')} "
               f"rRMSE={summary.get('relative_rmse')} "
               f"RMSE={summary.get('rmse')} maxabs={summary.get('max_abs')}")
+        if "last_token" in summary:
+            last = summary["last_token"]
+            print(f"  final_input_token cosine={last.get('cosine')} "
+                  f"rRMSE={last.get('relative_rmse')}")
+            print(f"  worst_error_position={summary.get('max_abs_position')} "
+                  f"feature={summary.get('max_abs_feature')}")
         for part in parts:
             print(f"  chunk={part['chunk']} cosine={part.get('cosine')} "
                   f"rRMSE={part.get('relative_rmse')}")
