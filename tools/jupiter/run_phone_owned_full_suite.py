@@ -239,6 +239,14 @@ def preflight(args: argparse.Namespace, files: list[Path],
         "runner_sha256": hashlib.sha256(
             Path(__file__).with_name("run_phone_owned_full_prefill.py").read_bytes()
         ).hexdigest(),
+        "jupiter_planner_code_sha256": {
+            name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
+            for name in (
+                "jupiter_planner.py", "run_min_chunk_profile.py",
+                "min_chunk_profile.py", "run_q_sweep.py",
+                "run_sequence_pipeline.py", "refine_sequence_q.py",
+            )
+        },
     }
     signature = hashlib.sha256(
         json.dumps(config, sort_keys=True).encode()).hexdigest()
