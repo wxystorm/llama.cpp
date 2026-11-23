@@ -1,6 +1,7 @@
 #include "ggml-rpc.h"
 #include "phone-owned-jupiter-api.h"
 #include "phone-npu-serial-executor.h"
+#include "phone-owned-cache-policy.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpp.h"
@@ -2260,15 +2261,20 @@ private:
         // Stable key of resident compiled Graphs; may differ from logical
         // plan.run_id after a warm PREPARE.
         uint64_t physical_run_id = 0;
+        // Measured HTP Graph/Scratch/KV allocations, excluding immutable
+        // model weights that are already cached separately per Session.
+        uint64_t resident_bytes = 0;
         uint32_t next_chunk = 0;
     };
     std::mutex phone_owned_mutex;
     std::vector<std::unique_ptr<ggml_phone_npu_serial::full_region_executor>> phone_owned_executors;
     std::map<std::pair<uint64_t, uint32_t>, phone_owned_chain> phone_owned_chains;
-    // At most one completed run's HTP Graphs/KV/scratch are retained,
-    // bounded to its exact Graph topology and fixed layer-to-Session map.
-    // No logical request is active while this standby cache is populated.
-    std::unique_ptr<phone_owned_chain> phone_owned_standby;
+    // Completed native executions have no active RPC run ID. Keep a
+    // bounded generation of independently keyed, precompiled HTP templates.
+    // The Hexagon fixed cache has only session-wide invalidation, so hitting
+    // the capacity/budget boundary flushes this entire generation safely.
+    // Exactly one chain may be active at a time.
+    std::vector<phone_owned_chain> phone_owned_standby;
 
 
     std::mutex jupiter_event_mutex;
@@ -2913,6 +2919,34 @@ static bool jupiter_phone_owned_persistence_enabled() {
     // measurements or to reproduce the old release-on-RESET behavior.
     const char * env = std::getenv("GGML_RPC_PHONE_OWNED_PERSIST");
     return env == nullptr || std::strcmp(env, "0") != 0;
+}
+
+static uint64_t jupiter_phone_owned_cache_setting(
+        const char * name, uint64_t fallback,
+        uint64_t minimum, uint64_t maximum) {
+    const char * value = std::getenv(name);
+    if (!value || !*value) { return fallback; }
+    char * end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    if (end == value || *end != '\0' ||
+            parsed < minimum || parsed > maximum) {
+        GGML_LOG_WARN("[JUPITER_PHONE_OWNED] CACHE_SETTING_INVALID"
+                      " name=%s value=%s fallback=%" PRIu64 "\n",
+                      name, value, fallback);
+        return fallback;
+    }
+    return static_cast<uint64_t>(parsed);
+}
+
+static size_t jupiter_phone_owned_cache_entries() {
+    return static_cast<size_t>(jupiter_phone_owned_cache_setting(
+        "GGML_RPC_PHONE_OWNED_CACHE_ENTRIES", 2, 1, 4));
+}
+
+static uint64_t jupiter_phone_owned_cache_budget_bytes() {
+    return jupiter_phone_owned_cache_setting(
+        "GGML_RPC_PHONE_OWNED_CACHE_BUDGET_MIB",
+        2048, 128, 8192) * UINT64_C(1024) * 1024;
 }
 
 bool rpc_server::phone_owned_prepare(
