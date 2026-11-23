@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <string>
 
 #define CHECK(expr) do { if (!(expr)) { \
@@ -161,6 +162,42 @@ int main() {
     wrong_projection.wo = w.wo; // 14B's narrower Q output projection
     CHECK(!ggml_phone_qwen3::validate_weights(
         wide, wrong_projection, reason));
+    // Jupiter can now request a Phone-local Graph with varying prefill KV
+    // capacity. Exercise each supported shape with an independently owned
+    // no-alloc graph context, rather than relying on the 512-token pilot.
+    for (uint32_t context : {256u, 512u, 1024u, 2048u, 4096u}) {
+        auto dynamic = p;
+        dynamic.layer = 39;
+        dynamic.region = 20;
+        dynamic.total_tokens = context;
+        dynamic.kv_capacity = context;
+        dynamic.n_kv = context;
+        dynamic.chunk_tokens = context == 4096 ? 256 : 128;
+        CHECK(ggml_phone_owned::validate(dynamic, reason));
+        CHECK(ggml_phone_owned::chunk_count(dynamic) <= 16);
+        ggml_init_params opts = {
+            ggml_tensor_overhead() * 1024 +
+            ggml_graph_overhead_custom(512, false) + 4096,
+            nullptr, true
+        };
+        ggml_context * dyn_ctx = ggml_init(opts);
+        CHECK(dyn_ctx != nullptr);
+        const auto dyn_weights = weights(dyn_ctx);
+        ggml_phone_qwen3::graph_result dyn_graph {};
+        CHECK(ggml_phone_qwen3::build_graph(
+            dyn_ctx, dynamic, 0, dyn_weights, dyn_graph, reason));
+        CHECK(dyn_graph.graph && dyn_graph.output);
+        CHECK(dyn_graph.tokens == dynamic.chunk_tokens);
+        CHECK(dyn_graph.cache_k->ne[1] == context);
+        ggml_phone_qwen3::side_inputs side {};
+        const uint32_t last_chunk =
+            ggml_phone_owned::chunk_count(dynamic) - 1;
+        CHECK(ggml_phone_qwen3::make_side_inputs(
+            dynamic, last_chunk, side, reason));
+        CHECK(side.causal_mask_f16.size() ==
+              size_t(context) * dynamic.chunk_tokens);
+        ggml_free(dyn_ctx);
+    }
     ggml_free(ctx);
     std::puts("test-phone-qwen3-local-builder PASS");
     return 0;
