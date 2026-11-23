@@ -23,7 +23,7 @@ class ModelLayout:
 
     @property
     def phone_first_min(self) -> int:
-        return self.layers - 8
+        return self.layers - 16
 
     @property
     def phone_first_max(self) -> int:
@@ -87,8 +87,8 @@ def resolve_splits(model: ModelLayout, *, layouts: str | None = None,
     A multi-layout sweep varies p and keeps c fixed. An explicit CUDA or
     Phone count selects a single placement and cannot override a sweep.
     """
-    if phone_layers is not None and not 1 <= phone_layers <= 8:
-        raise ValueError("--phone-layers must be 1..8")
+    if phone_layers is not None and not 1 <= phone_layers <= 16:
+        raise ValueError("--phone-layers must be 1..16")
     if cuda_layers is not None and cuda_layers < 1:
         raise ValueError("--cuda-layers must be positive")
     if layouts is not None and (phone_layers is not None or cuda_layers is not None):
