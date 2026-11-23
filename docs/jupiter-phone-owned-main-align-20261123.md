@@ -33,15 +33,23 @@ opt-in legacy RPC fallback. It DOES NOT replace Jupiter with Cycle Runtime.
    static Session mapping. This is not a dynamic HTP scheduling optimizer.
 5. The multi-Prompt harness no longer incorrectly equates a cache MISS with
    a confirmed eviction: server RESET/EVICT logs must establish the cause.
+6. An opt-in `LLAMA_JUPITER_PHONE_OWNED_ASYNC=1` PC worker queues at most
+   two in-flight Phone Chunks and uses a dedicated RPC socket lane. Each
+   non-final Chunk's hidden output is unused by the PC head, so its native
+   GGML custom node may return after enqueue. The worker processes Phone
+   Chunks strictly in order; the final Chunk waits for the worker's actual
+   output before computing PC logits. The caller joins the worker before
+   Phone-owned RESET can free any KV or Graph storage.
 
 ## Unchanged correctness restrictions
 
 - Only dense Qwen3-14B, one fresh single-sequence Prefill, Flash Attention,
   PC final norm/head and one output token; **Decode remains unsupported**.
-- A normal `PHONE_OWNED_RUN` still waits for the completed Phone suffix
-  before the PC head can proceed. Phone-local per-Chunk multi-layer computation
-  is autonomous within that call; the Region Ring task-queue/async PUSH-P2C
-  transport is **not yet ported**.
+- The default `PHONE_OWNED_RUN` remains synchronous. With opt-in PC
+  async overlap, the Phone still uses a synchronous native RUN on a dedicated
+  worker thread, allowing PC prefix computation for subsequent Chunks to
+  progress concurrently. This is an end-to-end per-Prompt overlap prototype,
+  **not** the Region Ring server's task registration / async PUSH-P2C system.
 - All HTP-owned KV allocations are private. No production Decode-KV handoff.
 - Inference equivalence for new boundaries/contexts must be checked against
   the legacy Jupiter result with complete F32 logits; matching Top-1 alone is
@@ -80,6 +88,12 @@ python .\tools\jupiter\run_phone_owned_full_prefill.py `
 This example uses a **six-layer Phone suffix**, L34–39, while the PC
 executes layers 0–33.
 
+To compare the default synchronous path with a PC/Phone overlapped
+version, repeat the **same** command in a fresh output directory and add
+`--async-phone`. Verify full F32 logits parity across both variants and
+against the existing Jupiter baseline before comparing Prefill timing.
+The async option must never be used for Decode or multi-sequence tasks.
+
 Check the Phone `[PHONE_OWNED_SCRATCH]` log for
 `mode=REGION_SINGLE_SLOT`, `PREPARE_LAYER` for every assigned Layer,
 `RUN_DONE` for every Chunk, and final PC `output=REAL_LOGITS`.
@@ -88,11 +102,12 @@ Check the Phone `[PHONE_OWNED_SCRATCH]` log for
 
 The Region Ring reference uses `RPC_CMD_PHONE_INPUT_STREAM_RUN`,
 Phone-owned task registration and input PUSH, session-aware execution
-workers, and asynchronous P2C capture. The Jupiter native bridge instead
-uses synchronous `RPC_CMD_PHONE_OWNED_RUN`. Porting that worker/task
-interface requires separate, full integration of request IDs, readiness
-fences, output lifetimes, queue cancellation/reset and KV ownership; it
-is **not** supplied by the changes in this branch.
+workers, and asynchronous P2C capture. The Jupiter native bridge now offers optional **PC-side asynchronous
+Chunk submission** over the existing synchronous `RPC_CMD_PHONE_OWNED_RUN`
+protocol. This provides limited PC-prefix/Phone-suffix overlap without the
+main design's autonomous Phone RPC task workers and async P2C stream.
+Porting the full server-side task interface remains separate work, especially
+for multiple Regions and downstream Decode-KV ownership.
 
 Do not replace the working Jupiter execution path or report that
 asynchronous runtime alignment is complete until the new transport has
