@@ -6,8 +6,10 @@
 #include <clocale>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <string>
+#include <utility>
 #include <vector>
 #include <iostream> // TODO: remove me
 
