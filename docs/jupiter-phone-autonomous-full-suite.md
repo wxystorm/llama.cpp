@@ -37,8 +37,8 @@ ctest --test-dir build-phone-owned -C Release --output-on-failure -R "test-phone
 ```
 
 Defaults are the already-tested paths:
-- model \`E:\llama\models\Qwen3-14B-Q4_K_M.gguf\` by default; select 32B with \`-ModelSize 32b\`
-- dataset \`E:\llama\datasets\sharegpt\sharegpt40\`
+- model `E:\llama\models\Qwen3-14B-Q4_K_M.gguf` by default; select 32B with `-ModelSize 32b`
+- dataset `E:\llama\datasets\sharegpt\sharegpt40`
 - Phone RPC `10.71.109.52:10140`
 - 14B default: CPU L0..15, CUDA L16..31, Phone L32..39 (8 HTP layers)
 - 32B default: CPU L0..43, CUDA L44..55, Phone L56..63 (8 HTP layers)
@@ -118,38 +118,38 @@ Heads and 8 KV Heads. The local Graph Builder supports its 8192-dimensional
 Attention intermediate and 25600 FFN width. **Context and Batch remain
 fixed to 2048 for both model sizes.**
 
-\`\`\`powershell
+```powershell
 # 32B default: CPU44 + CUDA12 + Phone8, 4 HTP sessions
 .\tools\jupiter\run_phone_owned_full_suite.ps1 -ModelSize 32b -DryRun
 .\tools\jupiter\run_phone_owned_full_suite.ps1 -ModelSize 32b
 
 # Explicit count selection: CPU48 + CUDA8 + Phone8
-.\tools\jupiter\run_phone_owned_full_suite.ps1 \`
-  -ModelSize 32b -CudaLayers 8 -PhoneLayers 8 \`
+.\tools\jupiter\run_phone_owned_full_suite.ps1 `
+  -ModelSize 32b -CudaLayers 8 -PhoneLayers 8 `
   -OutDir ".\jupiter-32b-cpu48-cuda8-htp8"
 
 # Equivalent explicit split using first Phone layer
-.\tools\jupiter\run_phone_owned_full_suite.ps1 \`
-  -ModelSize 32b -CpuLayers 48 -Layouts 56 \`
+.\tools\jupiter\run_phone_owned_full_suite.ps1 `
+  -ModelSize 32b -CpuLayers 48 -Layouts 56 `
   -OutDir ".\jupiter-32b-custom"
 
 # Sweep suffixes of 8/6/4/1 layers (some layouts may exceed GPU VRAM)
-.\tools\jupiter\run_phone_owned_full_suite.ps1 \`
-  -ModelSize 32b -CpuLayers 44 -Layouts "56,58,60,63" \`
+.\tools\jupiter\run_phone_owned_full_suite.ps1 `
+  -ModelSize 32b -CpuLayers 44 -Layouts "56,58,60,63" `
   -OutDir ".\jupiter-32b-layout-sweep"
 
 # Custom GGUF path; auto validates model architecture from GGUF metadata
-.\tools\jupiter\run_phone_owned_full_suite.ps1 \`
+.\tools\jupiter\run_phone_owned_full_suite.ps1 `
   -Model "E:\llama\models\Qwen3-32B-Q4_K_M.gguf"
-\`\`\`
+```
 
-\`-CudaLayers\` and \`-PhoneLayers\` specify a single layout; do not combine
-them with \`-Layouts\`, which specifies one or more Phone start layers.
+`-CudaLayers` and `-PhoneLayers` specify a single layout; do not combine
+them with `-Layouts`, which specifies one or more Phone start layers.
 If CPU layers are not given, they are derived from the CUDA/Phone counts
-or use model defaults. \`-ModelSize 14b\` retains CPU16/CUDA16/Phone8.
+or use model defaults. `-ModelSize 14b` retains CPU16/CUDA16/Phone8.
 Default output directories are model-specific:
-\`jupiter-autonomous-14b-dp-2048\` and
-\`jupiter-autonomous-32b-dp-2048\`.
+`jupiter-autonomous-14b-dp-2048` and
+`jupiter-autonomous-32b-dp-2048`.
 
 **Feasibility is not assumed.** The RTX 4050's 6 GiB VRAM also holds the
 PC final Norm/LM Head, KV and work buffers. Four HTP sessions have their
