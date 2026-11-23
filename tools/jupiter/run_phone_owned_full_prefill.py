@@ -176,10 +176,21 @@ def main() -> int:
                 )
             ]
             if prepared_tokens != [args.target_tokens]:
+                if len(prepared_tokens) == 1:
+                    raise RuntimeError(
+                        f"native: actual chat-formatted Prompt has "
+                        f"{prepared_tokens[0]} tokens, but the requested "
+                        f"Chunk Plan totals {args.target_tokens}. The CLI "
+                        "uses /v1/chat/completions, which adds model-specific "
+                        "Chat Template tokens. For multi-Prompt runs, rebuild "
+                        "llama-tokenize with --chat-user and use "
+                        "run_phone_owned_multi_prompt.py; do not hardcode "
+                        f"a token offset. See {log_path}"
+                    )
                 raise RuntimeError(
-                    f"native: expected one real Prompt PREPARE_BEGIN with "
-                    f"{args.target_tokens} tokens, got {prepared_tokens}; "
-                    "the internal compatibility probe or a prior request "
+                    f"native: expected exactly one real Prompt PREPARE_BEGIN "
+                    f"with {args.target_tokens} tokens, got {prepared_tokens}; "
+                    "an extra compatibility request or incomplete request "
                     f"may have consumed the Phone-owned run. See {log_path}"
                 )
         plan_matches = list(PLAN_RE.finditer(log))
