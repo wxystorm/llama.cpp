@@ -120,6 +120,11 @@ fixed to 2048 for both model sizes.**
 
 ```powershell
 # 32B default: CPU44 + CUDA12 + Phone8, 4 HTP sessions
+# First smoke: one Prompt, actual Jupiter q-DP + Sync/Phone Auto full logits
+.\tools\jupiter\run_phone_owned_full_suite.ps1 `
+  -ModelSize 32b -Pattern "prompt_256_01.txt" -ExpectedCount 1 `
+  -OutDir ".\jupiter-32b-smoke-2048"
+
 .\tools\jupiter\run_phone_owned_full_suite.ps1 -ModelSize 32b -DryRun
 .\tools\jupiter\run_phone_owned_full_suite.ps1 -ModelSize 32b
 
