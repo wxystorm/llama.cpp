@@ -1,4 +1,5 @@
 #include "../ggml/src/ggml-rpc/phone-owned-execution-plan.h"
+#include "../ggml/src/ggml-rpc/phone-owned-cache-policy.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -67,6 +68,29 @@ int main() {
     new_request.p2c_run_id = 2001;
     CHECK(!equal(chain, new_request));
     CHECK(same_execution_template(chain, new_request));
+    // Different Prompt shape uses another fixed Graph template; the cache
+    // must keep multiple layouts only within its measured HTP byte budget.
+    const uint64_t mib = UINT64_C(1024) * 1024;
+    auto short_plan = chain;
+    short_plan.total_tokens = 175;
+    short_plan.chunk_tokens = 88;
+    auto alt_plan = short_plan;
+    alt_plan.total_tokens = 176;
+    CHECK(!same_execution_template(short_plan, alt_plan));
+    CHECK(estimate_resident_bytes(short_plan, 700*mib, alt_plan) >= 700*mib);
+    CHECK(!must_evict_generation(0, 2, 0, 700*mib, 2048*mib));
+    CHECK(!must_evict_generation(1, 2, 700*mib, 900*mib, 2048*mib));
+    CHECK(must_evict_generation(2, 2, 1400*mib, 100*mib, 2048*mib));
+    CHECK(must_evict_generation(1, 2, 1400*mib, 700*mib, 2048*mib));
+    CHECK(must_evict_generation(1, 2, 1500*mib, UINT64_MAX, 2048*mib));
+    const auto larger_plan = short_plan;
+    auto long_plan = larger_plan;
+    long_plan.total_tokens = 512;
+    long_plan.chunk_tokens = 128;
+    CHECK(estimate_resident_bytes(short_plan, 700*mib, long_plan) >
+          estimate_resident_bytes(short_plan, 700*mib, alt_plan));
+    CHECK(estimate_resident_bytes(short_plan, 0, long_plan) == UINT64_MAX);
+
     new_request.total_tokens = 256;
     CHECK(!same_execution_template(chain, new_request));
     new_request = chain;
