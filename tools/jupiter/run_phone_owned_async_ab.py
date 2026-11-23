@@ -89,14 +89,14 @@ def main() -> int:
     enqueued = {
         int(m.group(1)): int(m.group(2))
         for m in re.finditer(
-            r"phase=ASYNC_ENQUEUE chunk=(\\d+) tokens=\\d+ t_us=(\\d+)",
+            r"phase=ASYNC_ENQUEUE chunk=(\d+) tokens=\d+ t_us=(\d+)",
             async_log)
     }
     completed = {
         int(m.group(1)): (int(m.group(2)), int(m.group(3)))
         for m in re.finditer(
-            r"phase=CHUNK_DONE mode=ASYNC[^\\n]*?chunk=(\\d+)"
-            r"[^\\n]*?t_begin_us=(\\d+) t_done_us=(\\d+)",
+            r"phase=CHUNK_DONE mode=ASYNC[^\n]*?chunk=(\d+)"
+            r"[^\n]*?t_begin_us=(\d+) t_done_us=(\d+)",
             async_log)
     }
     overlap_windows = sum(
