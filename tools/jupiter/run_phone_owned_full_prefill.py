@@ -100,6 +100,10 @@ def main() -> int:
             or sum(chunks) != args.target_tokens
             or chunks[:-1] != [chunks[0]]*(len(chunks)-1)):
         raise ValueError("native requires equal full chunks plus one final tail; sum must equal --target-tokens")
+    if args.async_phone and args.stage_dump:
+        raise ValueError("async overlap and stage-dump cannot be combined: snapshots synchronize and may include unused non-final outputs")
+    if args.async_phone and len(chunks) < 2:
+        raise ValueError("async Phone overlap requires at least two Prompt chunks")
     if not 32 <= args.pc_layers <= 39 or not 0 <= args.cpu_layers < args.pc_layers:
         raise ValueError("native requires 32..39 PC layers and 0 <= CPU layers < PC layers")
     if not 256 <= args.context <= 4096 or args.context % 256 != 0:
