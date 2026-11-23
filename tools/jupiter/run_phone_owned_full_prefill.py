@@ -37,7 +37,9 @@ def arguments() -> argparse.Namespace:
     p.add_argument("--chunks", default="88,87")
     p.add_argument("--mode", choices=("both", "legacy", "native"), default="both")
     p.add_argument("--async-phone", action="store_true",
-                   help="overlap PC prefix of next Chunk with Phone suffix of previous Chunk")
+                   help="legacy PC worker overlap; retains synchronous Phone RUN RPC")
+    p.add_argument("--autonomous-phone", action="store_true",
+                   help="Phone server owns FIFO HTP worker; PC PUSH triggers execution and final P2C returns asynchronously")
     p.add_argument("--stage-dump", action="store_true",
                    help="debug only: export PC intermediate F32 stage tensors "
                         "(inserts scheduler synchronization; not for timing)")
@@ -96,14 +98,16 @@ def main() -> int:
         if not p.is_file():
             raise FileNotFoundError(p)
     chunks = [int(x.strip()) for x in args.chunks.split(",")]
-    if (not chunks or any(x <= 0 or x > 128 for x in chunks)
+    if (not chunks or any(x <= 0 or x > 4096 for x in chunks)
             or sum(chunks) != args.target_tokens
             or chunks[:-1] != [chunks[0]]*(len(chunks)-1)):
         raise ValueError("native requires equal full chunks plus one final tail; sum must equal --target-tokens")
-    if args.async_phone and args.stage_dump:
-        raise ValueError("async overlap and stage-dump cannot be combined: snapshots synchronize and may include unused non-final outputs")
-    if args.async_phone and len(chunks) < 2:
-        raise ValueError("async Phone overlap requires at least two Prompt chunks")
+    if args.async_phone and args.autonomous_phone:
+        raise ValueError("--async-phone and --autonomous-phone are exclusive")
+    if (args.async_phone or args.autonomous_phone) and args.stage_dump:
+        raise ValueError("stream overlap and stage-dump cannot be combined")
+    if (args.async_phone or args.autonomous_phone) and len(chunks) < 2:
+        raise ValueError("Phone overlap requires at least two Prompt chunks")
     if not 32 <= args.pc_layers <= 39 or not 0 <= args.cpu_layers < args.pc_layers:
         raise ValueError("native requires 32..39 PC layers and 0 <= CPU layers < PC layers")
     if not 256 <= args.context <= 4096 or args.context % 256 != 0:
@@ -135,6 +139,7 @@ def main() -> int:
             "LLAMA_JUPITER_ASYNC_C2P": "0",
             "LLAMA_JUPITER_PHONE_OWNED_NATIVE": "1" if native else "0",
             "LLAMA_JUPITER_PHONE_OWNED_ASYNC": "1" if native and args.async_phone else "0",
+            "LLAMA_JUPITER_PHONE_OWNED_AUTONOMOUS": "1" if native and args.autonomous_phone else "0",
             "LLAMA_JUPITER_PHONE_OWNED_ENDPOINT": args.rpc,
             "LLAMA_JUPITER_TIMELINE": "1",
             "LLAMA_JUPITER_TRACE": "1",
@@ -241,8 +246,14 @@ def main() -> int:
             raise RuntimeError(
                 f"{mode}: observed {observed_total} / {observed}, expected "
                 f"{args.target_tokens} / {chunks}")
-        if native and (NATIVE_DONE not in log or
-                       log.count(NATIVE_CHUNK) != len(chunks)):
+        if native and NATIVE_DONE not in log:
+            raise RuntimeError(f"native suffix incomplete; see {log_path}")
+        if native and args.autonomous_phone:
+            if (log.count("phase=PHONE_AUTO_PUSH") != len(chunks) or
+                    log.count("phase=PHONE_AUTO_P2C_DONE") != 1):
+                raise RuntimeError(
+                    f"Phone autonomous input/P2C contract incomplete; see {log_path}")
+        elif native and log.count(NATIVE_CHUNK) != len(chunks):
             raise RuntimeError(
                 f"native suffix did not complete all {len(chunks)} chunks; see {log_path}")
         if native and "output=REAL_LOGITS" not in log:
