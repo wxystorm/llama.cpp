@@ -3106,6 +3106,29 @@ static uint64_t jupiter_phone_owned_cache_budget_bytes() {
 bool rpc_server::phone_owned_prepare(
         const rpc_msg_phone_owned_prepare_req & request,
         rpc_msg_phone_owned_prepare_rsp & response) {
+    // Recover an abandoned autonomous task stream before trying to admit
+    // another Plan. A failed worker or a five-minute idle lease cannot keep
+    // the Phone's sole active Graph/KV run permanently occupied.
+    uint64_t abandoned_run = 0;
+    {
+        std::lock_guard<std::mutex> lock(phone_owned_auto_mutex);
+        if (phone_owned_auto_active &&
+                phone_owned_auto_active->queue->abandoned()) {
+            abandoned_run = phone_owned_auto_active->run_id;
+        }
+    }
+    if (abandoned_run) {
+        GGML_LOG_WARN(
+            "[PHONE_AUTO] RECOVER_ABANDONED run=%" PRIu64
+            " action=JOIN_RESET\n", abandoned_run);
+        const rpc_msg_phone_owned_reset_req old { abandoned_run };
+        if (!phone_owned_reset(old)) {
+            GGML_LOG_ERROR(
+                "[PHONE_AUTO] RECOVER_ABANDONED run=%" PRIu64
+                " status=FAIL\n", abandoned_run);
+            return false;
+        }
+    }
     response = {};
     ggml_phone_owned::region_plan plan {};
     jupiter_phone_owned_copy_plan(plan, request.plan);
