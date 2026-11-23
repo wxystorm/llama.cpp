@@ -5,6 +5,7 @@
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
+#include "llama-jupiter.h"
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-kv-cache.h"
@@ -155,6 +156,8 @@ struct jupiter_phone_owned_native_state {
     uint32_t total_tokens = 0;
     uint32_t chunk_tokens = 0;
     uint32_t next_chunk = 0;
+    uint32_t phone_first_layer = 32;
+    uint32_t phone_layers = 8;
     bool prepared = false;
     bool completed = false;
     bool failed = false;
@@ -178,13 +181,19 @@ struct jupiter_phone_owned_native_state {
             return false;
         }
         const auto & hp = model.hparams;
+        const int native_first = llama_jupiter::model_pc_layers(32);
+        const uint32_t native_ctx = cparams.n_ctx_seq;
+        const uint32_t n_chunks = first_chunk == 0 ? 0 :
+            (tokens + first_chunk - 1) / first_chunk;
         if (model.arch != LLM_ARCH_QWEN3 || hp.n_layer() != 40 ||
                 hp.n_embd != 5120 || hp.n_head() != 40 ||
                 hp.n_head_kv() != 8 || hp.n_embd_head_k() != 128 ||
-                !cparams.flash_attn || cparams.n_ctx != 512 ||
-                cparams.n_ctx_seq != 512 ||
-                tokens < 2 || tokens > 512 ||
+                native_first < 32 || native_first >= 40 ||
+                !cparams.flash_attn || cparams.n_ctx != native_ctx ||
+                native_ctx < 256 || native_ctx > 4096 ||
+                tokens < 2 || tokens > native_ctx ||
                 first_chunk == 0 || first_chunk > tokens ||
+                first_chunk > 4096 || n_chunks > 16 ||
                 !model.output || !model.output_norm) {
             fail("UNSUPPORTED_QWEN3_14B_FRESH_PREFILL_SHAPE_OR_KV");
             return false;
@@ -224,10 +233,14 @@ struct jupiter_phone_owned_native_state {
             fail("PILOT_REQUIRES_HTP_SESSIONS_1_OR_4");
             return false;
         }
-        std::vector<uint32_t> devices(8, 0);
+        phone_first_layer = uint32_t(native_first);
+        phone_layers = 40 - phone_first_layer;
+        std::vector<uint32_t> devices(phone_layers, 0);
         if (sessions == 4) {
-            for (uint32_t i = 0; i < 8; ++i) {
-                devices[i] = i/2;
+            for (uint32_t i = 0; i < phone_layers; ++i) {
+                // Contiguous, balanced mapping; the original 8-layer
+                // pilot remains [0,0,1,1,2,2,3,3].
+                devices[i] = (i * 4) / phone_layers;
             }
         }
 
@@ -235,11 +248,11 @@ struct jupiter_phone_owned_native_state {
         // tensor pointer, or PC-side Graph is serialized to the Phone.
         ggml_rpc_phone_owned_plan plan {};
         plan.version = 3;
-        plan.flags = 1 | (8u << 16);
+        plan.flags = 1 | (phone_layers << 16);
         plan.run_id = (uint64_t) ggml_time_us();
         plan.p2c_run_id = plan.run_id;
         plan.region = 0;
-        plan.layer = 32;
+        plan.layer = phone_first_layer;
         plan.total_tokens = tokens;
         plan.chunk_tokens = first_chunk;
         plan.n_embd = hp.n_embd;
@@ -263,8 +276,9 @@ struct jupiter_phone_owned_native_state {
         const int64_t begin = ggml_time_us();
         LLAMA_LOG_INFO(
             "[JUPITER_PHONE_OWNED_PREFILL] phase=PREPARE_BEGIN run=%" PRIu64
-            " tokens=%u chunk=%u sessions=%u ctx=%u\n",
-            plan.run_id, tokens, first_chunk, sessions, cparams.n_ctx_seq);
+            " tokens=%u chunk=%u sessions=%u ctx=%u first_layer=%u layers=%u\n",
+            plan.run_id, tokens, first_chunk, sessions, cparams.n_ctx_seq,
+            phone_first_layer, phone_layers);
         if (!prepare_fn(endpoint.c_str(), &plan,
                         devices.data(), (uint32_t) devices.size(), &stats)) {
             fail("PHONE_NATIVE_PREPARE_REJECTED_CHECK_PHONE_RPC_LOG");
@@ -324,7 +338,8 @@ struct jupiter_phone_owned_native_state {
             0, state->next_chunk,
             static_cast<const float *>(src->data), n_floats,
             static_cast<float *>(dst->data), n_floats, &stats);
-        if (!ok || stats.layers != 8 || stats.tokens != expected_tokens) {
+        if (!ok || stats.layers != state->phone_layers ||
+                stats.tokens != expected_tokens) {
             state->fail("PHONE_NATIVE_CHUNK_RPC_OR_HTP_FAILURE");
             zero_output();
             return;
@@ -424,9 +439,9 @@ llama_context::llama_context(
                 std::make_unique<jupiter_phone_owned_native_state>(endpoint);
             LLAMA_LOG_INFO(
                 "[JUPITER_PHONE_OWNED_PREFILL] mode=FULL_PREFILL"
-                " endpoint=%s stage=PC_CPU_16_PC_CUDA_16_PHONE_HTP_8"
+                " endpoint=%s phone_first_layer=%d"
                 " head=PC_CUDA decode=UNSUPPORTED status=ENABLED\n",
-                endpoint);
+                endpoint, llama_jupiter::model_pc_layers(32));
         }
     }
 
@@ -3310,6 +3325,8 @@ llm_graph_params llama_context::graph_params(
         /*.jupiter_phone_owned_op =*/
             jupiter_phone_native ? jupiter_phone_owned_native_state::graph_compute : nullptr,
         /*.jupiter_phone_owned_user =*/ jupiter_phone_native.get(),
+        /*.jupiter_phone_first_layer =*/
+            jupiter_phone_native ? llama_jupiter::model_pc_layers(32) : 0,
     };
 }
 
