@@ -108,10 +108,17 @@ authenticated Internet-facing service.
 ## Run A → B → A on PC (automated token count)
 
 The test automatically tokenizes each file with the matching
-`llama-tokenize.exe`, computes its actual tokens and 88-token chunks,
-runs native Prefill in a separate `llama-cli.exe` process for each
-Prompt, checks successful real final logits, and compares A with replayed
-A after B. Do not restart the Phone RPC server between cases.
+`llama-tokenize.exe --chat-user`, which **first applies the same default
+Jinja chat template as llama-cli's `/v1/chat/completions` endpoint**.
+Raw `.txt` token counts are not the Prefill counts: for example,
+`prompt_128_01.txt` had 167 raw tokens but the actual native Prefill
+expected 175 after chat formatting. This change is template-aware and does
+**not** assume that the difference is always eight tokens.
+
+The runner computes the formatted total and 88-token chunks, then launches
+native Prefill in a separate `llama-cli.exe` process for each Prompt,
+checks successful real final logits, and compares A with replayed A after B.
+Do not restart the Phone RPC server between cases.
 
 ```powershell
 cd E:\llama\llama-jupiter
@@ -125,6 +132,12 @@ cmake --build build-phone-owned --config Release `
 
 ctest --test-dir build-phone-owned -C Release --output-on-failure `
   -R "test-phone-owned-execution-plan"
+
+# Optional: compare raw token count with the real chat-formatted count.
+& ".\build-phone-owned\bin\Release\llama-tokenize.exe" `
+  -m "E:\llama\models\Qwen3-14B-Q4_K_M.gguf" `
+  -f "E:\llama\datasets\sharegpt\sharegpt40\prompt_128_01.txt" `
+  --chat-user --show-count --log-disable
 
 python .\tools\jupiter\run_phone_owned_multi_prompt.py `
   --exe ".\build-phone-owned\bin\Release\llama-cli.exe" `
