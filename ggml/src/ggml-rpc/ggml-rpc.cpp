@@ -3086,6 +3086,20 @@ bool rpc_server::phone_owned_prepare(
             plan.run_id, miss_reason.c_str());
         flush_standby("REARM_FAILED");
     } else if (!phone_owned_standby.empty()) {
+        // PC run IDs are process-local. A newly started client can reuse
+        // an old physical ID, which would collide with a standby Graph's
+        // (run_id, internal_region) key. Rebuild after flushing in this
+        // rare case rather than accidentally binding another template.
+        bool id_collision = false;
+        for (const auto & candidate : phone_owned_standby) {
+            id_collision |= candidate.physical_run_id == plan.run_id;
+        }
+        if (id_collision) {
+            flush_standby("PHYSICAL_RUN_ID_COLLISION");
+        }
+    }
+    if (hit_index == phone_owned_standby.size() &&
+            !phone_owned_standby.empty()) {
         uint64_t used_bytes = 0;
         uint64_t estimated_new_bytes = 0;
         for (const auto & candidate : phone_owned_standby) {
