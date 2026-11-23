@@ -1287,7 +1287,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                                      std::atoi(native_env) != 0;
     const bool jupiter_pc_layers_env = std::getenv("LLAMA_JUPITER_PC_LAYERS") != nullptr;
     const bool jupiter_plan_file = std::getenv("LLAMA_JUPITER_PLAN_FILE") != nullptr;
-    const int jupiter_pc_layers = llama_jupiter::model_pc_layers(n_layer_all / 2);
+    // Native defaults to the last eight Phone layers for both 14B and
+    // 32B; retain Jupiter's historical half-split for the legacy path.
+    const int jupiter_pc_layers = llama_jupiter::model_pc_layers(
+        jupiter_phone_native ? n_layer_all - 8 : n_layer_all / 2);
     const int jupiter_cpu_layers = llama_jupiter::model_cpu_layers();
 
     ggml_backend_dev_t jupiter_pc_dev = nullptr;
