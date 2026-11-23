@@ -109,8 +109,20 @@ def main() -> int:
     parity = logits_comparison(sync_logits, async_logits)
     report = {
         "parity": parity,
+        "parity_input_a": "sync_native",
+        "parity_input_b": "async_native",
         "phone_rpc_spanned_next_enqueue": overlap_windows,
         "candidate_overlap_boundaries": len(parts) - 1,
+        "overlap_counter_note": (
+            "The next enqueue can happen AFTER the previous Phone RPC ends "
+            "even if it overlapped earlier PC prefix work; use "
+            "inspect_phone_owned_overlap.py to measure those windows."
+        ),
+        "comparison_note": (
+            "Sync runs first, async second: cold/warm model or Graph residency "
+            "may confound elapsed-time comparisons. Repeat in reversed or "
+            "alternating order before claiming a speedup."
+        ),
         "sync_prefill_ms": results["sync"]["prompt_eval_ms"],
         "async_prefill_ms": results["async"]["prompt_eval_ms"],
         "sync_log": str(output / "sync" / "native-full-prefill.log"),
