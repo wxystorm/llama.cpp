@@ -60,8 +60,8 @@ inline bool make_side_inputs(const ggml_phone_owned::region_plan & p,
         reason = "INVALID_SIDE_INPUT_CHUNK";
         return false;
     }
-    const uint32_t begin = chunk * p.chunk_tokens;
-    const uint32_t tokens = std::min(p.chunk_tokens, p.total_tokens - begin);
+    const uint32_t begin = ggml_phone_owned::chunk_begin(p, chunk);
+    const uint32_t tokens = ggml_phone_owned::chunk_size(p, chunk);
     if (uint64_t(p.n_kv) * tokens * sizeof(uint16_t) >
             ggml_phone_owned::k_max_activation_bytes) {
         reason = "CAUSAL_MASK_BUDGET_EXCEEDED";
@@ -137,8 +137,8 @@ inline bool build_graph(ggml_context * ctx,
         }
         return false;
     }
-    const uint32_t begin = chunk * p.chunk_tokens;
-    const uint32_t tokens = std::min(p.chunk_tokens, p.total_tokens - begin);
+    const uint32_t begin = ggml_phone_owned::chunk_begin(p, chunk);
+    const uint32_t tokens = ggml_phone_owned::chunk_size(p, chunk);
     const int64_t kv_width = int64_t(p.n_heads_kv) * p.head_dim;
     const int64_t attn_width = int64_t(p.n_heads) * p.head_dim;
     if (uint64_t(p.n_kv) * tokens * sizeof(uint16_t) >
