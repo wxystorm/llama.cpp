@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run different Qwen3-14B prompts against persistent Phone-owned HTP Graphs.
+"""Run Qwen3-14B/32B prompts against persistent Phone-owned HTP Graphs.
 
 A -> B -> A checks whether the first Graph survives creation of a second
 execution shape. The phone RPC server must remain alive between invocations.
@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 
 from run_phone_owned_full_prefill import read_logits, logits_comparison
+from phone_owned_models import inspect_model, resolve_splits
 from test_phone_owned_residency import PREPARE
 
 TOKEN_COUNT = re.compile(r"Total number of tokens:\s*(\d+)")
@@ -28,6 +29,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--exe", required=True, help="Windows llama-cli.exe")
     p.add_argument("--tokenizer", required=True, help="matching llama-tokenize.exe")
     p.add_argument("--model", required=True)
+    p.add_argument("--model-size", choices=("auto", "14b", "32b"), default="auto")
     p.add_argument("--rpc", required=True)
     p.add_argument("--prompts", nargs="+", required=True,
                    help="two or more UTF-8 .txt files; order is preserved")
@@ -38,8 +40,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--require-revisit-hit", action="store_true",
                    help="fail if the replayed first shape was evicted")
     p.add_argument("--sessions", type=int, choices=(1, 2, 3, 4), default=4)
-    p.add_argument("--pc-layers", type=int, default=32)
-    p.add_argument("--cpu-layers", type=int, default=16)
+    p.add_argument("--pc-layers", type=int, default=None)
+    p.add_argument("--cpu-layers", type=int, default=None)
+    p.add_argument("--cuda-layers", type=int, default=None)
+    p.add_argument("--phone-layers", type=int, default=None)
     p.add_argument("--context", type=int, default=512)
     p.add_argument("--chunk-size", type=int, default=88)
     p.add_argument("--out-dir", default="phone-owned-multi-prompt-s4")
@@ -98,8 +102,14 @@ def run() -> int:
         raise ValueError("--chunk-size must be 1..4096")
     if not 256 <= args.context <= 4096 or args.context % 256 != 0:
         raise ValueError("--context must be 256..4096 and divisible by 256")
-    if not 32 <= args.pc_layers <= 39 or not 0 <= args.cpu_layers < args.pc_layers:
-        raise ValueError("--pc-layers must be 32..39 and CPU prefix must be smaller")
+    model_info = inspect_model(Path(args.model), args.model_size)
+    layouts, args.cpu_layers = resolve_splits(
+        model_info,
+        layouts=str(args.pc_layers) if args.pc_layers is not None else None,
+        cpu_layers=args.cpu_layers, cuda_layers=args.cuda_layers,
+        phone_layers=args.phone_layers)
+    args.pc_layers = layouts[0]
+    args.model_size = model_info.family
     exe = Path(args.exe).resolve()
     tokenizer = Path(args.tokenizer).resolve()
     model = Path(args.model).resolve()
@@ -144,6 +154,7 @@ def run() -> int:
         command = [
             sys.executable, str(runner),
             "--exe", str(exe), "--model", str(model),
+            "--model-size", args.model_size,
             "--rpc", args.rpc, "--prompt-file", str(path),
             "--sessions", str(args.sessions),
             "--pc-layers", str(args.pc_layers),
