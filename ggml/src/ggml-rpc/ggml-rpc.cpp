@@ -2,6 +2,7 @@
 #include "phone-owned-jupiter-api.h"
 #include "phone-npu-serial-executor.h"
 #include "phone-owned-cache-policy.h"
+#include "phone-owned-autonomous-queue.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpp.h"
@@ -120,6 +121,10 @@ enum rpc_cmd {
     RPC_CMD_PHONE_OWNED_PREPARE,
     RPC_CMD_PHONE_OWNED_RUN,
     RPC_CMD_PHONE_OWNED_RESET,
+    // Phone-owned Prefill-only autonomous input queue and P2C return.
+    RPC_CMD_PHONE_OWNED_AUTO_START,
+    RPC_CMD_PHONE_OWNED_AUTO_PUSH,
+    RPC_CMD_PHONE_OWNED_AUTO_P2C_WAIT,
     RPC_CMD_COUNT,
 };
 
@@ -313,6 +318,28 @@ struct rpc_msg_phone_owned_run_rsp {
 struct rpc_msg_phone_owned_reset_req {
     uint64_t run_id;
 };
+struct rpc_msg_phone_owned_auto_start_req {
+    uint64_t run_id;
+    uint64_t p2c_run_id;
+    uint32_t region;
+    uint32_t max_in_flight;
+};
+struct rpc_msg_phone_owned_auto_push_req {
+    uint64_t run_id;
+    uint64_t p2c_run_id;
+    uint32_t region;
+    uint32_t chunk;
+    uint32_t input_floats;
+};
+struct rpc_msg_phone_owned_auto_p2c_wait_req {
+    uint64_t run_id;
+    uint64_t p2c_run_id;
+    uint32_t region;
+};
+static_assert(sizeof(rpc_msg_phone_owned_auto_start_req) == 24,
+              "Phone-owned autonomous start ABI changed");
+static_assert(sizeof(rpc_msg_phone_owned_auto_push_req) == 28,
+              "Phone-owned autonomous push ABI changed");
 
 
 struct rpc_msg_set_tensor_from_local_file_rsp {
