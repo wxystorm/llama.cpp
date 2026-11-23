@@ -3338,27 +3338,50 @@ bool rpc_server::phone_owned_reset(const rpc_msg_phone_owned_reset_req & req) {
     auto & chain = phone_owned_chains.begin()->second;
     const bool complete = chain.next_chunk ==
         ggml_phone_owned::chunk_count(chain.plan);
-    const bool retain = jupiter_phone_owned_persistence_enabled() && complete;
-    if (retain) {
-        // No active request may access this physical Graph until a new
-        // PREPARE has explicitly checked topology and cleared ALL layer KV.
-        phone_owned_standby =
-            std::make_unique<phone_owned_chain>(std::move(chain));
+    const bool persist = jupiter_phone_owned_persistence_enabled();
+
+    uint64_t standby_bytes = 0;
+    for (const auto & candidate : phone_owned_standby) {
+        standby_bytes += candidate.resident_bytes;
+    }
+    const uint64_t budget_bytes =
+        jupiter_phone_owned_cache_budget_bytes();
+    const size_t max_entries = jupiter_phone_owned_cache_entries();
+    const bool admission_ok = persist && complete &&
+        chain.resident_bytes != 0 &&
+        chain.resident_bytes <= budget_bytes &&
+        phone_owned_standby.size() < max_entries &&
+        standby_bytes <= budget_bytes - chain.resident_bytes;
+    if (admission_ok) {
+        // Only completed executions enter the standby pool. Every cached
+        // template has private Graph metadata/KV/scratch; the next logical
+        // request MUST rearm it, zeroing every layer's KV first.
+        phone_owned_standby.push_back(std::move(chain));
         GGML_LOG_INFO(
             "[JUPITER_PHONE_OWNED] RESET run=%" PRIu64
             " status=PASS graph_cache=RESIDENT physical_run=%" PRIu64
-            " chunks=%u\n",
-            req.run_id, phone_owned_standby->physical_run_id,
-            phone_owned_standby->next_chunk);
+            " chunks=%u entries=%zu resident_mib=%.3f"
+            " budget_mib=%.0f\n",
+            req.run_id, phone_owned_standby.back().physical_run_id,
+            phone_owned_standby.back().next_chunk,
+            phone_owned_standby.size(),
+            (standby_bytes + phone_owned_standby.back().resident_bytes)/1048576.0,
+            budget_bytes/1048576.0);
     } else {
+        // The HTP backend exposes no safe per-UID eviction. Releasing
+        // active or partially built Graphs invalidates the entire fixed
+        // graph cache; release all standby Graph allocations too.
         for (auto & owner : phone_owned_executors) {
             if (owner) { owner->release_owned_htp_graphs(); }
         }
-        phone_owned_standby.reset();
+        phone_owned_standby.clear();
+        const char * reason = !complete ? "INCOMPLETE_RUN" :
+            !persist ? "PERSIST_DISABLED" :
+            "RESIDENT_MEMORY_OR_CAPACITY";
         GGML_LOG_INFO(
             "[JUPITER_PHONE_OWNED] RESET run=%" PRIu64
             " status=PASS graph_cache=RELEASED reason=%s\n",
-            req.run_id, complete ? "PERSIST_DISABLED" : "INCOMPLETE_RUN");
+            req.run_id, reason);
     }
     phone_owned_chains.clear();
     return true;
