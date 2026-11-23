@@ -333,8 +333,10 @@ struct jupiter_phone_owned_native_state {
         // Exact scalar parameters of the regular Qwen3 graph. No weight,
         // tensor pointer, or PC-side Graph is serialized to the Phone.
         ggml_rpc_phone_owned_plan plan {};
-        plan.version = 3;
-        plan.flags = 1 | (phone_layers << 16);
+        // v2 represents one Layer; v3 carries a contiguous multi-Layer
+        // count in the upper flag bits. Do not encode a one-layer v3 plan.
+        plan.version = phone_layers == 1 ? 2 : 3;
+        plan.flags = phone_layers == 1 ? 1 : 1 | (phone_layers << 16);
         plan.run_id = (uint64_t) ggml_time_us();
         plan.p2c_run_id = plan.run_id;
         plan.region = 0;
