@@ -17,6 +17,7 @@
 struct llama_model;
 class llama_batch_allocr;
 struct jupiter_phone_owned_native_state;
+struct jupiter_stage_dump_state;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -349,6 +350,9 @@ private:
 
     // Opt-in full-Prefill Phone-owned HTP suffix; never enabled for Decode.
     std::unique_ptr<jupiter_phone_owned_native_state> jupiter_phone_native;
+
+    // Disabled unless LLAMA_JUPITER_STAGE_DUMP_DIR is set.
+    std::unique_ptr<jupiter_stage_dump_state> jupiter_stage_dump;
 
     bool sched_need_reserve = true;
 
