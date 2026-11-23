@@ -50,6 +50,21 @@ GGML_BACKEND_API bool run_chunk(
     const float * input, size_t input_floats,
     std::vector<float> & output, run_stats & stats);
 
+// Autonomous Prefill-only alternative to run_chunk(): prepare Graphs, arm
+// the Phone worker, and PUSH ordered full hidden-state Chunks. A successful
+// push ACK means queue admission only. The Phone computes autonomously;
+// p2c_wait returns the FINAL Chunk hidden state from a separate RPC channel.
+// The PC still owns embedding/prefix layers and final RMSNorm/LM Head.
+GGML_BACKEND_API bool auto_start(
+    const char * endpoint, uint64_t run_id, uint64_t p2c_run_id,
+    uint32_t region, uint32_t max_in_flight);
+GGML_BACKEND_API bool auto_push(
+    const char * endpoint, uint64_t run_id, uint64_t p2c_run_id,
+    uint32_t region, uint32_t chunk, const float * input, size_t input_floats);
+GGML_BACKEND_API bool auto_p2c_wait(
+    const char * endpoint, uint64_t run_id, uint64_t p2c_run_id,
+    uint32_t region, std::vector<float> & output, run_stats & stats);
+
 // Releases all pilot Phone-owned graphs and private KV for the sole active
 // run. Do not call concurrently with native chunk execution.
 GGML_BACKEND_API bool reset(
