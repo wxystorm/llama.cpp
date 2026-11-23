@@ -126,6 +126,29 @@ cosine. A numeric mismatch is reported, not silently labeled PASS.
 For S4, restart Phone RPC with four HTP devices, then use `--sessions 4`
 and an isolated output directory.
 
+### Internal two-token probe (fixed on this branch)
+
+The llama-server wrapper calls `common_context_can_seq_rm()` before serving
+the real Prompt. Its capability check normally evaluates **two synthetic
+tokens**, even when `--no-warmup` is set. For the one-shot native Phone-owned
+KV/run this must NOT execute the model: otherwise it completes the Phone-owned
+run with just two tokens and subsequent real Prefill fails with
+`DECODE_KV_HANDOFF_NOT_IMPLEMENTED`.
+
+When `LLAMA_JUPITER_PHONE_OWNED_NATIVE=1` and
+`LLAMA_JUPITER_PREFILL=1`, the branch now checks the host memory API instead
+of calling `llama_decode()` during this capability probe. Expected log:
+
+```text
+[JUPITER_PHONE_OWNED_PREFILL] phase=SEQ_RM_PROBE mode=MEMORY_ONLY result=1 synthetic_decode=SKIPPED
+```
+
+The real first native decode must be the 175-token Prompt, not the synthetic
+2-token probe. This change is **PC-side only**: rebuild `llama-cli` and its
+dependent `common` library; the Phone RPC server need not rebuild for this
+specific fix. The A/B runner now rejects a missing probe marker and checks the
+exact `PREPARE_BEGIN tokens=175` value.
+
 ### Expected log milestones
 
 ```text
