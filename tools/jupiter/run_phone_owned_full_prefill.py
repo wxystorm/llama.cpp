@@ -107,8 +107,9 @@ def main() -> int:
         raise ValueError("--async-phone and --autonomous-phone are exclusive")
     if (args.async_phone or args.autonomous_phone) and args.stage_dump:
         raise ValueError("stream overlap and stage-dump cannot be combined")
-    if (args.async_phone or args.autonomous_phone) and len(chunks) < 2:
-        raise ValueError("Phone overlap requires at least two Prompt chunks")
+    if args.async_phone and len(chunks) < 2:
+        raise ValueError("PC-worker overlap requires at least two Prompt Chunks; "
+                         "Phone-autonomous Jupiter DP accepts a single Chunk")
     if not 32 <= args.pc_layers <= 39 or not 0 <= args.cpu_layers < args.pc_layers:
         raise ValueError("native requires 32..39 PC layers and 0 <= CPU layers < PC layers")
     if not 256 <= args.context <= 4096 or args.context % 256 != 0:
