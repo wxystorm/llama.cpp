@@ -217,6 +217,10 @@ def preflight(args: argparse.Namespace, files: list[Path],
         "mode_order": args.mode_order, "warmup": not args.no_warmup,
         "revisit_first": args.revisit_first,
         "prompts": list(tokens.values()),
+        "driver_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "runner_sha256": hashlib.sha256(
+            Path(__file__).with_name("run_phone_owned_full_prefill.py").read_bytes()
+        ).hexdigest(),
     }
     signature = hashlib.sha256(
         json.dumps(config, sort_keys=True).encode()).hexdigest()
@@ -305,7 +309,7 @@ def child_run(command: list[str], stdout_path: Path, timeout: int) -> None:
         child = subprocess.Popen(command, **options)
         try:
             code = child.wait(timeout=timeout if timeout > 0 else None)
-        except subprocess.TimeoutExpired as exc:
+        except (subprocess.TimeoutExpired, KeyboardInterrupt) as exc:
             if os.name == "nt":
                 subprocess.run(
                     ["taskkill", "/F", "/T", "/PID", str(child.pid)],
@@ -313,7 +317,13 @@ def child_run(command: list[str], stdout_path: Path, timeout: int) -> None:
                     check=False)
             else:
                 os.killpg(child.pid, signal.SIGKILL)
-            child.wait()
+            try:
+                child.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+            if isinstance(exc, KeyboardInterrupt):
+                raise
             raise RuntimeError(
                 f"Timeout after {timeout}s; local child tree killed. "
                 "Check Phone active-run recovery before continuing.") from exc
@@ -377,7 +387,10 @@ def perform_case(args: argparse.Namespace, case: dict,
             (args.mode_order == "alternate" and position % 2):
         order.reverse()
     if not args.no_warmup:
-        run_mode(args, case, "sync", attempt / "warmup")
+        warm = run_mode(args, case, "sync", attempt / "warmup")
+        # Warmup is not a measurement and does not need a duplicate
+        # 151936-element F32 logits dump on disk.
+        Path(warm["logits"]).unlink(missing_ok=True)
     runs = {}
     for mode in order:
         runs[mode] = run_mode(args, case, mode, attempt / mode)
