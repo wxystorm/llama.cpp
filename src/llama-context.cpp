@@ -846,7 +846,25 @@ llama_context::llama_context(
         // including KV and scheduler compute graph workspace. Four sessions
         // share physical RAM; do not treat 4 x VMEM as guaranteed free RAM.
         const char * htp_multi_env = std::getenv("LLAMA_JUPITER_HTP_SESSIONS");
-        if (htp_multi_env && std::atoi(htp_multi_env) > 1) {
+        const bool htp_multi_session =
+            htp_multi_env != nullptr && std::atoi(htp_multi_env) > 1;
+        if (htp_multi_session && jupiter_phone_native) {
+            // Phone-owned native mode intentionally keeps Layers 32..39
+            // as *CPU placeholders* on the PC. The actual HTP model/KV/Graph
+            // allocations are owned by the remote Phone RPC server, so
+            // model.dev_layer(il) contains no RPC backend for those layers.
+            // The following legacy runtime memory accounting requires
+            // PC-mapped RPC layers and would incorrectly throw
+            // "Jupiter HTP runtime has no assigned Phone layers".
+            // The native path validates RPC device count and Session memory
+            // in llama-model.cpp, then checks real remote allocations during
+            // PHONE_OWNED_PREPARE. Do not bypass that remote validation.
+            LLAMA_LOG_INFO(
+                "[JUPITER_PHONE_OWNED_PREFILL] phase=HTP_RUNTIME_MEMORY"
+                " mode=PHONE_OWNED_REMOTE status=DEFER_TO_REMOTE_PREPARE"
+                " sessions=%d\n", std::atoi(htp_multi_env));
+        }
+        if (htp_multi_session && !jupiter_phone_native) {
             std::unordered_set<ggml_backend_dev_t> used_htp_devices;
             for (uint32_t il = 0; il < model.hparams.n_layer_all; ++il) {
                 auto * dev = model.dev_layer(il);
