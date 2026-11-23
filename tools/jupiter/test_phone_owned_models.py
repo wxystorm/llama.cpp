@@ -4,7 +4,8 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from dataclasses import replace
+from jupiter_memory_partition import GGUFWeights
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -13,8 +14,12 @@ import phone_owned_models as m
 
 class TestModelsAndSplits(unittest.TestCase):
     def mock_gguf(self, layers: int):
-        return SimpleNamespace(
-            arch="qwen3", n_layers=layers, embedding_length=5120,
+        # Use Jupiter's REAL GGUFWeights dataclass to keep the model
+        # inspector contract in sync with read_gguf_weights().
+        return GGUFWeights(
+            architecture="qwen3", layers=tuple([1024] * layers),
+            other_bytes=2048, file_bytes=2048 + 1024*layers,
+            embedding_length=5120,
             attention_head_count=40 if layers == 40 else 64,
             attention_head_count_kv=8, attention_key_length=128,
             rope_dimension_count=128,
@@ -48,18 +53,18 @@ class TestModelsAndSplits(unittest.TestCase):
         with patch.object(m, "read_gguf_weights", return_value=model):
             with self.assertRaises(ValueError):
                 m.inspect_model(Path("model.gguf"), "14b")
-        model.attention_head_count = 40
+        model = replace(model, attention_head_count=40)
         with patch.object(m, "read_gguf_weights", return_value=model):
             with self.assertRaises(ValueError):
                 m.inspect_model(Path("model.gguf"))
 
     def test_bad_layers_and_unsupported_arch_rejected(self):
         model = self.mock_gguf(64)
-        model.n_layers = 63
+        model = replace(model, layers=tuple([1024] * 63))
         with patch.object(m, "read_gguf_weights", return_value=model):
             with self.assertRaises(ValueError):
                 m.inspect_model(Path("model.gguf"))
-        model.arch = "qwen3moe"
+        model = replace(model, architecture="qwen3moe")
         with patch.object(m, "read_gguf_weights", return_value=model):
             with self.assertRaises(ValueError):
                 m.inspect_model(Path("model.gguf"))
