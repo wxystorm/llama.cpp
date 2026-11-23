@@ -41,21 +41,25 @@ static ggml_phone_owned::region_plan qwen3_14b_plan() {
 
 int main(int argc, char ** argv) {
     if (argc < 3 || argc > 4 ||
-            (std::string(argv[2]) != "1" && std::string(argv[2]) != "4")) {
+            (std::atoi(argv[2]) < 1 || std::atoi(argv[2]) > 4)) {
         std::fprintf(stderr,
-            "usage: %s <phone-host:port> <sessions:1|4> [--run]\n"
+            "usage: %s <phone-host:port> <sessions:1..4> [--run|--auto-run]\n"
             "Requires a rebuilt phone RPC server exposing HTP devices\n"
             "and a local Qwen3-14B GGUF tensor source.\n", argv[0]);
         return 2;
     }
-    if (argc == 4 && std::string(argv[3]) != "--run") {
+    if (argc == 4 && std::string(argv[3]) != "--run" &&
+            std::string(argv[3]) != "--auto-run") {
         return 2;
     }
     // Refuse older server protocol before sending native opcodes.
+    const bool autonomous = argc == 4 && std::string(argv[3]) == "--auto-run";
 #ifdef _WIN32
     _putenv_s("LLAMA_JUPITER_PHONE_OWNED_NATIVE", "1");
+    if (autonomous) { _putenv_s("LLAMA_JUPITER_PHONE_OWNED_AUTONOMOUS", "1"); }
 #else
     setenv("LLAMA_JUPITER_PHONE_OWNED_NATIVE", "1", 1);
+    if (autonomous) { setenv("LLAMA_JUPITER_PHONE_OWNED_AUTONOMOUS", "1", 1); }
 #endif
     const std::string endpoint(argv[1]);
     const bool execute = argc == 4;
@@ -66,12 +70,10 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "invalid plan: %s\n", reason);
         return 2;
     }
-    // The current Jupiter HTP8_S4 stage layout is 2 layers per device.
+    // The original eight-layer S4 layout remains [0,0,1,1,2,2,3,3].
     std::vector<uint32_t> devices(8, 0);
-    if (sessions == 4) {
-        for (size_t i = 0; i < devices.size(); ++i) {
-            devices[i] = static_cast<uint32_t>(i / 2);
-        }
+    for (size_t i = 0; i < devices.size(); ++i) {
+        devices[i] = static_cast<uint32_t>(i*sessions/devices.size());
     }
     ggml_jupiter_phone_owned::prepare_stats prep {};
     if (!ggml_jupiter_phone_owned::prepare(
@@ -86,7 +88,45 @@ int main(int argc, char ** argv) {
                 prep.buffer_alloc_ms, prep.precompile_ms, prep.wall_ms);
 
     bool ok = true;
-    if (execute) {
+    if (autonomous) {
+        if (!ggml_jupiter_phone_owned::auto_start(
+                endpoint.c_str(), p.run_id, p.p2c_run_id, p.region, 2)) {
+            std::fprintf(stderr, "[PHONE_OWNED_SMOKE] AUTO_START_FAILED\n");
+            ok = false;
+        }
+        for (uint32_t chunk = 0;
+                ok && chunk < ggml_phone_owned::chunk_count(p); ++chunk) {
+            const uint32_t n = std::min(
+                p.chunk_tokens, p.total_tokens - chunk*p.chunk_tokens);
+            std::vector<float> input(size_t(n)*p.n_embd, 0.0f);
+            if (!ggml_jupiter_phone_owned::auto_push(
+                    endpoint.c_str(), p.run_id, p.p2c_run_id, p.region,
+                    chunk, input.data(), input.size())) {
+                std::fprintf(stderr,
+                    "[PHONE_OWNED_SMOKE] AUTO_PUSH_FAILED chunk=%u\n", chunk);
+                ok = false;
+                break;
+            }
+            std::printf("[PHONE_OWNED_SMOKE] AUTO_PUSH chunk=%u"
+                        " tokens=%u status=QUEUED\n", chunk, n);
+        }
+        if (ok) {
+            std::vector<float> output;
+            ggml_jupiter_phone_owned::run_stats st {};
+            const uint32_t last_tokens = p.total_tokens % p.chunk_tokens ?
+                p.total_tokens % p.chunk_tokens : p.chunk_tokens;
+            ok = ggml_jupiter_phone_owned::auto_p2c_wait(
+                endpoint.c_str(), p.run_id, p.p2c_run_id,
+                p.region, output, st);
+            ok = ok && output.size() == size_t(last_tokens)*p.n_embd &&
+                st.layers == 8 && st.tokens == last_tokens &&
+                std::all_of(output.begin(), output.end(),
+                    [](float x) { return std::isfinite(x); });
+            std::printf("[PHONE_OWNED_SMOKE] AUTO_P2C"
+                        " tokens=%u layers=%u status=%s\n",
+                        st.tokens, st.layers, ok ? "PASS" : "FAIL");
+        }
+    } else if (execute) {
         for (uint32_t chunk = 0;
                 chunk < ggml_phone_owned::chunk_count(p); ++chunk) {
             const uint32_t n = std::min(
