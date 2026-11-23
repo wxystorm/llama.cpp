@@ -2257,11 +2257,19 @@ private:
     struct phone_owned_chain {
         ggml_phone_owned::region_plan plan {};
         std::vector<uint32_t> devices;
+        // Stable key of resident compiled Graphs; may differ from logical
+        // plan.run_id after a warm PREPARE.
+        uint64_t physical_run_id = 0;
         uint32_t next_chunk = 0;
     };
     std::mutex phone_owned_mutex;
     std::vector<std::unique_ptr<ggml_phone_npu_serial::full_region_executor>> phone_owned_executors;
     std::map<std::pair<uint64_t, uint32_t>, phone_owned_chain> phone_owned_chains;
+    // At most one completed run's HTP Graphs/KV/scratch are retained,
+    // bounded to its exact Graph topology and fixed layer-to-Session map.
+    // No logical request is active while this standby cache is populated.
+    std::unique_ptr<phone_owned_chain> phone_owned_standby;
+
 
     std::mutex jupiter_event_mutex;
     std::condition_variable jupiter_event_cv;
@@ -2900,6 +2908,13 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
 }
 
 
+static bool jupiter_phone_owned_persistence_enabled() {
+    // Enabled by default for native Phone-owned RPC. Opt out for cold A/B
+    // measurements or to reproduce the old release-on-RESET behavior.
+    const char * env = std::getenv("GGML_RPC_PHONE_OWNED_PERSIST");
+    return env == nullptr || std::strcmp(env, "0") != 0;
+}
+
 bool rpc_server::phone_owned_prepare(
         const rpc_msg_phone_owned_prepare_req & request,
         rpc_msg_phone_owned_prepare_rsp & response) {
@@ -2942,13 +2957,84 @@ bool rpc_server::phone_owned_prepare(
     if (phone_owned_executors.size() < backends.size()) {
         phone_owned_executors.resize(backends.size());
     }
+    const int64_t begin_us = ggml_time_us();
+
+    // The previous completed request has released its *logical* run ID,
+    // but its HTP fixed Graphs are still resident under their original
+    // physical_run_id. No RPC wire change is needed: new logical IDs are
+    // translated to this key only inside phone_owned_run().
+    if (phone_owned_standby != nullptr) {
+        const bool matches = jupiter_phone_owned_persistence_enabled() &&
+            ggml_phone_owned::same_execution_template(
+                phone_owned_standby->plan, plan) &&
+            phone_owned_standby->devices == mapping;
+        bool rearmed = matches;
+        size_t kv_cleared_bytes = 0;
+        std::string miss_reason = matches ? "NONE" : "TEMPLATE_OR_DEVICE_MISMATCH";
+        if (matches) {
+            for (uint32_t offset = 0; offset < count; ++offset) {
+                const uint32_t device = mapping[offset];
+                if (device >= phone_owned_executors.size() ||
+                        !phone_owned_executors[device]) {
+                    rearmed = false;
+                    miss_reason = "RESIDENT_EXECUTOR_MISSING";
+                    break;
+                }
+                auto child = ggml_phone_owned::single_layer_plan(plan, offset);
+                std::string reason;
+                size_t bytes = 0;
+                if (!phone_owned_executors[device]->rearm_native_prefill_graphs(
+                        phone_owned_standby->physical_run_id,
+                        child.region, child, reason, bytes)) {
+                    rearmed = false;
+                    miss_reason = reason;
+                    break;
+                }
+                kv_cleared_bytes += bytes;
+            }
+        }
+        if (rearmed) {
+            phone_owned_chain chain {};
+            chain.plan = plan;
+            chain.devices = std::move(mapping);
+            chain.physical_run_id = phone_owned_standby->physical_run_id;
+            phone_owned_chains.emplace(key, std::move(chain));
+            phone_owned_standby.reset();
+            response.ok = 1;
+            response.graphs = uint32_t(count *
+                ggml_phone_owned::chunk_count(plan));
+            response.wall_ms = (ggml_time_us() - begin_us)/1000.0;
+            GGML_LOG_INFO(
+                "[JUPITER_PHONE_OWNED] PREPARE_CACHE status=HIT"
+                " run=%" PRIu64 " physical_run=%" PRIu64
+                " layers=%zu graphs=%u kv_cleared_bytes=%zu"
+                " wall_ms=%.3f\n",
+                plan.run_id,
+                phone_owned_chains.at(key).physical_run_id,
+                count, response.graphs, kv_cleared_bytes,
+                response.wall_ms);
+            return true;
+        }
+        // A different prompt/chunk/session topology cannot reuse the old
+        // fixed tensor pointers. Invalidate Hexagon's compiled UID cache
+        // before freeing Graph/KV/scratch, then prepare a fresh set.
+        GGML_LOG_INFO(
+            "[JUPITER_PHONE_OWNED] PREPARE_CACHE status=MISS"
+            " run=%" PRIu64 " reason=%s action=REBUILD\n",
+            plan.run_id, miss_reason.c_str());
+        for (auto & owner : phone_owned_executors) {
+            if (owner) { owner->release_owned_htp_graphs(); }
+        }
+        phone_owned_standby.reset();
+    }
+
     const auto rollback = [&]() {
         for (auto & owner : phone_owned_executors) {
             if (owner) { owner->release_owned_htp_graphs(); }
         }
+        phone_owned_standby.reset();
         response = {};
     };
-    const int64_t begin_us = ggml_time_us();
     for (uint32_t offset = 0; offset < count; ++offset) {
         const uint32_t device = mapping[offset];
         if (!phone_owned_executors[device]) {
@@ -2992,6 +3078,7 @@ bool rpc_server::phone_owned_prepare(
     phone_owned_chain chain {};
     chain.plan = plan;
     chain.devices = std::move(mapping);
+    chain.physical_run_id = plan.run_id;
     phone_owned_chains.emplace(key, std::move(chain));
     response.ok = 1;
     response.wall_ms = (ggml_time_us() - begin_us) / 1000.0;
@@ -3108,7 +3195,7 @@ bool rpc_server::phone_owned_run(
         std::vector<float> next;
         std::string reason;
         if (!owner.run_native_prefill_chunk(
-                req.run_id, internal_region, req.chunk,
+                chain.physical_run_id, internal_region, req.chunk,
                 activation.data(), activation.size(), next, reason, st)) {
             GGML_LOG_ERROR("[JUPITER_PHONE_OWNED] RUN_REJECT"
                            " layer=%u chunk=%u device=%u reason=%s\n",
@@ -3143,16 +3230,36 @@ bool rpc_server::phone_owned_run(
 
 bool rpc_server::phone_owned_reset(const rpc_msg_phone_owned_reset_req & req) {
     std::lock_guard<std::mutex> lock(phone_owned_mutex);
-    if (phone_owned_chains.empty() ||
+    if (phone_owned_chains.size() != 1 ||
             phone_owned_chains.begin()->first.first != req.run_id) {
         return false;
     }
-    for (auto & owner : phone_owned_executors) {
-        if (owner) { owner->release_owned_htp_graphs(); }
+    auto & chain = phone_owned_chains.begin()->second;
+    const bool complete = chain.next_chunk ==
+        ggml_phone_owned::chunk_count(chain.plan);
+    const bool retain = jupiter_phone_owned_persistence_enabled() && complete;
+    if (retain) {
+        // No active request may access this physical Graph until a new
+        // PREPARE has explicitly checked topology and cleared ALL layer KV.
+        phone_owned_standby =
+            std::make_unique<phone_owned_chain>(std::move(chain));
+        GGML_LOG_INFO(
+            "[JUPITER_PHONE_OWNED] RESET run=%" PRIu64
+            " status=PASS graph_cache=RESIDENT physical_run=%" PRIu64
+            " chunks=%u\n",
+            req.run_id, phone_owned_standby->physical_run_id,
+            phone_owned_standby->next_chunk);
+    } else {
+        for (auto & owner : phone_owned_executors) {
+            if (owner) { owner->release_owned_htp_graphs(); }
+        }
+        phone_owned_standby.reset();
+        GGML_LOG_INFO(
+            "[JUPITER_PHONE_OWNED] RESET run=%" PRIu64
+            " status=PASS graph_cache=RELEASED reason=%s\n",
+            req.run_id, complete ? "PERSIST_DISABLED" : "INCOMPLETE_RUN");
     }
     phone_owned_chains.clear();
-    GGML_LOG_INFO("[JUPITER_PHONE_OWNED] RESET run=%" PRIu64 " status=PASS\n",
-                  req.run_id);
     return true;
 }
 
