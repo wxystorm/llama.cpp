@@ -60,6 +60,28 @@ int main() {
     chain.layer = 23;
     CHECK(validate(chain, reason));
     CHECK(layer_count(chain) == 3);
+    // Reuse a precompiled Graph across requests only with identical
+    // execution geometry; a new transport run ID alone must not invalidate it.
+    auto new_request = chain;
+    new_request.run_id = 2000;
+    new_request.p2c_run_id = 2001;
+    CHECK(!equal(chain, new_request));
+    CHECK(same_execution_template(chain, new_request));
+    new_request.total_tokens = 256;
+    CHECK(!same_execution_template(chain, new_request));
+    new_request = chain;
+    new_request.run_id = 2000;
+    new_request.chunk_tokens = 64;
+    CHECK(!same_execution_template(chain, new_request));
+    new_request = chain;
+    new_request.run_id = 2000;
+    new_request.kv_capacity = 4096;
+    CHECK(!same_execution_template(chain, new_request));
+    new_request = chain;
+    new_request.run_id = 2000;
+    new_request.rope_freq_scale = 0.5f;
+    CHECK(!same_execution_template(chain, new_request));
+
     CHECK(chunk_count(chain) == 4);
     CHECK(internal_layer_region(chain, 0) != chain.region);
     CHECK(internal_layer_region(chain, 0) !=
