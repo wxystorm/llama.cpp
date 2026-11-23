@@ -1305,7 +1305,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     if (jupiter_prefill) {
         // The original Jupiter layer planner supplies the PC boundary.
-        // Native Phone-owned HTP accepts a contiguous 1..8 layer suffix of
+        // Native Phone-owned HTP accepts a contiguous 1..16 layer suffix of
         // either dense Qwen3 model; do not force the 14B L32 boundary on 32B.
         const bool native_qwen3_shape = arch == LLM_ARCH_QWEN3 &&
             ((n_layer_all == 40 && hparams.n_head() == 40) ||
@@ -1313,13 +1313,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             hparams.n_embd == 5120 && hparams.n_head_kv() == 8 &&
             hparams.n_embd_head_k() == 128;
         if (jupiter_phone_native &&
-                (!native_qwen3_shape || jupiter_pc_layers < n_layer_all - 8 ||
+                (!native_qwen3_shape || jupiter_pc_layers < n_layer_all - 16 ||
                  jupiter_pc_layers >= n_layer_all)) {
             throw std::runtime_error(
                 "Jupiter native Phone-owned Prefill requires dense Qwen3-14B"
-                " (40 layers, PC boundary 32..39) or Qwen3-32B"
-                " (64 layers, PC boundary 56..63), with a contiguous"
-                " 1..8-layer Phone suffix and 5120 hidden features");
+                " (40 layers, PC boundary 24..39) or Qwen3-32B"
+                " (64 layers, PC boundary 48..63), with a contiguous"
+                " 1..16-layer Phone suffix and 5120 hidden features");
         }
         if (split_mode != LLAMA_SPLIT_MODE_LAYER) {
             throw std::runtime_error("LLAMA_JUPITER_PREFILL requires --split-mode layer");
