@@ -310,6 +310,8 @@ llama_build(test-phone-qwen3-local-builder.cpp)
 llama_test(test-phone-qwen3-local-builder LABEL jupiter-phone-owned)
 llama_build(test-phone-qwen3-local-parity.cpp)
 llama_test(test-phone-qwen3-local-parity LABEL jupiter-phone-owned)
+llama_build(test-phone-owned-autonomous-queue.cpp)
+llama_test(test-phone-owned-autonomous-queue LABEL jupiter-phone-owned)
 
 # Optional manual integration smoke. Does not run in CTest because a Phone
 # with HTP, a local GGUF source and a dedicated RPC server are required.
