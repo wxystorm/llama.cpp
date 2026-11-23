@@ -39,6 +39,7 @@ jobs:
           tools/jupiter/compare_phone_owned_stages.py
           tools/jupiter/test_phone_owned_residency.py
           tools/jupiter/run_phone_owned_multi_prompt.py
+          tools/jupiter/run_phone_owned_async_ab.py
       - name: Run model-free contract tests
         run: >-
           ctest --test-dir build-phone-owned --output-on-failure
