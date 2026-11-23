@@ -43,7 +43,11 @@ Defaults are the already-tested paths:
 - 14B default: CPU L0..15, CUDA L16..31, Phone L32..39 (8 HTP layers)
 - 32B default: CPU L0..43, CUDA L44..55, Phone L56..63 (8 HTP layers)
 - Four HTP Sessions; Qwen3's PC Head remains unchanged
-- 50 unique Prompt files are required by `-ExpectedCount 50`
+- The **default dataset is exactly ShareGPT40's 50 Prompts**: ten each from
+  filename groups `0,128,256,512,1024`. Files from `2048`,
+  `2048-4000` or any other group are excluded **before tokenization**.
+  `-ExpectedCount 50` checks total coverage and the default five-group
+  layout additionally verifies ten files per group.
 - warm-up before measured pairs, alternating Sync/Phone-Auto run order
 - per-group distinct shape A→B→A replay, complete F32 Logits parity check
 - 1 measured pair per Prompt; stage2/q/refine calibration repeats are 2/2/2
@@ -65,8 +69,9 @@ lengths is explicitly recorded by Stage3, not presented as remeasurement.
 
 ## Planning is genuinely Jupiter q(x,y) + DP
 
-1. Enumerate all `prompt_*_*.txt` files (sorted by numeric
-   group and ordinal). Count **actual Chat Template tokens** using the
+1. Select only `prompt_{0,128,256,512,1024}_??.txt` groups from
+   `prompt_*_*.txt` (sorted by group and index); ignore any 2048+
+   source Prompt files. Count **actual Chat Template tokens** using the
    matching `llama-tokenize --chat-user` tool, rather than
    assigning a guessed constant offset. Any Prompt exceeding fixed
    Context=2048 causes an explicit preflight error.
@@ -109,6 +114,29 @@ alternative, because the Phone-owned native suffix presently supports
 only 1..8 contiguous Transformer layers. This preserves the same
 fixed placement in both A/B modes without misrepresenting its origin.
 
+
+### Selecting a different dataset (opt-in)
+
+The default one-command run always uses five groups 0,128,256,512,1024
+and **never** reads 2048+ Prompt files; Context=2048 and output
+`-n 1` are unchanged. The original files are not shortened or rewritten.
+The `2048` group is a filename/data-selection category, **not** the
+model Context setting.
+
+```powershell
+# Default five groups: 50 Prompts, not the later 2048 group
+.\tools\jupiter\run_phone_owned_full_suite.ps1 -ModelSize 32b -DryRun
+
+# Optional single-group custom experiment, outside the default full50
+.\tools\jupiter\run_phone_owned_full_suite.ps1 `
+  -ModelSize 32b -Groups 1024 -ExpectedCount 10 `
+  -OutDir ".\jupiter-32b-group1024"
+```
+
+Passing `-Groups all` explicitly opts into every matching source group,
+but requests whose actual Chat Template length exceeds Context=2048 will
+still be rejected before any model run. For the formal full50, keep the
+five-group default.
 
 ## Qwen3-32B: automatic or explicitly specified layer placement
 
