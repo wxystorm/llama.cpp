@@ -474,6 +474,56 @@ struct jupiter_phone_owned_native_state {
             return;
         }
         const size_t n_floats = size_t(expected_tokens)*5120;
+        if (state->autonomous_enabled) {
+            const uint32_t chunk = state->next_chunk;
+            const uint32_t last = (state->total_tokens +
+                                   state->chunk_tokens - 1) /
+                                   state->chunk_tokens - 1;
+            const int64_t begin_us = ggml_time_us();
+            if (!state->auto_push_fn(
+                    state->endpoint.c_str(), state->run_id, state->run_id,
+                    0, chunk, static_cast<const float *>(src->data), n_floats)) {
+                state->fail("PHONE_AUTO_INPUT_PUSH_REJECTED");
+                zero_output();
+                return;
+            }
+            LLAMA_LOG_INFO(
+                "[JUPITER_PHONE_OWNED_PREFILL] phase=PHONE_AUTO_PUSH"
+                " run=%" PRIu64 " chunk=%u tokens=%u"
+                " admission_ms=%.3f status=QUEUED\n",
+                state->run_id, chunk, expected_tokens,
+                (ggml_time_us() - begin_us)/1000.0);
+            if (chunk == last) {
+                // The Phone worker executes the local HTP Graphs without a
+                // matching PC RUN RPC. The final hidden state arrives from
+                // an independent P2C completion subscriber; only then may
+                // llama.cpp run the final PC RMSNorm and LM Head.
+                ggml_rpc_phone_owned_run_stats stats {};
+                const int64_t p2c_begin_us = ggml_time_us();
+                const bool received = state->auto_p2c_fn(
+                    state->endpoint.c_str(), state->run_id, state->run_id,
+                    0, static_cast<float *>(dst->data), n_floats, &stats);
+                if (!received || stats.layers != state->phone_layers ||
+                        stats.tokens != expected_tokens) {
+                    state->fail("PHONE_AUTO_P2C_FINAL_OR_HTP_FAILURE");
+                    zero_output();
+                    return;
+                }
+                LLAMA_LOG_INFO(
+                    "[JUPITER_PHONE_OWNED_PREFILL] phase=PHONE_AUTO_P2C_DONE"
+                    " run=%" PRIu64 " chunk=%u tokens=%u"
+                    " phone_compute_ms=%.3f p2c_wait_ms=%.3f"
+                    " output=REAL_HIDDEN status=PASS\n",
+                    state->run_id, chunk, expected_tokens, stats.compute_ms,
+                    (ggml_time_us() - p2c_begin_us)/1000.0);
+            } else {
+                // Non-final Phone layer outputs are not sampled; their HTP
+                // computations update private KV in the remote FIFO worker.
+                zero_output();
+            }
+            ++state->next_chunk;
+            return;
+        }
         if (state->async_enabled) {
             const uint32_t this_chunk = state->next_chunk;
             const uint32_t last = (state->total_tokens + state->chunk_tokens - 1) /
