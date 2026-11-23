@@ -53,6 +53,37 @@ int main() {
     CHECK(validate(wide, reason));
     CHECK(owned_task_uid(15, 0) != owned_task_uid(1, 0));
     CHECK(chunk_count(a) == 4);
+    // Jupiter original q(x,y) Sequence DP can use nonuniform widths.
+    auto dp = a;
+    dp.total_tokens = 358;
+    dp.chunk_tokens = 128;
+    dp.schedule_count = 4;
+    dp.schedule = {60, 60, 110, 128};
+    CHECK(validate(dp, reason));
+    CHECK(chunk_count(dp) == 4);
+    CHECK(chunk_begin(dp, 0) == 0);
+    CHECK(chunk_begin(dp, 1) == 60);
+    CHECK(chunk_begin(dp, 2) == 120);
+    CHECK(chunk_begin(dp, 3) == 230);
+    CHECK(chunk_size(dp, 2) == 110);
+    CHECK(chunk_size(dp, 3) == 128);
+    CHECK(matches_chunk(dp, 3, 230, 128, 91,
+                        128ULL*5120*4, 128ULL*5120*4));
+    CHECK(!matches_chunk(dp, 3, 240, 128, 91,
+                         128ULL*5120*4, 128ULL*5120*4));
+    auto other_dp = dp;
+    other_dp.schedule = {60, 110, 60, 128};
+    CHECK(validate(other_dp, reason));
+    CHECK(!same_execution_template(dp, other_dp));
+    other_dp = dp;
+    other_dp.schedule[3] = 127;
+    CHECK(!validate(other_dp, reason));
+    other_dp = dp;
+    other_dp.schedule[4] = 1;
+    CHECK(!validate(other_dp, reason));
+    other_dp = dp;
+    other_dp.schedule_count = 17;
+    CHECK(!validate(other_dp, reason));
     // Versioned contiguous NPU Region: one external Region/Chunk can
     // dispatch several ordered, separately cached whole-layer graphs.
     auto chain = a;
