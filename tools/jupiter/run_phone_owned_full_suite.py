@@ -536,6 +536,12 @@ def run_mode(args: argparse.Namespace, case: dict,
     if not isinstance(latency, (int, float)) or not math.isfinite(latency) or \
             latency <= 0:
         raise RuntimeError(f"Invalid Prefill timing in {work}/results.json")
+    timing_tokens = report.get("prompt_eval_timing_tokens")
+    if not isinstance(timing_tokens, int) or \
+            abs(timing_tokens - case["tokens"]) > 1:
+        raise RuntimeError(
+            f"Jupiter timing token count {timing_tokens} differs from "
+            f"planned {case['tokens']} by >1; invalid Prefill sample: {work}")
     logits = work / "native-logits.f32"
     if not logits.is_file():
         raise RuntimeError(f"Missing full F32 Logits: {logits}")
