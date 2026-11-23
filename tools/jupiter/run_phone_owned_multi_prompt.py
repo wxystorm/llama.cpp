@@ -3,7 +3,8 @@
 
 A -> B -> A checks whether the first Graph survives creation of a second
 execution shape. The phone RPC server must remain alive between invocations.
-Only the existing fresh-prefill, 512-token native pilot is supported.
+Only fresh one-shot native Qwen3 Prefill is supported (context <=4096,
+1..8 Phone layers, no Decode KV handoff).
 """
 from __future__ import annotations
 
@@ -219,9 +220,10 @@ def run() -> int:
         if (args.require_revisit_hit and
                 index == len(sequence) and not cache_hit):
             raise RuntimeError(
-                "revisited first Graph was evicted: increase the Phone's "
-                "GGML_RPC_PHONE_OWNED_CACHE_BUDGET_MIB, use smaller prompts, "
-                "or check CACHE_EVICT/RESET in the Phone log"
+                "revisited first Graph was not retained/reused. This alone "
+                "does not prove eviction; inspect Phone PREPARE_CACHE, "
+                "CACHE_EVICT and RESET logs for memory budget, shape-key "
+                "mismatch, ID collision, or release decisions"
             )
     print(f"[PHONE_MULTI_PROMPT] report={output/'multi-prompt-results.json'} "
           "status=PASS")
