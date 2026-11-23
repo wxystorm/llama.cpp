@@ -41,7 +41,8 @@ static ggml_phone_owned::region_plan plan() {
 }
 
 static ggml_phone_qwen3::layer_weights weights(
-        ggml_context * ctx, int64_t n_heads = 40) {
+        ggml_context * ctx, int64_t n_heads = 40,
+        int64_t ffn_width = 17408) {
     using ggml_phone_qwen3::layer_weights;
     layer_weights w {};
     const int64_t q_width = n_heads * 128;
@@ -51,9 +52,9 @@ static ggml_phone_qwen3::layer_weights weights(
     w.wv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 5120, 1024);
     w.wo = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, q_width, 5120);
     w.ffn_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 5120);
-    w.ffn_gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 5120, 17408);
-    w.ffn_up = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 5120, 17408);
-    w.ffn_down = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 17408, 5120);
+    w.ffn_gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 5120, ffn_width);
+    w.ffn_up = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 5120, ffn_width);
+    w.ffn_down = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ffn_width, 5120);
     w.q_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128);
     w.k_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128);
     return w;
@@ -170,7 +171,11 @@ int main() {
     wide.layer = 63;
     wide.region = 15;
     wide.n_heads = 64;
-    const auto wide_weights = weights(ctx, 64);
+    wide.total_tokens = 2048;
+    wide.kv_capacity = 2048;
+    wide.n_kv = 2048;
+    // Qwen3-32B has 8192 Query width and 25600 FFN hidden width.
+    const auto wide_weights = weights(ctx, 64, 25600);
     CHECK(ggml_phone_owned::validate(wide, reason));
     CHECK(ggml_phone_qwen3::validate_weights(wide, wide_weights, reason));
     ggml_phone_qwen3::graph_result wide_graph {};
@@ -179,6 +184,11 @@ int main() {
     CHECK(wide_graph.graph && wide_graph.output);
     CHECK(wide_graph.output->ne[0] == 5120 &&
           wide_graph.output->ne[1] == 128);
+    CHECK(wide_weights.ffn_up->ne[1] == 25600);
+    CHECK(wide_graph.cache_k->ne[1] == 2048);
+    ggml_phone_qwen3::side_inputs wide_side {};
+    CHECK(ggml_phone_qwen3::make_side_inputs(wide, 0, wide_side, reason));
+    CHECK(wide_side.causal_mask_f16.size() == size_t(2048)*128);
     const ggml_tensor * out_projection = nullptr;
     for (int n = 0; n < ggml_graph_n_nodes(wide_graph.graph); ++n) {
         const ggml_tensor * node = ggml_graph_node(wide_graph.graph, n);
