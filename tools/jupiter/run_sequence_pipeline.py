@@ -262,6 +262,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--batch", type=int, default=512)
     p.add_argument("--context", type=int, default=512)
     p.add_argument("--ubatch", type=int, default=128)
+    p.add_argument("--max-subsequences", type=int, default=None,
+                   help="bound Jupiter Sequence DP candidate Chunk count (native HTP <=16)")
     p.add_argument("--threads", type=int, default=8)
     p.add_argument("--out-dir", default="jupiter-sequence-stage3")
     p.add_argument("--plan-output", default="jupiter-stage3.plan")
@@ -400,7 +402,7 @@ def main() -> int:
         metric="compute_ms", pc_layers=pc,
         cpu_layers=args.cpu_layers,
         min_chunk=b, max_chunk=max_chunk,
-        max_subsequences=None, repeats=args.refine_repeats,
+        max_subsequences=args.max_subsequences, repeats=args.refine_repeats,
         batch=args.batch, context=args.context,
         threads=args.threads, extra_arg=[],
     )
@@ -427,6 +429,8 @@ def main() -> int:
         "--metric", "compute_ms",
         "--out-dir", str(refine_out), "--plan-output", str(final_plan),
     ]
+    if args.max_subsequences is not None:
+        refine_command += ["--max-subsequences", str(args.max_subsequences)]
     if args.accept_measured_candidate:
         refine_command.append("--accept-measured-candidate")
     if can_resume:
@@ -445,6 +449,8 @@ def main() -> int:
         refine_out / "q-profile-refined.csv",
         cpu_layers=args.cpu_layers,
     )
+    if args.max_subsequences is not None and len(chunks) > args.max_subsequences:
+        raise ValueError("Jupiter measured DP plan exceeds requested max-subsequences")
     runtime_latency_ms = None
     if not args.skip_runtime_verify:
         runtime_latency_ms = verify_runtime(
