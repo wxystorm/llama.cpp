@@ -33,6 +33,9 @@ def arguments() -> argparse.Namespace:
     p.add_argument("--target-tokens", type=int, default=175)
     p.add_argument("--chunks", default="88,87")
     p.add_argument("--mode", choices=("both", "legacy", "native"), default="both")
+    p.add_argument("--stage-dump", action="store_true",
+                   help="debug only: export PC intermediate F32 stage tensors "
+                        "(inserts scheduler synchronization; not for timing)")
     p.add_argument("--out-dir", default="phone-owned-full-prefill-14b")
     p.add_argument("--verbosity", type=int, default=4)
     return p.parse_args()
@@ -125,6 +128,12 @@ def main() -> int:
             "LLAMA_JUPITER_LOGITS_HASH": "1",
             "LLAMA_JUPITER_LOGITS_DUMP_FILE": str(out / f"{mode}-logits.f32"),
         })
+        if args.stage_dump:
+            env["LLAMA_JUPITER_STAGE_DUMP_DIR"] = str(out / f"{mode}-pc-stages")
+            env["LLAMA_JUPITER_STAGE_DUMP_TOKENS"] = str(args.target_tokens)
+        else:
+            env.pop("LLAMA_JUPITER_STAGE_DUMP_DIR", None)
+            env.pop("LLAMA_JUPITER_STAGE_DUMP_TOKENS", None)
         command = [
             str(exe), "-m", str(model),
             "--rpc", args.rpc,
@@ -221,6 +230,8 @@ def main() -> int:
         results[mode] = {
             "log": str(log_path),
             "logits": str(logits_path),
+            "pc_stage_dump_dir": str(out / f"{mode}-pc-stages") if args.stage_dump else None,
+            "timing_valid_for_performance": not args.stage_dump,
             "logits_count": len(logits),
             "top1": max(range(len(logits)), key=lambda i: logits[i]),
             "plan": observed,
