@@ -34,8 +34,9 @@ def main() -> int:
     args = p.parse_args()
 
     chunks = [int(x) for x in args.chunks.split(",")]
-    if len(chunks) < 2 or sum(chunks) != args.target_tokens:
-        raise ValueError("use at least two Chunks summing to --target-tokens")
+    if len(chunks) < 1 or sum(chunks) != args.target_tokens:
+        raise ValueError("Jupiter plan must have one or more Chunks "
+                         "summing to --target-tokens")
 
     out = Path(args.out_dir).resolve()
     out.mkdir(parents=True, exist_ok=True)
