@@ -148,7 +148,32 @@ def main() -> int:
             raise RuntimeError(f"{mode} exited {proc.returncode}:\n{tail}")
         plan_matches = list(PLAN_RE.finditer(log))
         if not plan_matches:
-            raise RuntimeError(f"{mode}: JUPITER_SEQUENCE_PLAN missing; see {log_path}")
+            # The CLI server wrapper may exit with status 0 after an internal
+            # request failure. Report the *earlier* failure rather than
+            # misdiagnosing a missing Plan as the root cause.
+            lines = log.splitlines()
+            clues = [
+                line for line in lines
+                if any(needle in line.lower() for needle in (
+                    "jupiter_phone_owned", "jupiter_sequence_decision",
+                    "jupiter_stage_plan", "reason=", "error", "fail",
+                    "could not", "unable to", "unsupported", "exception",
+                    "not found", "model loaded", "launch_slot",
+                    "stop processing", "prompt eval time",
+                ))
+            ]
+            clue_text = "\\n".join(clues[-35:]) or "(no matching milestones)"
+            tail_text = "\\n".join(lines[-45:]) or "(empty log)"
+            raise RuntimeError(
+                f"{mode}: no JUPITER_SEQUENCE_PLAN was emitted. "
+                f"Possibilities: the request failed before init_batch, "
+                f"or the explicit chunk plan was rejected. "
+                f"Inspect the original cause below; no model speedup/parity "
+                f"can be inferred.\\n"
+                f"--- key milestones/errors ---\\n{clue_text}\\n"
+                f"--- last 45 log lines ---\\n{tail_text}\\n"
+                f"--- full log: {log_path}"
+            )
         observed_total = int(plan_matches[-1].group(1))
         observed = [int(x) for x in plan_matches[-1].group(2).split(",")]
         if observed_total != args.target_tokens or observed != chunks:
