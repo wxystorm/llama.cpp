@@ -7,6 +7,7 @@
 // This header deliberately knows nothing about RPC sockets or HTP tensor
 // pointers. The same queue contract can be tested without a real Phone.
 
+#include <cstddef>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
