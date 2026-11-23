@@ -200,10 +200,12 @@ Use compare_phone_owned_stages.py with --cpu-dir, --native-dir and
 --phone-dir. It prints cosine, relative RMSE, absolute error and per-chunk
 (88 and 87 tokens) differences at four comparison points:
 
-1. CPU L31 versus native PC L31 (PC prefix correctness).
-2. CPU L32 versus HTP L32 (first Phone layer correctness).
-3. CPU L39 versus HTP L39 (full Phone suffix correctness).
-4. HTP L39 versus native PC phone_owned_hidden (RPC transfer parity).
+1. CPU L31 versus native PC L31 (full 175-token PC prefix correctness).
+2. CPU L32 versus HTP L32 (full 175-token first Phone layer).
+3. CPU L39 versus final token of HTP L39 (standard Qwen3 gathers only
+   the selected output token during its final Transformer layer).
+4. HTP L39 versus native PC phone_owned_hidden (all 175 tokens;
+   verifies the Phone-to-PC RPC transfer).
 
 Do NOT use these debug runs for performance claims. Scheduler eval
 callbacks synchronize and split compute; phone dumps add file I/O.
