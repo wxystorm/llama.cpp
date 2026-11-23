@@ -914,8 +914,7 @@ public:
             return false;
         }
         const uint32_t expected_tokens =
-            std::min<uint32_t>(
-                p.chunk_tokens, p.total_tokens - chunk * p.chunk_tokens);
+            ggml_phone_owned::chunk_size(p, chunk);
         const auto valid_indices = [&](const ggml_tensor * t) {
             return t && t->buffer && t->data &&
                 t->type == GGML_TYPE_I64 &&
@@ -1040,10 +1039,9 @@ public:
         const auto & g = git->second->built;
         if (state.next_chunk != chunk ||
                 chunk >= ggml_phone_owned::chunk_count(p) ||
-                g.token_begin != uint64_t(chunk) * p.chunk_tokens ||
+                g.token_begin != ggml_phone_owned::chunk_begin(p, chunk) ||
                 g.tokens == 0 ||
-                g.tokens != std::min<uint32_t>(
-                    p.chunk_tokens, p.total_tokens - g.token_begin) ||
+                g.tokens != ggml_phone_owned::chunk_size(p, chunk) ||
                 g.cache_k != state.k || g.cache_v != state.v ||
                 !state.canonical_k || !state.canonical_v) {
             reason = "PHONE_LOCAL_ONLY_KV_FIFO_OR_BINDING_MISMATCH";
@@ -1210,9 +1208,8 @@ public:
             reason = "PHONE_NATIVE_CHUNK_OUT_OF_RANGE";
             return false;
         }
-        const uint32_t token_begin = chunk * plan.chunk_tokens;
-        const uint32_t tokens = std::min<uint32_t>(
-            plan.chunk_tokens, plan.total_tokens - token_begin);
+        const uint32_t token_begin = ggml_phone_owned::chunk_begin(plan, chunk);
+        const uint32_t tokens = ggml_phone_owned::chunk_size(plan, chunk);
         const size_t expected_floats = size_t(tokens) * plan.n_embd;
         if (chunk >= ggml_phone_owned::chunk_count(plan) ||
             state.next_chunk != chunk ||
@@ -1315,9 +1312,8 @@ public:
         const auto & g = item.built;
         if (state.next_chunk != chunk ||
                 chunk >= ggml_phone_owned::chunk_count(p) ||
-                g.token_begin != uint64_t(chunk) * p.chunk_tokens ||
-                g.tokens != std::min<uint32_t>(
-                    p.chunk_tokens, p.total_tokens - g.token_begin) ||
+                g.token_begin != ggml_phone_owned::chunk_begin(p, chunk) ||
+                g.tokens != ggml_phone_owned::chunk_size(p, chunk) ||
                 g.cache_k != state.k || g.cache_v != state.v) {
             reason = "PHONE_LOCAL_EXEC_KV_FIFO_OR_BINDING_MISMATCH";
             return false;
@@ -1612,10 +1608,10 @@ public:
                 return false;
             }
             const auto & graph = graph_it->second->built;
-            const uint32_t expected_begin = chunk * requested.chunk_tokens;
-            const uint32_t expected_tokens = std::min(
-                requested.chunk_tokens,
-                requested.total_tokens - expected_begin);
+            const uint32_t expected_begin =
+                ggml_phone_owned::chunk_begin(requested, chunk);
+            const uint32_t expected_tokens =
+                ggml_phone_owned::chunk_size(requested, chunk);
             if (!graph.graph || !graph.input || !graph.output ||
                     graph.cache_k != state.k || graph.cache_v != state.v ||
                     graph.token_begin != expected_begin ||
