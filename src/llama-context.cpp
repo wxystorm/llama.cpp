@@ -147,8 +147,8 @@ struct jupiter_stage_dump_state {
 };
 
 // Native Phone-owned Prefill (Qwen3-14B pilot). Unlike the legacy Jupiter
-// path, the CPU GGML custom op calls the Phone Graph that owns the final
-// eight Transformer layers. The output head stays on PC CUDA. Only fresh
+// path, the CPU GGML custom op calls Phone-local Graphs for the planned
+// contiguous Transformer suffix. The output head stays on PC CUDA. Only fresh
 // Prefill is supported: the Phone-owned KV has no Decode handoff yet.
 struct jupiter_phone_owned_native_state {
     std::string endpoint;
