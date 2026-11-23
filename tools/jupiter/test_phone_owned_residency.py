@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model", required=True)
     p.add_argument("--rpc", required=True)
     p.add_argument("--prompt-file", required=True)
-    p.add_argument("--sessions", type=int, choices=(1, 4), default=4)
+    p.add_argument("--sessions", type=int, choices=(1, 2, 3, 4), default=4)
     p.add_argument("--target-tokens", type=int, default=175)
     p.add_argument("--chunks", default="88,87")
     p.add_argument("--runs", type=int, default=3)
