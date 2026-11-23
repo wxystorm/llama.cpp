@@ -46,6 +46,8 @@ jobs:
           tools/jupiter/run_phone_owned_autonomous_ab.py
           tools/jupiter/run_phone_owned_full_suite.py
           tools/jupiter/test_run_phone_owned_full_suite.py
+          tools/jupiter/run_min_chunk_profile.py
+          tools/jupiter/run_sequence_pipeline.py
       - name: Run full-suite planner/resume unit tests
         run: python -m unittest discover -s tools/jupiter -p test_run_phone_owned_full_suite.py -v
       - name: Run model-free contract tests
