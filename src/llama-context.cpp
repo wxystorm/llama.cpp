@@ -155,6 +155,9 @@ struct jupiter_phone_owned_native_state {
     ggml_backend_rpc_phone_owned_prepare_t prepare_fn = nullptr;
     ggml_backend_rpc_phone_owned_run_t run_fn = nullptr;
     ggml_backend_rpc_phone_owned_reset_t reset_fn = nullptr;
+    ggml_backend_rpc_phone_owned_auto_start_t auto_start_fn = nullptr;
+    ggml_backend_rpc_phone_owned_auto_push_t auto_push_fn = nullptr;
+    ggml_backend_rpc_phone_owned_auto_p2c_wait_t auto_p2c_fn = nullptr;
     uint64_t run_id = 0;
     uint32_t total_tokens = 0;
     uint32_t chunk_tokens = 0;
@@ -175,6 +178,7 @@ struct jupiter_phone_owned_native_state {
         uint32_t tokens = 0;
         std::vector<float> input;
     };
+    bool autonomous_enabled = false;
     bool async_enabled = false;
     bool async_stop = false;
     uint32_t async_completed = 0;
@@ -304,6 +308,18 @@ struct jupiter_phone_owned_native_state {
                 prepare_fn = prepare;
                 run_fn = run;
                 reset_fn = reset;
+                auto_start_fn =
+                    reinterpret_cast<ggml_backend_rpc_phone_owned_auto_start_t>(
+                        ggml_backend_reg_get_proc_address(
+                            reg, GGML_BACKEND_RPC_PHONE_OWNED_AUTO_START_PROC));
+                auto_push_fn =
+                    reinterpret_cast<ggml_backend_rpc_phone_owned_auto_push_t>(
+                        ggml_backend_reg_get_proc_address(
+                            reg, GGML_BACKEND_RPC_PHONE_OWNED_AUTO_PUSH_PROC));
+                auto_p2c_fn =
+                    reinterpret_cast<ggml_backend_rpc_phone_owned_auto_p2c_wait_t>(
+                        ggml_backend_reg_get_proc_address(
+                            reg, GGML_BACKEND_RPC_PHONE_OWNED_AUTO_P2C_WAIT_PROC));
                 break;
             }
         }
@@ -377,10 +393,34 @@ struct jupiter_phone_owned_native_state {
         total_tokens = tokens;
         chunk_tokens = first_chunk;
         prepared = true;
+        if (const char * setting = std::getenv("LLAMA_JUPITER_PHONE_OWNED_AUTONOMOUS")) {
+            autonomous_enabled = std::strcmp(setting, "1") == 0;
+        }
+        if (autonomous_enabled) {
+            const char * other = std::getenv("LLAMA_JUPITER_PHONE_OWNED_ASYNC");
+            if (other && std::strcmp(other, "1") == 0) {
+                fail("PHONE_NATIVE_AUTONOMOUS_AND_PC_ASYNC_ARE_EXCLUSIVE");
+                return false;
+            }
+            if (!auto_start_fn || !auto_push_fn || !auto_p2c_fn) {
+                fail("PHONE_NATIVE_AUTONOMOUS_RPC_PROCS_MISSING_REBUILD_PC");
+                return false;
+            }
+            if (!auto_start_fn(endpoint.c_str(), run_id, plan.p2c_run_id,
+                               plan.region, 2)) {
+                fail("PHONE_NATIVE_AUTONOMOUS_START_REJECTED_CHECK_PHONE_LOG");
+                return false;
+            }
+            LLAMA_LOG_INFO(
+                "[JUPITER_PHONE_OWNED_PREFILL] phase=PHONE_AUTO_START"
+                " run=%" PRIu64 " p2c_run=%" PRIu64
+                " queue_depth=2 mode=PHONE_SERVER_TASK_FIFO status=READY\n",
+                run_id, plan.p2c_run_id);
+        }
         if (const char * setting = std::getenv("LLAMA_JUPITER_PHONE_OWNED_ASYNC")) {
             async_enabled = std::strcmp(setting, "1") == 0;
         }
-        if (async_enabled) {
+        if (async_enabled && !autonomous_enabled) {
             try {
                 async_worker = std::thread([this] { async_loop(); });
             } catch (const std::exception & e) {
