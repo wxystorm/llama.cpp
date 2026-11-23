@@ -712,6 +712,9 @@ struct llm_graph_params {
     // A null function preserves the original graph exactly.
     ggml_custom1_op_t jupiter_phone_owned_op = nullptr;
     void * jupiter_phone_owned_user = nullptr;
+    // First Phone-owned layer, taken from Jupiter's placement plan.
+    // Zero when the native bridge is disabled.
+    int jupiter_phone_first_layer = 0;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -785,7 +788,8 @@ struct llm_graph_params {
             loras == other.loras &&
             cross == other.cross &&
             jupiter_phone_owned_op == other.jupiter_phone_owned_op &&
-            jupiter_phone_owned_user == other.jupiter_phone_owned_user;
+            jupiter_phone_owned_user == other.jupiter_phone_owned_user &&
+            jupiter_phone_first_layer == other.jupiter_phone_first_layer;
     }
 };
 
