@@ -146,8 +146,8 @@ def parse_args() -> argparse.Namespace:
                    help="insert A-B-A with two distinct shapes in each group")
     p.add_argument("--resume", action="store_true",
                    help="skip only matching completed PASS cases")
-    p.add_argument("--fail-fast", action="store_true",
-                   help="stop at first failed request instead of collecting failures")
+    p.add_argument("--continue-on-error", action="store_true",
+                   help="continue after failed Phone RPC; off by default to avoid cascading active-run failures")
     p.add_argument("--timeout-seconds", type=int, default=1800,
                    help="per child run; kill the whole local subprocess tree")
     p.add_argument("--dry-run", action="store_true",
@@ -609,7 +609,7 @@ def run() -> int:
             print(f"[PHONE_SUITE] result={row['status']}"
                   f" prompt={case['name']} error={row['error'][:300]}",
                   file=sys.stderr, flush=True)
-        if stopped or (args.fail_fast and row["status"] != "PASS"):
+        if stopped or (not args.continue_on_error and row["status"] != "PASS"):
             break
 
     failures = sum(row["status"] != "PASS" for row in rows)
