@@ -580,9 +580,8 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
         return false;
     }
 
-    // Legacy Graph registration needs patch 4; synchronous Phone-owned
-    // RUN needs patch 5; autonomous Phone PUSH/P2C with arbitrary
-    // Jupiter Sequence DP chunks requires patch 7.
+    // Legacy Graph registration needs patch 4; all Phone-owned native
+    // PREPARE commands now use an extended schedule-aware ABI (patch 7).
     // Keep older non-native Jupiter modes backwards-compatible.
     const bool native_phone_owned =
         std::getenv("LLAMA_JUPITER_PHONE_OWNED_NATIVE") != nullptr &&
@@ -590,8 +589,8 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
     const bool autonomous_phone_owned =
         std::getenv("LLAMA_JUPITER_PHONE_OWNED_AUTONOMOUS") != nullptr &&
         std::atoi(std::getenv("LLAMA_JUPITER_PHONE_OWNED_AUTONOMOUS")) != 0;
-    const uint8_t required_patch = autonomous_phone_owned ? 7 :
-        native_phone_owned ? 5 : jupiter_graph_prebuild_enabled() ? 4 : 0;
+    const uint8_t required_patch = (autonomous_phone_owned || native_phone_owned)
+        ? 7 : jupiter_graph_prebuild_enabled() ? 4 : 0;
     if (required_patch != 0 &&
         (response.major != RPC_PROTO_MAJOR_VERSION ||
          response.minor != RPC_PROTO_MINOR_VERSION ||
