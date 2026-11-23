@@ -5,10 +5,10 @@ import sys
 import unittest
 from pathlib import Path
 from dataclasses import replace
-from jupiter_memory_partition import GGUFWeights
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from jupiter_memory_partition import GGUFWeights
 import phone_owned_models as m
 
 
