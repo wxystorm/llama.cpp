@@ -2138,7 +2138,14 @@ bool run_chunk(const char * endpoint, uint64_t run_id,
     };
     std::memcpy(req.data(), &header, sizeof(header));
     std::memcpy(req.data() + sizeof(header), input, data_bytes);
-    auto sock = get_socket(endpoint);
+    // Keep asynchronous Phone-owned RUN traffic off llama.cpp's control
+    // socket: PC may issue model/scheduler RPC commands while this worker
+    // computes a previous Chunk. Sharing the socket would interleave
+    // request/response frames across threads.
+    const char * async_env = std::getenv("LLAMA_JUPITER_PHONE_OWNED_ASYNC");
+    const bool async = async_env && std::strcmp(async_env, "1") == 0;
+    auto sock = async ? get_socket_lane(endpoint, "phone-owned-async") :
+                        get_socket(endpoint);
     if (!sock || !send_rpc_cmd(sock, RPC_CMD_PHONE_OWNED_RUN,
                                req.data(), req.size())) {
         return false;
