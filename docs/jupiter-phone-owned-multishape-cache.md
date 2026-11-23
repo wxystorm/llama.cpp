@@ -133,11 +133,12 @@ cmake --build build-phone-owned --config Release `
 ctest --test-dir build-phone-owned -C Release --output-on-failure `
   -R "test-phone-owned-execution-plan"
 
-# Optional: compare raw token count with the real chat-formatted count.
+# Optional: count the same trimmed text passed to llama-cli.
+$promptText = [System.IO.File]::ReadAllText(
+  "E:\llama\datasets\sharegpt\sharegpt40\prompt_128_01.txt").TrimEnd("`r", "`n")
 & ".\build-phone-owned\bin\Release\llama-tokenize.exe" `
   -m "E:\llama\models\Qwen3-14B-Q4_K_M.gguf" `
-  -f "E:\llama\datasets\sharegpt\sharegpt40\prompt_128_01.txt" `
-  --chat-user --show-count --log-disable
+  -p $promptText --chat-user --show-count --log-disable
 
 python .\tools\jupiter\run_phone_owned_multi_prompt.py `
   --exe ".\build-phone-owned\bin\Release\llama-cli.exe" `
