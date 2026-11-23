@@ -36,7 +36,7 @@ def parse_args() -> argparse.Namespace:
                    help="replay first prompt after all supplied prompts (A-B-A)")
     p.add_argument("--require-revisit-hit", action="store_true",
                    help="fail if the replayed first shape was evicted")
-    p.add_argument("--sessions", type=int, choices=(1, 4), default=4)
+    p.add_argument("--sessions", type=int, choices=(1, 2, 3, 4), default=4)
     p.add_argument("--pc-layers", type=int, default=32)
     p.add_argument("--cpu-layers", type=int, default=16)
     p.add_argument("--context", type=int, default=512)
