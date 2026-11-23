@@ -2351,6 +2351,11 @@ public:
     bool jupiter_sync(rpc_msg_jupiter_rsp & response);
     bool phone_owned_prepare(const rpc_msg_phone_owned_prepare_req & req, rpc_msg_phone_owned_prepare_rsp & rsp);
     bool phone_owned_run(const std::vector<uint8_t> & request, std::vector<uint8_t> & response);
+    bool phone_owned_auto_start(const rpc_msg_phone_owned_auto_start_req & req);
+    bool phone_owned_auto_push(std::vector<uint8_t> request);
+    bool phone_owned_auto_p2c_wait(const rpc_msg_phone_owned_auto_p2c_wait_req & req,
+                                    std::vector<uint8_t> & response);
+    void phone_owned_auto_stop(uint64_t run_id);
     bool phone_owned_reset(const rpc_msg_phone_owned_reset_req & req);
     struct stored_graph {
         std::vector<uint8_t>   buffer;
@@ -2413,6 +2418,18 @@ private:
     // Exactly one chain may be active at a time.
     std::vector<phone_owned_chain> phone_owned_standby;
 
+    struct phone_owned_auto_state {
+        uint64_t run_id = 0;
+        uint64_t p2c_run_id = 0;
+        uint32_t region = 0;
+        uint32_t n_embd = 0;
+        uint32_t total_tokens = 0;
+        uint32_t chunk_tokens = 0;
+        uint32_t layer_count = 0;
+        std::shared_ptr<ggml_phone_autonomous::prefill_queue> queue;
+    };
+    std::mutex phone_owned_auto_mutex;
+    std::shared_ptr<phone_owned_auto_state> phone_owned_auto_active;
 
     std::mutex jupiter_event_mutex;
     std::condition_variable jupiter_event_cv;
