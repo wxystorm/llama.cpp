@@ -37,7 +37,8 @@ FIELDNAMES = (
     "sync_ms", "autonomous_ms", "sync_tok_s", "autonomous_tok_s",
     "speedup", "sync_cache_hit", "autonomous_cache_hit",
     "warm_comparable", "top1_same", "max_abs", "relative_rmse",
-    "cosine", "revisit_parity", "error", "case_dir",
+    "cosine", "revisit_parity", "revisit_first_cache_hit",
+    "warmup_cache_hit", "error", "case_dir",
 )
 
 
@@ -386,10 +387,14 @@ def perform_case(args: argparse.Namespace, case: dict,
     if args.mode_order == "autonomous-first" or \
             (args.mode_order == "alternate" and position % 2):
         order.reverse()
+    warmup_info = None
     if not args.no_warmup:
         warm = run_mode(args, case, "sync", attempt / "warmup")
-        # Warmup is not a measurement and does not need a duplicate
-        # 151936-element F32 logits dump on disk.
+        # For A-B-A, this warmup is the FIRST revisit of shape A after B:
+        # preserve its cache status before the paired measured runs refill it.
+        warmup_info = {"cache_hit": warm["cache_hit"],
+                       "prepare": warm["prepare"], "log": warm["log"]}
+        # Warmup is not a measurement and need not keep another F32 dump.
         Path(warm["logits"]).unlink(missing_ok=True)
     runs = {}
     for mode in order:
@@ -403,6 +408,11 @@ def perform_case(args: argparse.Namespace, case: dict,
     comparable = runs["sync"]["cache_hit"] and runs["autonomous"]["cache_hit"]
     row = dict(case, status="PASS",
                first_mode=order[0], runs=runs, parity=parity,
+               warmup=warmup_info,
+               revisit_first_cache_hit=(
+                   warmup_info["cache_hit"] if warmup_info is not None
+                   else runs[order[0]]["cache_hit"]
+               ) if case["kind"] == "revisit" else None,
                warm_comparable=comparable,
                sync_ms=runs["sync"]["ms"],
                autonomous_ms=runs["autonomous"]["ms"],
@@ -436,6 +446,9 @@ def csv_row(row: dict) -> dict:
         "relative_rmse": parity.get("relative_rmse"),
         "cosine": parity.get("cosine"),
         "revisit_parity": row.get("revisit_parity"),
+        "revisit_first_cache_hit": row.get("revisit_first_cache_hit"),
+        "warmup_cache_hit": (
+            row["warmup"]["cache_hit"] if row.get("warmup") else None),
         "error": row.get("error", ""),
         "case_dir": row.get("case_dir", ""),
     }
