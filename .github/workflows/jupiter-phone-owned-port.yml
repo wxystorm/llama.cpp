@@ -6,6 +6,7 @@ on:
       - feat/jupiter-phone-owned-graphless-20261122
       - feat/jupiter-phone-owned-multishape-20261123
       - feat/jupiter-phone-owned-main-align-20261123
+      - feat/jupiter-phone-autonomous-prefill-20261123
   workflow_dispatch:
 
 jobs:
