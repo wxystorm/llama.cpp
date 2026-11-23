@@ -51,9 +51,9 @@ class ModelLayout:
 def inspect_model(path: Path, family: str = "auto") -> ModelLayout:
     """Verify dense Qwen3 GGUF dimensions before any Phone experiment."""
     model = read_gguf_weights(Path(path))
-    if model.arch != "qwen3":
+    if model.architecture != "qwen3":
         raise ValueError(
-            f"Phone-native supports dense Qwen3, got GGUF arch={model.arch!r}")
+            f"Phone-native supports dense Qwen3, got GGUF arch={model.architecture!r}")
     layers = model.n_layers
     names = {40: "14b", 64: "32b"}
     if layers not in names:
