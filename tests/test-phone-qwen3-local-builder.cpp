@@ -119,6 +119,39 @@ int main() {
         const size_t future = (size_t) 1 * p.n_kv + (chunk * 128 + 2);
         CHECK(side.causal_mask_f16[future] == 0xfc00);
     }
+    // The Jupiter Sequence DP may choose 60,60,110,128 instead of
+    // uniform chunks. Graph input dimensions, RoPE positions, and the
+    // causal KV mask must follow exact prefix sums, not chunk*width.
+    auto dp = p;
+    dp.total_tokens = 358;
+    dp.chunk_tokens = 128;
+    dp.schedule_count = 4;
+    dp.schedule = {60, 60, 110, 128};
+    CHECK(ggml_phone_owned::validate(dp, reason));
+    ggml_init_params dp_params = {
+        ggml_tensor_overhead() * 1024 +
+        ggml_graph_overhead_custom(512, false) + 4096,
+        nullptr, true
+    };
+    ggml_context * dp_ctx = ggml_init(dp_params);
+    CHECK(dp_ctx != nullptr);
+    const auto dp_weights = weights(dp_ctx);
+    const uint32_t dp_starts[] = {0, 60, 120, 230};
+    for (uint32_t i = 0; i < dp.schedule_count; ++i) {
+        ggml_phone_qwen3::graph_result dp_graph {};
+        CHECK(ggml_phone_qwen3::build_graph(
+            dp_ctx, dp, i, dp_weights, dp_graph, reason));
+        CHECK(dp_graph.token_begin == dp_starts[i]);
+        CHECK(dp_graph.tokens == dp.schedule[i]);
+        ggml_phone_qwen3::side_inputs dp_side {};
+        CHECK(ggml_phone_qwen3::make_side_inputs(dp, i, dp_side, reason));
+        CHECK(dp_side.positions.front() == int32_t(dp_starts[i]));
+        CHECK(dp_side.positions.back() ==
+              int32_t(dp_starts[i] + dp.schedule[i] - 1));
+        CHECK(dp_side.causal_mask_f16.size() ==
+              size_t(dp.n_kv) * dp.schedule[i]);
+    }
+    ggml_free(dp_ctx);
     // Tail graph has a distinct token dimension, but shares one KV span.
     auto tail = p;
     tail.total_tokens = 500;
