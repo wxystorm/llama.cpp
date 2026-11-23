@@ -110,6 +110,13 @@ def run() -> int:
         print(f"[PHONE_MULTI_PROMPT] prompt={path.name} "
               f"tokens={token_counts[path]} chunks={chunks}", flush=True)
 
+    shapes = {(token_counts[path], tuple(chunks_for(
+        token_counts[path], args.chunk_size))) for path in prompts}
+    if args.require_revisit_hit and len(shapes) < 2:
+        raise ValueError(
+            "all Prompt files have the same Token/Chunk shape; choose "
+            "different Token counts to test multi-shape caching"
+        )
     sequence = [*prompts, prompts[0]] if args.revisit_first else prompts
     reference: dict[Path, array.array] = {}
     records: list[dict] = []
