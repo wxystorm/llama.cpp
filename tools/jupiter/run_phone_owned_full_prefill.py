@@ -146,6 +146,33 @@ def main() -> int:
         if proc.returncode:
             tail = "\n".join(log.splitlines()[-55:])
             raise RuntimeError(f"{mode} exited {proc.returncode}:\n{tail}")
+        # The llama-server initialization normally probes seq_rm by doing a
+        # synthetic two-token decode. In one-shot Phone-owned mode that would
+        # consume the private HTP KV/run before the real 175-token Prompt.
+        # Require the new memory-only probe bypass and exact request boundary.
+        if native:
+            probe_marker = (
+                "[JUPITER_PHONE_OWNED_PREFILL] phase=SEQ_RM_PROBE"
+            )
+            if probe_marker not in log or "synthetic_decode=SKIPPED" not in log:
+                raise RuntimeError(
+                    "native: mandatory memory-only seq_rm probe bypass "
+                    "missing; rebuild llama-cli from the updated branch. "
+                    f"See {log_path}"
+                )
+            prepared_tokens = [
+                int(x) for x in re.findall(
+                    r"\\[JUPITER_PHONE_OWNED_PREFILL\\] phase=PREPARE_BEGIN"
+                    r"[^\\n]*?\\btokens=(\\d+)", log
+                )
+            ]
+            if prepared_tokens != [args.target_tokens]:
+                raise RuntimeError(
+                    f"native: expected one real Prompt PREPARE_BEGIN with "
+                    f"{args.target_tokens} tokens, got {prepared_tokens}; "
+                    "the internal compatibility probe or a prior request "
+                    f"may have consumed the Phone-owned run. See {log_path}"
+                )
         plan_matches = list(PLAN_RE.finditer(log))
         if not plan_matches:
             # The CLI server wrapper may exit with status 0 after an internal
