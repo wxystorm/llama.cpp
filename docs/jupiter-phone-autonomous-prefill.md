@@ -131,3 +131,16 @@ These tests have been added or described but **cannot be claimed PASS
 until executed on the user's Windows PC and Snapdragon Phone**.
 
 No Prefill-to-Decode KV handoff is implemented or required.
+
+## Full ShareGPT Prompt suite
+
+For a complete one-command run instead of repeating the single-Prompt A/B
+by hand, use `tools/jupiter/run_phone_owned_full_suite.ps1`
+(Windows) or `tools/jupiter/run_phone_owned_full_suite.py`.
+It auto-tokenizes every Prompt with Qwen3's Chat Template, adapts Chunk and
+Context, runs warm comparable native Sync-vs-Phone-autonomous pairs, records
+full-logits parity, checkpoints each case, optionally replays A-B-A, and
+generates per-group CSV statistics.
+
+See [Jupiter Phone-autonomous full suite](jupiter-phone-autonomous-full-suite.md)
+for commands, output schema and resume rules. No Decode is involved.
