@@ -216,9 +216,11 @@ struct jupiter_phone_owned_native_state {
                 output.size(), &stats);
             const bool valid = ok && stats.layers == phone_layers &&
                 stats.tokens == job.tokens;
+            bool ordered = false;
             {
                 std::lock_guard<std::mutex> lock(async_mutex);
-                if (!valid || job.chunk != async_completed) {
+                ordered = job.chunk == async_completed;
+                if (!valid || !ordered) {
                     async_error = "PHONE_NATIVE_ASYNC_RPC_OR_FIFO_FAILURE";
                     async_jobs.clear();
                     async_stop = true;
@@ -232,7 +234,7 @@ struct jupiter_phone_owned_native_state {
                 }
             }
             async_cv.notify_all();
-            if (!valid) { return; }
+            if (!valid || !ordered) { return; }
             LLAMA_LOG_INFO(
                 "[JUPITER_PHONE_OWNED_PREFILL] phase=CHUNK_DONE"
                 " mode=ASYNC run=%" PRIu64 " chunk=%u tokens=%u"
