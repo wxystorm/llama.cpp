@@ -1568,6 +1568,76 @@ public:
         return records;
     }
 
+    // Re-arm a completely prepared native Graph for a new logical request.
+    // The old run ID remains the *physical* executor key so compiled Hexagon
+    // opnodes and their tensor addresses do not need to be rebuilt/rekeyed.
+    // rpc_server maps the new transport ID to this private key, and rejects
+    // old transport IDs after RESET. The owning RPC mutex serializes this
+    // operation with RUN and RESET on all involved Sessions.
+    //
+    // Important: clearing KV is compulsory even when the previous request
+    // did not reach its final Chunk (failed or interrupted run).
+    bool rearm_native_prefill_graphs(
+            uint64_t physical_run_id, uint32_t region,
+            const ggml_phone_owned::region_plan & requested,
+            std::string & reason, size_t & cleared_kv_bytes) {
+        reason.clear();
+        cleared_kv_bytes = 0;
+        const auto key = std::make_pair(physical_run_id, region);
+        const auto it = owned_kv_.find(key);
+        if (backend_ == nullptr || it == owned_kv_.end() ||
+                !it->second || !it->second->buffer ||
+                !ggml_phone_owned::same_execution_template(
+                    it->second->plan, requested)) {
+            reason = "PHONE_OWNED_RESIDENT_TEMPLATE_MISS";
+            return false;
+        }
+        auto & state = *it->second;
+        if (state.plan.region != region ||
+                !state.k || !state.v ||
+                state.k->buffer != state.buffer.get() ||
+                state.v->buffer != state.buffer.get()) {
+            reason = "PHONE_OWNED_RESIDENT_KV_STORAGE_INVALID";
+            return false;
+        }
+        for (uint32_t chunk = 0;
+                chunk < ggml_phone_owned::chunk_count(requested); ++chunk) {
+            const auto graph_it = owned_graphs_.find(
+                std::make_tuple(physical_run_id, region, chunk));
+            if (graph_it == owned_graphs_.end() || !graph_it->second) {
+                reason = "PHONE_OWNED_RESIDENT_GRAPH_MISSING";
+                return false;
+            }
+            const auto & graph = graph_it->second->built;
+            const uint32_t expected_begin = chunk * requested.chunk_tokens;
+            const uint32_t expected_tokens = std::min(
+                requested.chunk_tokens,
+                requested.total_tokens - expected_begin);
+            if (!graph.graph || !graph.input || !graph.output ||
+                    graph.cache_k != state.k || graph.cache_v != state.v ||
+                    graph.token_begin != expected_begin ||
+                    graph.tokens != expected_tokens ||
+                    !graph.input->buffer || !graph.output->buffer) {
+                reason = "PHONE_OWNED_RESIDENT_GRAPH_LAYOUT_CHANGED";
+                return false;
+            }
+        }
+        // The buffer contains only this Layer's F16 K/V. Do not reset or
+        // move Graph/Scratch/weights: fixed-UID HTP nodes retain addresses.
+        ggml_backend_synchronize(backend_);
+        ggml_backend_buffer_clear(state.buffer.get(), 0);
+        ggml_backend_synchronize(backend_);
+        cleared_kv_bytes = ggml_backend_buffer_get_size(state.buffer.get());
+        state.next_chunk = 0;
+        GGML_LOG_INFO(
+            "[PHONE_OWNED_RESIDENCY] event=KV_RESET layer=%u"
+            " physical_run=%" PRIu64 " requested_run=%" PRIu64
+            " region=%u kv_bytes=%zu status=PASS\n",
+            state.plan.layer, physical_run_id, requested.run_id,
+            region, cleared_kv_bytes);
+        return true;
+    }
+
     // Called after an input RUN has fully ended while HTP is serialized.
     // Shadow graphs never contribute to decode KV, so release their scratch
     // and KV immediately instead of reserving Phone HTP RAM until next RUN.
