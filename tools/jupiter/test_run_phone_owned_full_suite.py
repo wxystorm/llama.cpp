@@ -32,13 +32,10 @@ class TestPlanning(unittest.TestCase):
             suite.choose_chunks(4097)
 
     def test_context(self):
-        self.assertEqual(suite.choose_context(66), 512)
-        self.assertEqual(suite.choose_context(175), 512)
-        self.assertEqual(suite.choose_context(700), 768)
-        self.assertEqual(suite.choose_context(1855), 2048)
-        self.assertEqual(suite.choose_context(4096), 4096)
+        for tokens in (66, 175, 700, 1855, 2048):
+            self.assertEqual(suite.choose_context(tokens), 2048)
         with self.assertRaises(ValueError):
-            suite.choose_context(4097)
+            suite.choose_context(2049)
 
     def test_prompt_sorting_and_group(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -84,6 +81,63 @@ class TestPlanning(unittest.TestCase):
         self.assertEqual(grouped[0]["sync_mean_ms"], 150.0)
 
 
+class TestOriginalJupiterDP(unittest.TestCase):
+    def test_irregular_measured_dp_plan_is_used_without_repartition(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            case = {
+                "layout": 32, "name": "prompt_256_01.txt",
+                "path": str(folder / "prompt_256_01.txt"),
+                "tokens": 358, "context": 2048,
+                "group": "256", "chunks": [], "kind": "normal",
+            }
+            target = (folder / "calibration" / "l32" / "plans"
+                      / "prompt_256_01")
+            (target / "stage3").mkdir(parents=True)
+            (target / "final.plan").write_text(
+                "model.pc_layers=32\nmodel.cpu_layers=16\n"
+                "sequence.358=60,60,110,128\n",
+                encoding="utf-8",
+            )
+            (target / "stage3" / "sequence-summary.json").write_text(
+                json.dumps({
+                    "status": "FULLY_MEASURED_AND_VERIFIED",
+                    "pc_layers": 32, "cpu_layers": 16,
+                    "prompt_tokens": 358, "min_chunk": 32,
+                    "chunks": [60, 60, 110, 128],
+                }),
+                encoding="utf-8",
+            )
+            args = argparse.Namespace(cpu_layers=16, max_chunk=128)
+            original = suite.exact_jupiter_dp_plan(
+                args, case, folder, folder / "stage2.json")
+            self.assertEqual(original["chunks"], [60, 60, 110, 128])
+            self.assertEqual(original["context"], 2048)
+            self.assertEqual(original["plan_source"],
+                             "JUPITER_STAGE2_B_QXY_EXACT_DP")
+            self.assertEqual(case["chunks"], [])
+            args.cpu_layers = 0
+            with self.assertRaises(ValueError):
+                suite.exact_jupiter_dp_plan(
+                    args, case, folder, folder / "stage2.json")
+
+    def test_stage2_boundary_is_verified(self):
+        with tempfile.TemporaryDirectory() as temp:
+            file = Path(temp) / "min-chunk.json"
+            file.write_text(json.dumps({
+                "pc_layers": 32, "cpu_layers": 16,
+                "max_chunk": 128,
+                "candidates": [{"samples": 2, "chunk_tokens": 32}],
+            }), encoding="utf-8")
+            args = argparse.Namespace(
+                min_chunk_json=str(file), cpu_layers=16, max_chunk=128)
+            self.assertEqual(
+                suite.stage2_for_layout(args, [], 32, Path(temp)), file)
+            args.cpu_layers = 0
+            with self.assertRaises(ValueError):
+                suite.stage2_for_layout(args, [], 32, Path(temp))
+
+
 class TestResume(unittest.TestCase):
     def test_full_dry_preflight_fake_runs_and_resume(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -106,7 +160,10 @@ class TestResume(unittest.TestCase):
                 rpc="127.0.0.1:10140", prompts_dir=str(prompts),
                 pattern="prompt_*_*.txt", out_dir=str(out),
                 layouts="32", cpu_layers=16, sessions=4, chunk_size=88,
-                context_floor=512, context_cap=4096, repeats=1,
+                sequence_policy="fixed-control", min_chunk_json=None,
+                stage2_repeats=2, q_repeats=2,
+                refine_repeats=2, max_rounds=6, max_chunk=128,
+                repeats=1,
                 expected_count=3, mode_order="alternate",
                 no_warmup=False, revisit_first=True,
                 resume=False, continue_on_error=False,
