@@ -2431,8 +2431,7 @@ private:
         uint64_t p2c_run_id = 0;
         uint32_t region = 0;
         uint32_t n_embd = 0;
-        uint32_t total_tokens = 0;
-        uint32_t chunk_tokens = 0;
+        ggml_phone_owned::region_plan plan {};
         uint32_t layer_count = 0;
         std::shared_ptr<ggml_phone_autonomous::prefill_queue> queue;
     };
@@ -3473,8 +3472,7 @@ bool rpc_server::phone_owned_run(
             req.chunk >= ggml_phone_owned::chunk_count(plan)) {
         return false;
     }
-    const uint32_t tokens = std::min<uint32_t>(
-        plan.chunk_tokens, plan.total_tokens - req.chunk * plan.chunk_tokens);
+    const uint32_t tokens = ggml_phone_owned::chunk_size(plan, req.chunk);
     if (uint64_t(tokens) * plan.n_embd != req.input_floats) {
         return false;
     }
@@ -3555,12 +3553,10 @@ bool rpc_server::phone_owned_auto_start(
         state->p2c_run_id = req.p2c_run_id;
         state->region = req.region;
         state->n_embd = plan.n_embd;
-        state->total_tokens = plan.total_tokens;
-        state->chunk_tokens = plan.chunk_tokens;
+        state->plan = plan;
         state->layer_count = uint32_t(ggml_phone_owned::layer_count(plan));
     }
-    const uint32_t n_chunks = (state->total_tokens +
-                              state->chunk_tokens - 1) / state->chunk_tokens;
+    const uint32_t n_chunks = ggml_phone_owned::chunk_count(state->plan);
     try {
         // Input PUSH, not a PC worker calling RUN, triggers the Phone worker.
         // Reuse exactly the proven local HTP Graph, KV FIFO and error path.
@@ -3603,14 +3599,12 @@ bool rpc_server::phone_owned_auto_push(std::vector<uint8_t> payload) {
             req.input_floats >
                 ggml_phone_owned::k_max_activation_bytes / sizeof(float) ||
             payload.size() != sizeof(req) + size_t(req.input_floats)*sizeof(float) ||
-            req.chunk >= (active->total_tokens + active->chunk_tokens - 1) /
-                          active->chunk_tokens) {
+            req.chunk >= ggml_phone_owned::chunk_count(active->plan)) {
         GGML_LOG_ERROR("[PHONE_AUTO] PUSH_REJECT reason=RUN_OR_SHAPE\n");
         return false;
     }
-    const uint32_t tokens = std::min<uint32_t>(
-        active->chunk_tokens,
-        active->total_tokens - req.chunk*active->chunk_tokens);
+    const uint32_t tokens =
+        ggml_phone_owned::chunk_size(active->plan, req.chunk);
     if (uint64_t(req.input_floats) !=
             uint64_t(tokens)*active->n_embd) {
         GGML_LOG_ERROR("[PHONE_AUTO] PUSH_REJECT reason=TOKEN_SIZE\n");
@@ -3668,9 +3662,8 @@ bool rpc_server::phone_owned_auto_p2c_wait(
     }
     rpc_msg_phone_owned_run_rsp rsp {};
     std::memcpy(&rsp, response.data(), sizeof(rsp));
-    const uint32_t final_tokens =
-        active->total_tokens % active->chunk_tokens ?
-        active->total_tokens % active->chunk_tokens : active->chunk_tokens;
+    const uint32_t final_tokens = ggml_phone_owned::chunk_size(
+        active->plan, ggml_phone_owned::chunk_count(active->plan) - 1);
     if (!rsp.ok || rsp.tokens != final_tokens ||
             rsp.layers != active->layer_count ||
             rsp.output_floats != uint64_t(final_tokens)*active->n_embd ||
