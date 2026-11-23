@@ -409,7 +409,8 @@ public:
             const ggml_phone_owned::region_plan & plan,
             std::string & reason,
             local_htp_prepare_stats & stats,
-            std::unique_lock<std::mutex> * session_guard = nullptr) {
+            std::unique_lock<std::mutex> * session_guard = nullptr,
+            bool native_phone_owned = false) {
         stats = {};
         const char * why = "NONE";
         if (!ggml_phone_owned::validate(plan, why)) {
@@ -518,15 +519,17 @@ public:
         // Region is executing on the same Session. Weights and KV stay in
         // their own immutable/per-layer allocations.
         //
-        // Graphless enables reuse by default; set
-        // GGML_RPC_PHONE_QWEN3_SHARED_SCRATCH=0 for an exact legacy A/B.
+        // Both Region Ring graphless and native Jupiter Phone-owned Graphs
+        // can reuse one stable scratch allocation per Region across Chunks.
+        // GGML_RPC_PHONE_QWEN3_SHARED_SCRATCH=0 opts out for A/B.
         const char * graphless_env =
             std::getenv("GGML_RPC_PHONE_QWEN3_LOCAL_GRAPHLESS");
         const char * reuse_env =
             std::getenv("GGML_RPC_PHONE_QWEN3_SHARED_SCRATCH");
+        const bool graphless = graphless_env != nullptr &&
+            std::strcmp(graphless_env, "1") == 0;
         const bool reuse_scratch =
-            graphless_env != nullptr &&
-            std::strcmp(graphless_env, "1") == 0 &&
+            (graphless || native_phone_owned) &&
             !(reuse_env != nullptr && std::strcmp(reuse_env, "0") == 0);
         // A fixed Hexagon node cache retains tensor addresses. Never resize
         // an arena after its first graph has been compiled.
