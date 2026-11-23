@@ -132,6 +132,18 @@ For a performance conclusion, prewarm both variants and rerun in
 reversed or alternating sync/async order with matching Graph cache
 states. Only compare repeated, comparable warm runs.
 
+The A/B runner now accepts `--reverse-order` and embeds `prepare`,
+`overlap_timeline` and `performance_interpretation` in the output report.
+Use `--reverse-order --out-dir .\\jupiter-phone-async-ab-reversed` to run
+Async first and Sync second on the **same live Phone RPC server**.
+`status=PASS` means Logits parity, not proof of speedup. Read
+`performance_interpretation` before interpreting the time ratio.
+
+On the Phone, inspect `PREPARE_CACHE status=HIT/MISS/INVALID`,
+`CACHE_EVICT reason=...`, and `RESET ... graph_cache=RESIDENT/RELEASED`
+in the persistent RPC server output; this explains why the first run may
+recompile while the second reuses fixed HTP Graphs.
+
 ## Remaining integration to match the reference Runtime
 
 The Region Ring reference uses `RPC_CMD_PHONE_INPUT_STREAM_RUN`,
