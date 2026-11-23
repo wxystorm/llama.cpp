@@ -42,9 +42,11 @@ def parse_args() -> argparse.Namespace:
 
 def count_model_tokens(
         tokenizer: Path, model: Path, prompt: str) -> int:
-    # Read from stdin to avoid Windows' command-line length limit. Tokenize
-    # the exact rstrip'ed prompt passed to llama-cli with -p, preserving
-    # normal BOS, special-token and escape settings in both programs.
+    # The CLI sends one user message to /v1/chat/completions; its Server
+    # expands the model's Jinja Chat Template before tokenization. Count
+    # THAT exact formatted Prompt, not raw .txt tokens (Qwen3-14B may add
+    # eight special/message-boundary tokens).
+    # Read stdin to avoid the Windows command-line length limit.
     env = os.environ.copy()
     env["LLAMA_JUPITER_PREFILL"] = "0"
     env["LLAMA_JUPITER_PHONE_OWNED_NATIVE"] = "0"
@@ -52,7 +54,7 @@ def count_model_tokens(
     env.pop("LLAMA_JUPITER_PLAN_FILE", None)
     result = subprocess.run(
         [str(tokenizer), "-m", str(model), "--stdin",
-         "--show-count", "--log-disable"],
+         "--chat-user", "--show-count", "--log-disable"],
         input=prompt, capture_output=True, text=True, encoding="utf-8",
         errors="replace", env=env, check=False,
     )
