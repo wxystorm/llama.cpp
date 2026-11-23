@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 
 from run_phone_owned_full_prefill import read_logits, logits_comparison
+from phone_owned_models import inspect_model, resolve_splits
 
 
 PREPARE = re.compile(
@@ -31,11 +32,14 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--exe", required=True)
     p.add_argument("--model", required=True)
+    p.add_argument("--model-size", choices=("auto", "14b", "32b"), default="auto")
     p.add_argument("--rpc", required=True)
     p.add_argument("--prompt-file", required=True)
     p.add_argument("--sessions", type=int, choices=(1, 2, 3, 4), default=4)
-    p.add_argument("--pc-layers", type=int, default=32)
-    p.add_argument("--cpu-layers", type=int, default=16)
+    p.add_argument("--pc-layers", type=int, default=None)
+    p.add_argument("--cpu-layers", type=int, default=None)
+    p.add_argument("--cuda-layers", type=int, default=None)
+    p.add_argument("--phone-layers", type=int, default=None)
     p.add_argument("--context", type=int, default=512)
     p.add_argument("--target-tokens", type=int, default=175)
     p.add_argument("--chunks", default="88,87")
@@ -46,6 +50,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    spec = inspect_model(Path(args.model), args.model_size)
+    positions, cpu = resolve_splits(
+        spec, layouts=str(args.pc_layers) if args.pc_layers is not None else None,
+        cpu_layers=args.cpu_layers, cuda_layers=args.cuda_layers,
+        phone_layers=args.phone_layers)
+    args.pc_layers, args.cpu_layers = positions[0], cpu
+    args.model_size = spec.family
     if args.runs < 2:
         raise ValueError("--runs must be >= 2")
     output = Path(args.out_dir).resolve()
@@ -58,6 +69,7 @@ def main() -> int:
         command = [
             sys.executable, str(runner),
             "--exe", args.exe, "--model", args.model,
+            "--model-size", args.model_size,
             "--rpc", args.rpc, "--prompt-file", args.prompt_file,
             "--sessions", str(args.sessions),
             "--pc-layers", str(args.pc_layers),
