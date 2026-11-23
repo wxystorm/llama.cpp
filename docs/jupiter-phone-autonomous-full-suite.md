@@ -1,184 +1,189 @@
-# One-command full Prompt evaluation: Jupiter Phone-owned autonomous Prefill
+# Jupiter original-design full Prompt suite: Context=2048, measured q(x,y) DP
 
-Branch: `feat/jupiter-phone-autonomous-prefill-20261123`.
-Scope: Qwen3-14B only, fresh single-sequence **Prefill**, no Decode.
+Branch: `feat/jupiter-phone-autonomous-prefill-20261123`
+Workload: Qwen3-14B ShareGPT50, one-shot Prefill (`n_predict=1`), NO Decode.
+The **same fixed Context=2048 and Batch=2048** are used for every Prompt.
 
-This is the formal all-Prompt extension of the already tested single-Prompt
-`run_phone_owned_autonomous_ab.py`. It calls the same
-`run_phone_owned_full_prefill.py` native runner per case, so
-both Sync and Phone-autonomous modes use the same original PC CPU/CUDA prefix,
-Phone local GGUF/HTP Graphs, private KV and PC output head.
+This is the native Phone Graph migration of the *original Jupiter* planning
+path, not a new fixed-88 heuristic. It preserves the original Stage2 minimum
+efficient Chunk calibration, q(x,y) per-Prompt measurement, Sequence DP,
+targeted q refinement, verification and Prefill benchmarking. Phone-side
+Graph compilation and autonomous execution are different implementation
+mechanisms, not a replacement for Jupiter's planner or layer assignment.
 
-## Windows: one command for all 50 ShareGPT Prompts
+## One command on Windows
 
-Keep the already-tested Phone RPC server running on the same branch.
-The only new source in this commit is Python and PowerShell: rebuild the
-PC only if `llama-tokenize.exe` is absent.
+Update both the PC executable and Android Phone RPC server to **RPC 4.0.7**
+from the same branch; old patch-6 binaries are wire-incompatible with the
+extended nonuniform Sequence DP plan. Restart Phone server after deployment.
+The original Native Sync and Phone Auto modes share this new Plan ABI.
 
 ```powershell
 cd E:\llama\llama-jupiter
+git fetch origin
+git switch feat/jupiter-phone-autonomous-prefill-20261123
 git pull --ff-only
 
-# Only when the tokenizer binary is missing:
-cmake --build build-phone-owned --config Release --target llama-tokenize --parallel 8
+cmake --build build-phone-owned --config Release --parallel 8 --target llama-cli llama-tokenize test-phone-owned-execution-plan test-phone-qwen3-local-builder
 
-# Preflight: count actual Qwen3 chat-template tokens and preview all plans.
+ctest --test-dir build-phone-owned -C Release --output-on-failure -R "test-phone-owned-execution-plan|test-phone-qwen3-local-builder|test-phone-owned-autonomous-queue"
+
+# No inference; discover all Prompt files and exact Qwen3 chat-template tokens.
 .\tools\jupiter\run_phone_owned_full_suite.ps1 -DryRun
 
-# Full 50-Prompt suite (default: L32..39 Phone, S4, 1 A/B pair per Prompt).
+# Stage2 b once per layer layout; Stage3 q(x,y)+DP for EVERY Prompt;
+# then warmed Sync-vs-Phone autonomous full-logits A/B.
 .\tools\jupiter\run_phone_owned_full_suite.ps1
 ```
 
-The PowerShell wrapper defaults to these existing PC paths:
-- `E:\llama\models\Qwen3-14B-Q4_K_M.gguf` (model)
-- `E:\llama\datasets\sharegpt\sharegpt40` (Prompt directory)
-- `10.71.109.52:10140` (Phone RPC endpoint)
-- `build-phone-owned\bin\Release\llama-cli.exe`
-- `build-phone-owned\bin\Release\llama-tokenize.exe`
+Defaults are the already-tested paths:
+- model `E:llamamodelsQwen3-14B-Q4_K_M.gguf`
+- dataset `E:llamadatasetssharegptsharegpt40`
+- Phone RPC `10.71.109.52:10140`
+- PC first Phone layer L32 (Phone L32..39 / eight layers), CPU prefix L0..15,
+  four HTP Sessions; Qwen3's PC Head remains unchanged
+- 50 unique Prompt files are required by `-ExpectedCount 50`
+- warm-up before measured pairs, alternating Sync/Phone-Auto run order
+- per-group distinct shape A→B→A replay, complete F32 Logits parity check
+- 1 measured pair per Prompt; stage2/q/refine calibration repeats are 2/2/2
+- fixed 2048 Context and Batch, with max Chunk=128 and native limit 16
 
-All are overridable with `-Model`, `-PromptsDir`,
-`-Rpc`, `-Exe` and `-Tokenizer`.
-`-ExpectedCount 50` enforces full coverage; if a different
-dataset is intentionally supplied, change this value or set it to 0.
-
-Equivalent direct Python call:
+All parameters except fixed Context can be overridden. To use a preexisting
+*matching* measured Stage2 b profile instead of remeasuring it:
 
 ```powershell
-python .\tools\jupiter\run_phone_owned_full_suite.py `
-  --exe ".\build-phone-owned\bin\Release\llama-cli.exe" `
-  --tokenizer ".\build-phone-owned\bin\Release\llama-tokenize.exe" `
-  --model "E:\llama\models\Qwen3-14B-Q4_K_M.gguf" `
-  --rpc "10.71.109.52:10140" `
-  --prompts-dir "E:\llama\datasets\sharegpt\sharegpt40" `
-  --expected-count 50 --sessions 4 --layouts 32 `
-  --chunk-size 88 --context-floor 512 --context-cap 4096 `
-  --repeats 1 --revisit-first `
-  --out-dir ".\jupiter-autonomous-full50"
+.\tools\jupiter\run_phone_owned_full_suite.ps1 -MinChunkJson ".\jupiter-min-chunk\min-chunk.json"
 ```
 
-## Exact workload / geometry policy
+The Stage2 profile must have the same CPU layers, PC split, max Chunk,
+hardware and workload configuration. One Stage2 JSON applies only to one
+layer layout. Without a supplied JSON, the suite measures Stage2 on a
+representative Prompt near 357 tokens, then reuses the measured hardware
+efficiency curve as in Jupiter's original Stage5. The reuse across Prompt
+lengths is explicitly recorded by Stage3, not presented as remeasurement.
 
-- Discover **every** file matching `prompt_*_*.txt` in the
-  specified directory, sort by numeric length group and within-group index.
-  Example expected groups: `0 / 128 / 256 / 512 / 1024`
-  (10 Prompts per group for the 50-Prompt dataset). A
-  `2048-4000` filename group is also supported.
-- Count Qwen3 **chat-formatted** tokens with matching
-  `llama-tokenize --stdin --chat-user --show-count`. Do not
-  add a fixed chat-template offset or reuse raw text token counts.
-- Choose Context as the smallest multiple of 256 that fits the actual
-  token count, with a configurable minimum of 512 and maximum 4096.
-  A request beyond 4096 is a preflight **error**, never silently skipped.
-- Choose a 2–16 Chunk plan. Prefer 88 tokens (reproducing the validated
-  [88,87] pilot for 175 tokens). For short Prompts, use 2 Chunks; for longer
-  ones, increase Chunk size to keep at most 16 HTP Graph shapes.
-  Every full Chunk has identical width; the last may be shorter.
-- Keep `n_predict=1`. This is a Prefill first-token
-  measurement, not Decode; no unsupported KV handoff.
-- The Phone's HTP KV always belongs to the single active request.
-  **Do not run multiple full-suite processes against the same Phone RPC
-  server at once.**
+## Planning is genuinely Jupiter q(x,y) + DP
 
-## Per-Prompt experiment and cache comparability
+1. Enumerate all `prompt_*_*.txt` files (sorted by numeric
+   group and ordinal). Count **actual Chat Template tokens** using the
+   matching `llama-tokenize --chat-user` tool, rather than
+   assigning a guessed constant offset. Any Prompt exceeding fixed
+   Context=2048 causes an explicit preflight error.
+2. Use original `run_min_chunk_profile.py` to select
+   the minimum efficient Chunk b for the given fixed model/device layout
+   (PC CPU16 + GPU16 + Phone HTP8, S4).
+3. Run original `run_sequence_pipeline.py` separately for
+   each Prompt: initial q(x,y) stage timings, Sequence DP optimization,
+   targeted missing-point q refinement, and application verification
+   under the **original Jupiter RPC compute path**. Calibration samples
+   synchronize devices; they are not formal throughput numbers.
+4. Require `FULLY_MEASURED_AND_VERIFIED` and an exact
+   `sequence.<actual-token-count>` plan. Do NOT accept
+   an unmeasured DP guess, normalize a variable plan into fixed chunks, or
+   silently change the total token count.
+5. Transfer the exact ordered Chunk schedule into the Phone-local Graph
+   Plan. Local Qwen3 graph dimensions, RoPE positions, private HTP KV slots,
+   FIFO admission and the last P2C payload are indexed by cumulative
+   prefix lengths, not by `chunk_index * chunk_width`.
+   Different Chunk widths may coexist in the same run. The native path
+   accepts **1–16 Chunks**: a short Jupiter DP result may contain just
+   one Chunk and is still valid Prefill (without inter-Chunk overlap).
+6. Run Sync Native warmup, then measured Sync Native and Phone autonomous
+   for the exact same plan and fixed Context=2048. Only matched
+   **hot-Graph** pairs enter reported geometric-mean performance ratios.
+   Full F32 Logits equality is checked per Prompt.
 
-For each Prompt and chosen layer layout, sequentially:
-1. Run a **Sync Native warmup** to pre-load/rearm that Graph shape.
-   The warmup is excluded from latency summaries.
-2. Run full **Sync Native** and **Phone-autonomous Native** Prefill.
-   Alternating which mode runs first reduces systematic run-order bias.
-3. Compare **all F32 final logits**. PASS requires Top-1 equality,
-   cosine >= 0.999 and relative RMSE <= 0.01. Keep actual error values
-   for inspection; matching one generated token is not enough.
-4. Mark a pair `warm_comparable=true` only when
-   BOTH measured modes have zero model-load/Graph-build/buffer/precompile
-   durations. All complete pairs remain recorded, but **only these
-   comparable warm pairs** enter the speedup geometric mean.
-5. Persist that case atomically before moving to the next Prompt.
-   Failed Phone RPC leaves logs and halts by default (a failed stream
-   can block the Phone's sole active slot); resume later with
-   `-Resume`.
+The 16-Chunk cap is a **migration executor constraint**, not a claimed
+original INFOCOM'25 Jupiter limitation. The Stage3 q(x,y) DP searches with
+`--max-subsequences 16` and the profile's measured
+min/max chunk bounds. If a measured DP cannot fit within 16 or preparation
+exceeds the Phone's actual HTP memory budget, fail with the reason and do
+not manufacture an incompatible baseline.
 
-With default `-RevisitFirst`, the script also runs A -> B -> A
-for two distinct token/Chunk shapes in each group, compares replay logits
-to the initial Prompt for **both** modes, and records whether the *first*
-revisit matched a previously resident template **before** its warmup.
-A Graph cache MISS may be expected if the budget forced safe generation-wide
-eviction; use the Phone `PREPARE_CACHE` and `CACHE_EVICT`
-logs to explain it. Replay rows are excluded from throughput means.
+The original Jupiter **model-partition DP** still exists in
+`jupiter_planner.py`; this full suite uses a specified
+hardware-feasible, previously tested layer boundary L32 for both modes.
+It does not claim to search every original Jupiter model-partition
+alternative, because the Phone-owned native suffix presently supports
+only 1..8 contiguous Transformer layers. This preserves the same
+fixed placement in both A/B modes without misrepresenting its origin.
 
-## Output files and resuming
+## Results and resume
 
 ```text
-jupiter-autonomous-full50/
-  suite-manifest.json          input/config/binary provenance and plans
-  token-cache.json             avoids retokenizing unchanged Prompt files
-  all-results.csv              all cases, errors, modes, Context, Chunk, parity
-  all-results.json             full machine-readable per-case results
-  group-summary.csv            group-level mean, median and warm speedups
-  summary.json                 total PASS/FAIL and warm geometric mean
+jupiter-autonomous-jupiter-dp-2048/
+  suite-manifest.json
+  token-cache.json
+  calibration/
+    l32/
+      stage2/
+        min-chunk.json
+        chunk-samples.csv
+      plans/
+        prompt_128_01/
+          final.plan           # original Jupiter sequence.N
+          stage3/
+            sequence-summary.json
+            q-sweep/...        # measured q(x,y)
+            refinement/...     # exact q calibration
+  all-results.csv
+  all-results.json
+  group-summary.csv
+  summary.json
   cases/
     l32/g128/prompt_128_01/r01/
       case-result.json
       attempt-001/
-        warmup/                warmup log and timing; unused logits removed
-        sync/
-          native-full-prefill.log
-          native-logits.f32
-          results.json
-          runner.stdout.log
-        autonomous/
-          native-full-prefill.log
-          native-logits.f32
-          results.json
-          runner.stdout.log
+        warmup/native-full-prefill.log
+        sync/native-full-prefill.log
+        sync/native-logits.f32
+        autonomous/native-full-prefill.log
+        autonomous/native-logits.f32
 ```
 
-Resume after interruption or correcting the Phone server:
+The CSV has Prompt group, actual tokens, fixed Context, exact
+Jupiter DP cuts, b, plan file/source, Sync/Auto Prefill latency,
+warm cache status, throughput, complete Logits error and A-B-A replay
+validation. The group CSV contains mean/median and **warm-only**
+geometric mean speedup; revisit rows are excluded from throughput means.
+
+After any interrupted calibration or Phone RPC failure:
 
 ```powershell
 .\tools\jupiter\run_phone_owned_full_suite.ps1 -Resume
-Get-Content .\jupiter-autonomous-full50\summary.json
-Import-Csv .\jupiter-autonomous-full50\group-summary.csv | Format-Table
+Get-Content ".\jupiter-autonomous-jupiter-dp-2048\summary.json"
+Import-Csv ".\jupiter-autonomous-jupiter-dp-2048\group-summary.csv" | Format-Table
 ```
 
-Only cases whose checkpoint says PASS and whose **two final logits
-files are still present** are skipped. A failed or incomplete case gets
-a new `attempt-NNN` subfolder; previous failure logs survive.
-Resuming refuses changed Prompt contents, binary fingerprints, code,
-layouts, Chunk/Context policy or mode options. Use a new output directory
-when intentionally changing the experiment.
+Only complete PASS checkpoints with both Logits files are skipped.
+Incomplete/failed A/B attempts retain logs in incrementing attempt folders.
+The input/runner signature is pinned, so changing Context, binary, Prompt
+content, CPU/Phone split, DP settings or q-sweep settings requires a NEW
+output directory. The Phone RPC Server must remain alive; do not run
+two full suites against its sole active Native Graph run simultaneously.
 
-## Full dynamic-layout matrix / repeated measurements
+## Diagnostics / explicit ablation, not the main result
 
-After the baseline full50 suite succeeds, use the same entry point for
-four Phone suffix sizes and 3 repeats per Prompt:
+To test the earlier uniform fixed128 strategy, opt in and name the result
+an ablation. This intentionally **does not perform Jupiter DP**:
 
 ```powershell
-.\tools\jupiter\run_phone_owned_full_suite.ps1 `
-  -Layouts "32,34,36,39" -Repeats 3 `
-  -OutDir ".\jupiter-autonomous-layout-matrix"
+.\tools\jupiter\run_phone_owned_full_suite.ps1 -SequencePolicy fixed-control -ChunkSize 128 -OutDir ".\jupiter-fixed128-control"
 ```
 
-L32/34/36/39 correspond to Phone 8/6/4/1-layer
-suffixes, while the PC CPU prefix remains L0..15. Each case automatically
-gets its own Context based on actual Prompt tokens.
+For repeated/alternative layer tests:
 
-## Local tests / limits
+```powershell
+.\tools\jupiter\run_phone_owned_full_suite.ps1 -Repeats 3 -OutDir ".\jupiter-dp-2048-repeat3"
+.\tools\jupiter\run_phone_owned_full_suite.ps1 -Layouts "32,34,36,39" -OutDir ".\jupiter-dp-2048-layer-matrix"
+```
+
+A model-free unit-test entry point is available:
 
 ```powershell
 python -m unittest discover -s .\tools\jupiter -p test_run_phone_owned_full_suite.py -v
 python -m py_compile .\tools\jupiter\run_phone_owned_full_suite.py
 ```
 
-These are offline tests of planning, resume and summaries; only PC+Phone
-can validate HTP Graph preparation, numerical accuracy and performance.
-
-The Phone RPC server must remain running throughout the suite, with the
-matching previously tested autonomous branch and local GGUF. If a long
-Prompt causes HTP memory infeasibility, the suite records the failure and
-halts by default instead of claiming all Prompts passed. Use the saved
-case logs to adjust a NEW experiment or fix the Runtime, then resume
-with identical measured settings.
-
-There is **no Decode**, no independent multi-tenant Phone scheduling and
-no claim of GPU/HTP kernel-level overlap from host timestamps alone.
+Actual GPU/HTP correctness, memory viability and performance require
+the Windows PC + Snapdragon Phone. No Decode and no KV handoff are involved.
