@@ -167,11 +167,12 @@ def make_cli(args: argparse.Namespace, prompt: str) -> list[str]:
     ]
 
 
-def calibration_env(pc_layers: int) -> dict[str, str]:
+def calibration_env(pc_layers: int, cpu_layers: int = 0) -> dict[str, str]:
     env = os.environ.copy()
     env.update({
         "LLAMA_JUPITER_PREFILL": "1",
         "LLAMA_JUPITER_PC_LAYERS": str(pc_layers),
+        "LLAMA_JUPITER_CPU_LAYERS": str(cpu_layers),
         "LLAMA_JUPITER_WINDOW": "1",
         "LLAMA_JUPITER_TRACE": "1",
         "LLAMA_JUPITER_Q_SWEEP": "1",
@@ -200,6 +201,7 @@ def build_parser() -> argparse.ArgumentParser:
     for option in ("exe", "model", "rpc", "prompt-file"):
         parser.add_argument("--" + option, required=True)
     parser.add_argument("--pc-layers", type=int, default=None)
+    parser.add_argument("--cpu-layers", type=int, default=0)
     parser.add_argument("--model-plan", default="jupiter-model.plan")
     parser.add_argument(
         "--candidates", type=parse_sizes,
@@ -223,6 +225,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     pc_layers = load_pc_layers(args.pc_layers, args.model_plan)
+    if not 0 <= args.cpu_layers < pc_layers:
+        raise ValueError("CPU prefix must be in [0, pc-layers)")
     if (args.min_tail < 1 or args.max_chunk < args.min_tail or
             any(x < args.min_tail or x > args.max_chunk for x in args.candidates)):
         raise ValueError("candidate sizes must be within [min-tail, max-chunk]")
@@ -246,7 +250,7 @@ def main() -> int:
     # Use the exact same tokenizer/runtime settings for token detection and
     # stage measurements. A full plan only applies if its sum matches the
     # actual llama_context prefill batch size.
-    env = calibration_env(pc_layers)
+    env = calibration_env(pc_layers, args.cpu_layers)
     command = make_cli(args, prompt)
     probe_log = out / "token-probe.log"
     probe_env = env.copy()
@@ -265,7 +269,8 @@ def main() -> int:
         "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
         "exe": str(exe), "exe_stat": [exe.stat().st_size, exe.stat().st_mtime_ns],
         "model": str(model), "model_stat": [model.stat().st_size, model.stat().st_mtime_ns],
-        "rpc": args.rpc, "pc_layers": pc_layers, "tokens": total,
+        "rpc": args.rpc, "pc_layers": pc_layers,
+        "cpu_layers": args.cpu_layers, "tokens": total,
         "candidates": args.candidates, "min_tail": args.min_tail,
         "max_chunk": args.max_chunk, "batch": args.batch,
         "context": args.context, "threads": args.threads, "repeats": args.repeats,
@@ -377,6 +382,7 @@ def main() -> int:
         "prefix_tokens": 0,
         "threshold": args.threshold,
         "pc_layers": pc_layers,
+        "cpu_layers": args.cpu_layers,
         "prompt_tokens": total,
         "max_chunk": args.max_chunk,
         "dp_feasible": partition_feasible(total, selected.tokens, args.max_chunk),
