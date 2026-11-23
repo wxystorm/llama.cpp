@@ -429,6 +429,12 @@ def exact_jupiter_dp_plan(args: argparse.Namespace, case: dict,
     summary_path = stage3 / "sequence-summary.json"
     existing = (json.loads(summary_path.read_text(encoding="utf-8"))
                 if summary_path.is_file() else None)
+    if existing and (existing.get("pc_layers") != case["layout"] or
+                     existing.get("cpu_layers") != args.cpu_layers or
+                     existing.get("prompt_tokens") != case["tokens"]):
+        raise ValueError("Old Jupiter Stage3 results use a different "
+                         f"CPU/PC boundary or Prompt shape: {target}; "
+                         "choose a new output directory")
     status = "FULLY_MEASURED_AND_VERIFIED"
     ready = (plan_file.is_file() and existing is not None and
              existing.get("status") == status and
@@ -467,12 +473,13 @@ def exact_jupiter_dp_plan(args: argparse.Namespace, case: dict,
     if summary.get("status") != status:
         raise RuntimeError(f"Jupiter DP not fully measured and verified: "
                            f"{summary.get('status')}")
-    lines = {
-        k.strip(): v.strip()
-        for raw in plan_file.read_text(encoding="utf-8-sig").splitlines()
-        if "=" in (line := raw.split("#", 1)[0])
-        for k, v in [line.split("=", 1)]
-    }
+    lines = {}
+    for raw in plan_file.read_text(encoding="utf-8-sig").splitlines():
+        cleaned = raw.split("#", 1)[0]
+        if "=" not in cleaned:
+            continue
+        key, value = cleaned.split("=", 1)
+        lines[key.strip()] = value.strip()
     if (int(lines.get("model.pc_layers", -1)) != case["layout"] or
             int(lines.get("model.cpu_layers", 0)) != args.cpu_layers):
         raise ValueError(f"Jupiter model/CPU placement mismatch: {plan_file}")
