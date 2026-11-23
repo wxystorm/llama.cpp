@@ -1,4 +1,5 @@
 #include "common.h"
+#include "chat.h"
 //#include "log.h" // TODO: start using log.h
 #include "llama.h"
 
@@ -36,6 +37,7 @@ static void print_usage_information(const char * argv0) {
     printf("    --no-parse-special                   do not parse control tokens.\n");
     printf("    --log-disable                        disable logs. Makes stderr quiet when loading the model.\n");
     printf("    --show-count                         print the total number of tokens.\n");
+    printf("    --chat-user                          format one user message with the model's default Jinja chat template, then tokenize it.\n");
 }
 
 static void llama_log_callback_null(ggml_log_level level, const char * text, void * user_data) {
@@ -206,6 +208,7 @@ int main(int raw_argc, char ** raw_argv) {
     bool no_parse_special = false;
     bool disable_logging = false;
     bool show_token_count = false;
+    bool chat_user = false;
     const char * model_path = NULL;
     const char * prompt_path = NULL;
     const char * prompt_arg = NULL;
@@ -268,6 +271,9 @@ int main(int raw_argc, char ** raw_argv) {
         }
         else if (arg == "--show-count") {
             show_token_count = true;
+        }
+        else if (arg == "--chat-user") {
+            chat_user = true;
         }
         else {
             fprintf(stderr, "Error: unknown option '%s'\n", argv[iarg].c_str());
@@ -377,6 +383,35 @@ int main(int raw_argc, char ** raw_argv) {
 
     if (escape) {
         string_process_escapes(prompt);
+    }
+
+    if (chat_user) {
+        // The current llama-cli executes /v1/chat/completions even when
+        // --no-conversation is set. The Server formats {"role":"user"}
+        // with common_chat_templates_apply() before tokenization. A raw
+        // llama-tokenize --stdin count therefore misses ChatML/Qwen3
+        // delimiters and the assistant generation prefix (e.g. +8 tokens
+        // for Qwen3-14B). Match the Server's default Jinja route, without
+        // guessing a fixed number of added tokens.
+        try {
+            const auto templates = common_chat_templates_init(model, "");
+            common_chat_templates_inputs inputs {};
+            inputs.use_jinja = true;
+            inputs.add_generation_prompt = true;
+            inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+            inputs.enable_thinking =
+                common_chat_templates_support_enable_thinking(templates.get());
+            common_chat_msg user {};
+            user.role = "user";
+            user.content = prompt;
+            inputs.messages.push_back(std::move(user));
+            prompt = common_chat_templates_apply(templates.get(), inputs).prompt;
+        } catch (const std::exception & e) {
+            fprintf(stderr, "Error: failed to format single-user chat Prompt: %s\n", e.what());
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
     }
 
     std::vector<llama_token> tokens;
