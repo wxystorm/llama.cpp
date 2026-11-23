@@ -107,6 +107,17 @@ inline bool equal(const region_plan & a, const region_plan & b) {
         a.rope_beta_slow == b.rope_beta_slow;
 }
 
+// A compiled Phone-owned Graph is reusable only when every graph-affecting
+ // scalar matches. Run identifiers are transport ownership, not graph shape.
+ // Compare fields through equal() rather than memcmp() (which includes padding).
+inline bool same_execution_template(
+        const region_plan & cached, const region_plan & request) {
+    region_plan normalized = request;
+    normalized.run_id = cached.run_id;
+    normalized.p2c_run_id = cached.p2c_run_id;
+    return equal(cached, normalized);
+}
+
 inline bool validate(const region_plan & p, const char * & reason) {
     reason = "NONE";
     const uint32_t layers = layer_count(p);
