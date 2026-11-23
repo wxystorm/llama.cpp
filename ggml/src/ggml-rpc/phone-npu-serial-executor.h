@@ -543,6 +543,48 @@ public:
         const size_t graph_ctx_bytes =
             ggml_tensor_overhead() * 1024 +
             ggml_graph_overhead_custom(512, false) + 4096;
+        // Jupiter's exact q(x,y) DP may select a smaller first Chunk than
+        // later Chunks. The previous native pilot allocated one permanent
+        // Scratch from Chunk 0, assuming it was the largest. Fixed Hexagon
+        // Graphs retain tensor addresses: resizing after first compile is
+        // unsafe. Probe ALL planned Graph sizes before binding or compiling
+        // anything, then allocate a single immutable worst-case arena.
+        size_t scratch_reserve_bytes = 0;
+        if (reuse_scratch && plan.schedule_count != 0) {
+            size_t worst_graph_bytes = 0;
+            for (uint32_t chunk = 0;
+                    chunk < ggml_phone_owned::chunk_count(plan); ++chunk) {
+                ggml_init_params probe_params = {graph_ctx_bytes, nullptr, true};
+                std::unique_ptr<ggml_context, decltype(&ggml_free)> probe(
+                    ggml_init(probe_params), &ggml_free);
+                if (!probe) {
+                    reason = "PHONE_OWNED_SCRATCH_PROBE_CONTEXT";
+                    return false;
+                }
+                ggml_phone_qwen3::graph_result built {};
+                if (!ggml_phone_qwen3::build_graph(
+                        probe.get(), plan, chunk, w, built, why,
+                        kv->k, kv->v)) {
+                    reason = std::string("PHONE_OWNED_SCRATCH_PROBE_BUILD:") + why;
+                    return false;
+                }
+                const size_t required =
+                    ggml_backend_alloc_ctx_tensors_from_buft_size(
+                        probe.get(), scratch_buft);
+                if (required == 0 ||
+                        required > SIZE_MAX - required / 8 - 4096) {
+                    reason = "PHONE_OWNED_SCRATCH_PROBE_SIZE";
+                    return false;
+                }
+                worst_graph_bytes = std::max(worst_graph_bytes, required);
+            }
+            scratch_reserve_bytes =
+                worst_graph_bytes + worst_graph_bytes / 8 + 4096;
+            if (scratch_reserve_bytes > scratch_cap_bytes) {
+                reason = "PHONE_OWNED_HTP_SCRATCH_BUDGET_EXCEEDED";
+                return false;
+            }
+        }
         for (uint32_t chunk = 0;
                 chunk < ggml_phone_owned::chunk_count(plan); ++chunk) {
             auto item = std::make_unique<owned_chunk_graph>();
@@ -597,9 +639,12 @@ public:
             stats.graph_logical_storage_bytes += graph_required_bytes;
             if (reuse_scratch) {
                 if (!kv->scratch_buffer) {
-                    // Reserve 12.5% for alignment/layout differences; the
-                    // first full Chunk is the worst-case graph in this Plan.
-                    const size_t reserve_bytes =
+                    // The measured max of all DP Chunk Graphs reserves
+                    // space before any fixed-UID compilation. For older
+                    // uniform plans, the original first-Chunk estimate is
+                    // sufficient and preserves the previous memory behavior.
+                    const size_t reserve_bytes = scratch_reserve_bytes ?
+                        scratch_reserve_bytes :
                         graph_required_bytes + graph_required_bytes / 8 + 4096;
                     if (reserve_bytes > scratch_cap_bytes) {
                         reason = "PHONE_OWNED_HTP_SCRATCH_BUDGET_EXCEEDED";
