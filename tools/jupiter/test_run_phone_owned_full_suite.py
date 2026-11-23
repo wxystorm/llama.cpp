@@ -120,8 +120,8 @@ class TestResume(unittest.TestCase):
                     work = path / mode
                     work.mkdir()
                     logit_path = work / "native-logits.f32"
-                    array.array("f", [1.0, 2.0, 3.0]).tofile(
-                        logit_path.open("wb"))
+                    with logit_path.open("wb") as file:
+                        array.array("f", [1.0, 2.0, 3.0]).tofile(file)
                     runs[mode] = {"ms": ms, "cache_hit": True,
                                   "logits": str(logit_path),
                                   "log": str(work / "native-full-prefill.log")}
