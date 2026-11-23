@@ -578,14 +578,17 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
         return false;
     }
 
-    // Legacy GRAPH_REGISTER needs patch 4; native Phone-owned opcodes need
-    // patch 5. Preserve backwards-compatible legacy inference when the
-    // new feature is not opted in.
+    // Legacy Graph registration needs patch 4; synchronous Phone-owned
+    // RUN needs patch 5; autonomous Phone PUSH/P2C requires patch 6.
+    // Keep older non-native Jupiter modes backwards-compatible.
     const bool native_phone_owned =
         std::getenv("LLAMA_JUPITER_PHONE_OWNED_NATIVE") != nullptr &&
         std::atoi(std::getenv("LLAMA_JUPITER_PHONE_OWNED_NATIVE")) != 0;
-    const uint8_t required_patch = native_phone_owned ? 5 :
-        jupiter_graph_prebuild_enabled() ? 4 : 0;
+    const bool autonomous_phone_owned =
+        std::getenv("LLAMA_JUPITER_PHONE_OWNED_AUTONOMOUS") != nullptr &&
+        std::atoi(std::getenv("LLAMA_JUPITER_PHONE_OWNED_AUTONOMOUS")) != 0;
+    const uint8_t required_patch = autonomous_phone_owned ? 6 :
+        native_phone_owned ? 5 : jupiter_graph_prebuild_enabled() ? 4 : 0;
     if (required_patch != 0 &&
         (response.major != RPC_PROTO_MAJOR_VERSION ||
          response.minor != RPC_PROTO_MINOR_VERSION ||
