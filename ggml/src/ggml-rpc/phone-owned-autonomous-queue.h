@@ -51,6 +51,7 @@ public:
             return false;
         }
         jobs_.push_back({chunk, std::move(payload)});
+        last_progress_ = std::chrono::steady_clock::now();
         ++accepted_;
         ++outstanding_;
         cv_.notify_all();
@@ -91,6 +92,16 @@ public:
         if (worker_.joinable()) {
             worker_.join();
         }
+    }
+
+    // A restarted PC must not leave a lost stream holding the Phone's only
+    // active HTP Graph/KV generation forever. Used solely at the next
+    // PREPARE boundary; never interrupts a recently active request.
+    bool abandoned() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return failed_ || stopped_ ||
+            (!finished_ && std::chrono::steady_clock::now() -
+                last_progress_ > std::chrono::minutes(5));
     }
 
     uint32_t accepted() const {
@@ -141,6 +152,7 @@ private:
                     return;
                 }
                 ++completed_;
+                last_progress_ = std::chrono::steady_clock::now();
                 --outstanding_;
                 if (completed_ == n_chunks_) {
                     if (response.empty()) {
@@ -168,6 +180,8 @@ private:
     bool finished_ = false;
     bool stopped_ = false;
     std::string error_;
+    std::chrono::steady_clock::time_point last_progress_ =
+        std::chrono::steady_clock::now();
     std::vector<uint8_t> final_response_;
     std::thread worker_;
 };
