@@ -34,7 +34,8 @@ PROMPT_NAME = re.compile(r"^prompt_(.+)_(\d+)$", re.IGNORECASE)
 CHUNK_BUCKETS = (32, 64, 88, 96, 128, 192, 256, 384, 512, 768, 1024, 2048, 4096)
 FIELDNAMES = (
     "layout", "group", "prompt", "kind", "repeat", "status", "tokens",
-    "context", "chunks", "chunk_size", "n_chunks", "first_mode",
+    "context", "chunks", "chunk_size", "n_chunks",
+    "min_chunk", "plan_source", "plan_file", "first_mode",
     "sync_ms", "autonomous_ms", "sync_tok_s", "autonomous_tok_s",
     "speedup", "sync_cache_hit", "autonomous_cache_hit",
     "warm_comparable", "top1_same", "max_abs", "relative_rmse",
@@ -590,7 +591,11 @@ def csv_row(row: dict) -> dict:
         "repeat": row["repeat"], "status": row["status"],
         "tokens": tokens, "context": row["context"],
         "chunks": ",".join(map(str, row["chunks"])),
-        "chunk_size": row["chunks"][0], "n_chunks": len(row["chunks"]),
+        "chunk_size": max(row["chunks"], default=0),
+        "n_chunks": len(row["chunks"]),
+        "min_chunk": row.get("min_chunk"),
+        "plan_source": row.get("plan_source", ""),
+        "plan_file": row.get("plan_file", ""),
         "first_mode": row.get("first_mode", ""),
         "sync_ms": sync.get("ms"), "autonomous_ms": auto.get("ms"),
         "sync_tok_s": round(tokens*1000/sync["ms"], 3) if sync.get("ms") else "",
@@ -726,6 +731,7 @@ def run() -> int:
     cases = build_cases(plan, layouts, args.repeats, args.revisit_first)
     print(f"[PHONE_SUITE] prompts={len(files)} layouts={layouts}"
           f" repeats={args.repeats} total_pairs={len(cases)}"
+          f" context=2048 batch=2048 sequence_policy={args.sequence_policy}"
           f" warmup={not args.no_warmup} status=PLANNED", flush=True)
     if args.dry_run:
         print(f"[PHONE_SUITE] manifest={output/'suite-manifest.json'}"
@@ -734,6 +740,7 @@ def run() -> int:
 
     rows = []
     reference = {}
+    stage2_by_layout = {}
     stopped = False
     for position, case in enumerate(cases):
         root = case_directory(output, case)
@@ -758,6 +765,15 @@ def run() -> int:
                   f" prompt={case['name']} kind={case['kind']}"
                   f" repeat={case['repeat']} status=RUN", flush=True)
             try:
+                if args.sequence_policy == "jupiter-dp":
+                    layout = case["layout"]
+                    if layout not in stage2_by_layout:
+                        stage2_by_layout[layout] = stage2_for_layout(
+                            args, cases, layout, output)
+                    case = exact_jupiter_dp_plan(
+                        args, case, output, stage2_by_layout[layout])
+                else:
+                    case["plan_source"] = "JUPITER_FIXED_CHUNK_ABLATION"
                 row = perform_case(args, case, output, position)
                 if case["kind"] == "revisit":
                     key = (case["layout"], case["group"],
