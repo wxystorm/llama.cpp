@@ -42,13 +42,15 @@
 struct jupiter_stage_dump_state {
     std::filesystem::path dir;
     uint32_t target_tokens = 175;
+    uint32_t output_width = 151936;
     uint32_t active_tokens = 0;
     bool active = false;
     bool failed = false;
     std::map<std::string, uint32_t> seen;
 
-    explicit jupiter_stage_dump_state(const std::string & dir_in, uint32_t tokens) :
-        dir(dir_in), target_tokens(tokens) {}
+    explicit jupiter_stage_dump_state(const std::string & dir_in,
+                                     uint32_t tokens, uint32_t vocab) :
+        dir(dir_in), target_tokens(tokens), output_width(vocab) {}
 
     static bool observe(ggml_tensor * t, bool ask, void * user_data) {
         auto * st = static_cast<jupiter_stage_dump_state *>(user_data);
@@ -61,7 +63,7 @@ struct jupiter_stage_dump_state {
             char * end = nullptr;
             const long layer = std::strtol(stage.c_str() + 6, &end, 10);
             layer_checkpoint = end && *end == '\0' &&
-                               layer >= 31 && layer <= 39;
+                               layer >= 31 && layer <= 63;
         }
         const bool selected = layer_checkpoint ||
                               stage == "phone_owned_hidden" ||
@@ -70,7 +72,7 @@ struct jupiter_stage_dump_state {
         if (ask) { return selected; }
         if (!selected) { return true; }
         const int64_t expected_width =
-            stage == "result_output" ? 151936 : 5120;
+            stage == "result_output" ? st->output_width : 5120;
         if (t->type != GGML_TYPE_F32 || t->ne[0] != expected_width ||
                 !ggml_is_contiguous(t)) {
             st->failed = true;
@@ -744,7 +746,7 @@ llama_context::llama_context(
                 "[JUPITER_PHONE_OWNED_PREFILL] mode=FULL_PREFILL"
                 " endpoint=%s phone_first_layer=%d"
                 " head=PC_CUDA decode=UNSUPPORTED status=ENABLED\n",
-                endpoint, llama_jupiter::model_pc_layers(32));
+                endpoint, llama_jupiter::model_pc_layers(int(hparams.n_layer()) - 8));
         }
     }
 
@@ -809,7 +811,8 @@ llama_context::llama_context(
                 target = uint32_t(parsed);
             }
             jupiter_stage_dump =
-                std::make_unique<jupiter_stage_dump_state>(dump_dir, target);
+                std::make_unique<jupiter_stage_dump_state>(
+                     dump_dir, target, uint32_t(hparams.n_vocab));
             cparams.cb_eval = jupiter_stage_dump_state::observe;
             cparams.cb_eval_user_data = jupiter_stage_dump.get();
             LLAMA_LOG_INFO(
