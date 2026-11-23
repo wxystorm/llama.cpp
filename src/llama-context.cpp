@@ -16,6 +16,8 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <condition_variable>
+#include <deque>
 #include <cinttypes>
 #include <utility>
 #include <cmath>
@@ -26,6 +28,7 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <thread>
 #include <string>
 #include <unordered_set>
 
@@ -163,6 +166,26 @@ struct jupiter_phone_owned_native_state {
     bool failed = false;
     std::string failure;
 
+    // Optional two-deep PC -> Phone pipeline. Each non-final Chunk's
+    // Phone result is only needed to update the private Phone KV, so the
+    // PC can continue building its next independent prefix Chunk while
+    // the worker runs the preceding Phone suffix. The final Chunk waits.
+    struct async_job {
+        uint32_t chunk = 0;
+        uint32_t tokens = 0;
+        std::vector<float> input;
+    };
+    bool async_enabled = false;
+    bool async_stop = false;
+    uint32_t async_completed = 0;
+    size_t async_in_flight = 0;
+    std::string async_error;
+    std::vector<float> async_final_output;
+    std::deque<async_job> async_jobs;
+    std::mutex async_mutex;
+    std::condition_variable async_cv;
+    std::thread async_worker;
+
     explicit jupiter_phone_owned_native_state(std::string ep) :
         endpoint(std::move(ep)) {}
 
@@ -171,6 +194,67 @@ struct jupiter_phone_owned_native_state {
         failure = msg;
         LLAMA_LOG_ERROR("[JUPITER_PHONE_OWNED_PREFILL] status=FAIL reason=%s\n",
                        failure.c_str());
+    }
+
+    void async_loop() {
+        const uint32_t last = (total_tokens + chunk_tokens - 1) / chunk_tokens - 1;
+        for (;;) {
+            async_job job;
+            {
+                std::unique_lock<std::mutex> lock(async_mutex);
+                async_cv.wait(lock, [&] { return async_stop || !async_jobs.empty(); });
+                if (async_stop && async_jobs.empty()) { return; }
+                job = std::move(async_jobs.front());
+                async_jobs.pop_front();
+            }
+            std::vector<float> output(job.input.size());
+            ggml_rpc_phone_owned_run_stats stats {};
+            const int64_t begin = ggml_time_us();
+            const bool ok = run_fn(
+                endpoint.c_str(), run_id, 0, job.chunk,
+                job.input.data(), job.input.size(), output.data(),
+                output.size(), &stats);
+            const bool valid = ok && stats.layers == phone_layers &&
+                stats.tokens == job.tokens;
+            {
+                std::lock_guard<std::mutex> lock(async_mutex);
+                if (!valid || job.chunk != async_completed) {
+                    async_error = "PHONE_NATIVE_ASYNC_RPC_OR_FIFO_FAILURE";
+                    async_jobs.clear();
+                    async_stop = true;
+                    async_in_flight = 0;
+                } else {
+                    if (job.chunk == last) {
+                        async_final_output = std::move(output);
+                    }
+                    ++async_completed;
+                    --async_in_flight;
+                }
+            }
+            async_cv.notify_all();
+            if (!valid) { return; }
+            LLAMA_LOG_INFO(
+                "[JUPITER_PHONE_OWNED_PREFILL] phase=CHUNK_DONE"
+                " mode=ASYNC run=%" PRIu64 " chunk=%u tokens=%u"
+                " phone_compute_ms=%.3f phone_upload_ms=%.3f"
+                " phone_copy_ms=%.3f phone_wall_ms=%.3f"
+                " total_bridge_ms=%.3f status=PASS\n",
+                run_id, job.chunk, job.tokens, stats.compute_ms,
+                stats.upload_ms, stats.output_copy_ms, stats.wall_ms,
+                (ggml_time_us() - begin)/1000.0);
+        }
+    }
+
+    void stop_async() {
+        if (!async_worker.joinable()) { return; }
+        {
+            std::lock_guard<std::mutex> lock(async_mutex);
+            async_stop = true;
+            async_jobs.clear();
+        }
+        async_cv.notify_all();
+        async_worker.join();
+        async_enabled = false;
     }
 
     bool prepare_run(const llama_model & model, const llama_cparams & cparams,
@@ -288,6 +372,20 @@ struct jupiter_phone_owned_native_state {
         total_tokens = tokens;
         chunk_tokens = first_chunk;
         prepared = true;
+        if (const char * setting = std::getenv("LLAMA_JUPITER_PHONE_OWNED_ASYNC")) {
+            async_enabled = std::strcmp(setting, "1") == 0;
+        }
+        if (async_enabled) {
+            try {
+                async_worker = std::thread([this] { async_loop(); });
+            } catch (const std::exception & e) {
+                async_enabled = false;
+                fail(std::string("PHONE_NATIVE_ASYNC_THREAD_START:") + e.what());
+                return false;
+            }
+            LLAMA_LOG_INFO("[JUPITER_PHONE_OWNED_PREFILL] phase=ASYNC_WORKER"
+                           " queue_depth=2 status=READY\n");
+        }
         LLAMA_LOG_INFO(
             "[JUPITER_PHONE_OWNED_PREFILL] phase=PREPARE_DONE run=%" PRIu64
             " graphs=%u load_ms=%.3f build_ms=%.3f buffer_ms=%.3f"
@@ -331,6 +429,65 @@ struct jupiter_phone_owned_native_state {
             return;
         }
         const size_t n_floats = size_t(expected_tokens)*5120;
+        if (state->async_enabled) {
+            const uint32_t this_chunk = state->next_chunk;
+            const uint32_t last = (state->total_tokens + state->chunk_tokens - 1) /
+                state->chunk_tokens - 1;
+            {
+                std::unique_lock<std::mutex> lock(state->async_mutex);
+                state->async_cv.wait(lock, [&] {
+                    return state->async_in_flight < 2 || !state->async_error.empty();
+                });
+                if (!state->async_error.empty()) {
+                    const std::string why = state->async_error;
+                    lock.unlock();
+                    state->fail(why);
+                    zero_output();
+                    return;
+                }
+                async_job job {};
+                job.chunk = this_chunk;
+                job.tokens = expected_tokens;
+                job.input.assign(static_cast<const float *>(src->data),
+                                 static_cast<const float *>(src->data) + n_floats);
+                state->async_jobs.push_back(std::move(job));
+                ++state->async_in_flight;
+            }
+            state->async_cv.notify_all();
+            LLAMA_LOG_INFO("[JUPITER_PHONE_OWNED_PREFILL] phase=ASYNC_ENQUEUE"
+                           " chunk=%u tokens=%u status=QUEUED\n",
+                           this_chunk, expected_tokens);
+            if (this_chunk == last) {
+                std::vector<float> result;
+                {
+                    std::unique_lock<std::mutex> lock(state->async_mutex);
+                    state->async_cv.wait(lock, [&] {
+                        return state->async_completed == last + 1 ||
+                               !state->async_error.empty();
+                    });
+                    if (!state->async_error.empty()) {
+                        const std::string why = state->async_error;
+                        lock.unlock();
+                        state->fail(why);
+                        zero_output();
+                        return;
+                    }
+                    result = std::move(state->async_final_output);
+                }
+                if (result.size() != n_floats) {
+                    state->fail("PHONE_NATIVE_ASYNC_FINAL_OUTPUT_SHAPE");
+                    zero_output();
+                    return;
+                }
+                std::memcpy(dst->data, result.data(), n_floats*sizeof(float));
+            } else {
+                // No non-final Phone output is sampled by llama.cpp.
+                // Its private HTP KV is computed by the ordered worker.
+                zero_output();
+            }
+            ++state->next_chunk;
+            return;
+        }
         ggml_rpc_phone_owned_run_stats stats {};
         const int64_t begin = ggml_time_us();
         const bool ok = state->run_fn(
@@ -357,6 +514,9 @@ struct jupiter_phone_owned_native_state {
     }
 
     void reset_run() {
+        // The Phone RPC RESET must never free Graph/KV while a worker
+        // is executing a previously submitted Chunk.
+        stop_async();
         if (prepared && reset_fn) {
             if (!reset_fn(endpoint.c_str(), run_id)) {
                 LLAMA_LOG_ERROR(
