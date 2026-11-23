@@ -314,11 +314,12 @@ def cli_for_case(args: argparse.Namespace, case: dict,
     return command
 
 
-def child_run(command: list[str], stdout_path: Path, timeout: int) -> None:
+def child_run(command: list[str], stdout_path: Path, timeout: int,
+              env: dict | None = None) -> None:
     stdout_path.parent.mkdir(parents=True, exist_ok=True)
     with stdout_path.open("wb") as stream:
         options = {"stdin": subprocess.DEVNULL, "stdout": stream,
-                   "stderr": subprocess.STDOUT}
+                   "stderr": subprocess.STDOUT, "env": env}
         if os.name == "nt":
             options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
@@ -349,6 +350,147 @@ def child_run(command: list[str], stdout_path: Path, timeout: int) -> None:
             stdout_path.read_text(encoding="utf-8", errors="replace")
             .splitlines()[-28:])
         raise RuntimeError(f"Runner failed exit={code}; {stdout_path}\n{tail}")
+
+
+def calibration_env(args: argparse.Namespace) -> dict[str, str]:
+    env = os.environ.copy()
+    # Jupiter's original q(x,y) calibrator and model partition MUST run
+    # without the Phone-native graph replacement being benchmarked.
+    env.update({
+        "LLAMA_JUPITER_PHONE_OWNED_NATIVE": "0",
+        "LLAMA_JUPITER_PHONE_OWNED_AUTONOMOUS": "0",
+        "LLAMA_JUPITER_PHONE_OWNED_ASYNC": "0",
+        "LLAMA_JUPITER_HTP_SESSIONS": str(args.sessions),
+        "LLAMA_JUPITER_HTP_ACTIVE_SESSIONS": str(args.sessions),
+        "LLAMA_JUPITER_HTP_CONTEXT_TOKENS": "2048",
+    })
+    env.pop("LLAMA_JUPITER_SEQUENCE_PLAN", None)
+    env.pop("LLAMA_JUPITER_PLAN_FILE", None)
+    return env
+
+
+def stage2_for_layout(args: argparse.Namespace, cases: list[dict],
+                      layout: int, output: Path) -> Path:
+    if args.min_chunk_json:
+        source = Path(args.min_chunk_json).resolve()
+    else:
+        stage2 = output / "calibration" / f"l{layout:02d}" / "stage2"
+        source = stage2 / "min-chunk.json"
+        if not source.is_file():
+            # Jupiter Stage2 is a *hardware* measurement, not a per-Prompt
+            # heuristic. Measure one representative prompt with the same
+            # model, CPU/GPU boundary, Phone HTP sessions and Context.
+            available = [x for x in cases if x["layout"] == layout and
+                         x["kind"] == "normal"]
+            if not available:
+                raise ValueError(f"No Prompt available for Stage2 L{layout}")
+            sample = min(available,
+                         key=lambda x: (abs(x["tokens"] - 357), x["name"]))
+            command = [
+                sys.executable,
+                str(Path(__file__).with_name("run_min_chunk_profile.py")),
+                "--exe", str(Path(args.exe).resolve()),
+                "--model", str(Path(args.model).resolve()),
+                "--rpc", args.rpc,
+                "--prompt-file", sample["path"],
+                "--pc-layers", str(layout),
+                "--cpu-layers", str(args.cpu_layers),
+                "--target-tokens", str(sample["tokens"]),
+                "--max-chunk", str(args.max_chunk),
+                "--batch", "2048", "--context", "2048",
+                "--repeats", str(args.stage2_repeats),
+                "--out-dir", str(stage2), "--resume",
+            ]
+            print(f"[PHONE_SUITE_STAGE2] layout={layout}"
+                  f" sample={sample['name']} tokens={sample['tokens']}"
+                  " policy=MEASURED_MINIMUM_B status=RUN", flush=True)
+            child_run(command, stage2 / "stage2-runner.stdout.log", 0,
+                      env=calibration_env(args))
+    if not source.is_file():
+        raise RuntimeError(f"Jupiter Stage2 min-chunk.json missing: {source}")
+    info = json.loads(source.read_text(encoding="utf-8-sig"))
+    if (int(info["pc_layers"]) != layout or
+            int(info.get("cpu_layers", 0)) != args.cpu_layers or
+            int(info["max_chunk"]) != args.max_chunk or
+            not info.get("candidates")):
+        raise ValueError(
+            f"Jupiter Stage2 calibration does not match CPU/PC boundary, "
+            f"maximum Chunk or measured candidates: {source}")
+    return source
+
+
+def exact_jupiter_dp_plan(args: argparse.Namespace, case: dict,
+                          output: Path, stage2_json: Path) -> dict:
+    target = output / "calibration" / f"l{case['layout']:02d}" / \
+        "plans" / case["name"].removesuffix(".txt")
+    stage3 = target / "stage3"
+    plan_file = target / "final.plan"
+    summary_path = stage3 / "sequence-summary.json"
+    existing = (json.loads(summary_path.read_text(encoding="utf-8"))
+                if summary_path.is_file() else None)
+    status = "FULLY_MEASURED_AND_VERIFIED"
+    ready = (plan_file.is_file() and existing is not None and
+             existing.get("status") == status and
+             existing.get("pc_layers") == case["layout"] and
+             existing.get("cpu_layers") == args.cpu_layers and
+             existing.get("prompt_tokens") == case["tokens"])
+    if not ready:
+        command = [
+            sys.executable,
+            str(Path(__file__).with_name("run_sequence_pipeline.py")),
+            "--exe", str(Path(args.exe).resolve()),
+            "--model", str(Path(args.model).resolve()),
+            "--rpc", args.rpc, "--prompt-file", case["path"],
+            "--min-chunk-json", str(stage2_json),
+            "--target-tokens", str(case["tokens"]),
+            "--reuse-b-profile-for-new-length",
+            "--pc-layers", str(case["layout"]),
+            "--cpu-layers", str(args.cpu_layers),
+            "--q-repeats", str(args.q_repeats),
+            "--refine-repeats", str(args.refine_repeats),
+            "--max-rounds", str(args.max_rounds),
+            "--max-subsequences", "16",
+            "--batch", "2048", "--context", "2048",
+            "--ubatch", str(args.max_chunk), "--threads", "8",
+            "--out-dir", str(stage3),
+            "--plan-output", str(plan_file), "--resume",
+        ]
+        print(f"[PHONE_SUITE_STAGE3] layout={case['layout']}"
+              f" prompt={case['name']} tokens={case['tokens']}"
+              " policy=EXACT_MEASURED_Q_DP status=RUN", flush=True)
+        child_run(command, target / "stage3-runner.stdout.log", 0,
+                  env=calibration_env(args))
+    if not plan_file.is_file() or not summary_path.is_file():
+        raise RuntimeError(f"Jupiter Stage3 plan incomplete: {target}")
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    if summary.get("status") != status:
+        raise RuntimeError(f"Jupiter DP not fully measured and verified: "
+                           f"{summary.get('status')}")
+    lines = {
+        k.strip(): v.strip()
+        for raw in plan_file.read_text(encoding="utf-8-sig").splitlines()
+        if "=" in (line := raw.split("#", 1)[0])
+        for k, v in [line.split("=", 1)]
+    }
+    if (int(lines.get("model.pc_layers", -1)) != case["layout"] or
+            int(lines.get("model.cpu_layers", 0)) != args.cpu_layers):
+        raise ValueError(f"Jupiter model/CPU placement mismatch: {plan_file}")
+    chunks = read_plan(plan_file).get(case["tokens"])
+    if (not chunks or len(chunks) < 2 or len(chunks) > 16 or
+            sum(chunks) != case["tokens"] or
+            chunks != summary.get("chunks") or
+            max(chunks) > args.max_chunk):
+        raise ValueError(f"Native Phone cannot execute exact Jupiter DP "
+                         f"plan; no fixed-Chunk fallback: {plan_file}")
+    planned = dict(case)
+    planned["chunks"] = chunks
+    planned["plan_file"] = str(plan_file)
+    planned["plan_source"] = "JUPITER_STAGE2_B_QXY_EXACT_DP"
+    planned["min_chunk"] = summary["min_chunk"]
+    print(f"[PHONE_SUITE_DP_READY] layout={case['layout']} "
+          f"prompt={case['name']} b={planned['min_chunk']}"
+          f" chunks={chunks} status=READY", flush=True)
+    return planned
 
 
 def run_mode(args: argparse.Namespace, case: dict,
