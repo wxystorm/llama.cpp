@@ -108,8 +108,8 @@ inline bool equal(const region_plan & a, const region_plan & b) {
 }
 
 // A compiled Phone-owned Graph is reusable only when every graph-affecting
- // scalar matches. Run identifiers are transport ownership, not graph shape.
- // Compare fields through equal() rather than memcmp() (which includes padding).
+// scalar matches. Run identifiers are transport ownership, not graph shape.
+// Compare fields through equal() rather than memcmp() (which includes padding).
 inline bool same_execution_template(
         const region_plan & cached, const region_plan & request) {
     region_plan normalized = request;
