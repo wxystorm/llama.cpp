@@ -240,10 +240,11 @@ struct jupiter_phone_owned_native_state {
                 " mode=ASYNC run=%" PRIu64 " chunk=%u tokens=%u"
                 " phone_compute_ms=%.3f phone_upload_ms=%.3f"
                 " phone_copy_ms=%.3f phone_wall_ms=%.3f"
-                " total_bridge_ms=%.3f status=PASS\n",
+                " total_bridge_ms=%.3f t_begin_us=%" PRId64
+                " t_done_us=%" PRId64 " status=PASS\n",
                 run_id, job.chunk, job.tokens, stats.compute_ms,
                 stats.upload_ms, stats.output_copy_ms, stats.wall_ms,
-                (ggml_time_us() - begin)/1000.0);
+                (ggml_time_us() - begin)/1000.0, begin, ggml_time_us());
         }
     }
 
@@ -459,8 +460,9 @@ struct jupiter_phone_owned_native_state {
             }
             state->async_cv.notify_all();
             LLAMA_LOG_INFO("[JUPITER_PHONE_OWNED_PREFILL] phase=ASYNC_ENQUEUE"
-                           " chunk=%u tokens=%u status=QUEUED\n",
-                           this_chunk, expected_tokens);
+                           " chunk=%u tokens=%u t_us=%" PRId64
+                           " status=QUEUED\n",
+                           this_chunk, expected_tokens, ggml_time_us());
             if (this_chunk == last) {
                 std::vector<float> result;
                 {
