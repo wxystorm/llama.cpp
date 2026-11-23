@@ -21,7 +21,7 @@ param(
     [string]$ModelSize = "auto",
     [string]$Model = "",
     [string]$Rpc = "10.71.109.52:10140",
-    [string]$PromptsDir = "E:\llama\datasets\sharegpt\sharegpt40",
+    [string]$PromptsDir = "E:\llama\datasets\sharegpt\sharegpt50_short",
     [string]$Pattern = "prompt_*_*.txt",
     [string]$Groups = "0,128,256,512,1024",
     [string]$OutDir = "",
