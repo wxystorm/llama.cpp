@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 
 using namespace ggml_phone_owned;
 
@@ -105,6 +106,31 @@ int main() {
     new_request.run_id = 2000;
     new_request.rope_freq_scale = 0.5f;
     CHECK(!same_execution_template(chain, new_request));
+
+    // Jupiter's native suffix can now be 1..8 layers with a bounded,
+    // context-dependent Chunk/KV geometry; the original 8-layer/512 pilot
+    // remains valid while longer prompts require appropriately sized Chunks.
+    for (uint32_t layers = 1; layers <= 8; ++layers) {
+        for (uint32_t ctx : {512u, 1024u, 2048u, 4096u}) {
+            auto native = a;
+            native.version = layers == 1 ? k_plan_version : k_multi_plan_version;
+            native.flags = layers == 1 ? k_flag_flash_attn : flags_for_layers(layers);
+            native.layer = 40 - layers;
+            native.region = 0;
+            native.total_tokens = ctx;
+            native.chunk_tokens = ctx == 4096 ? 256 : 128;
+            native.kv_capacity = ctx;
+            native.n_kv = ctx;
+            CHECK(validate(native, reason));
+            CHECK(layer_count(native) == layers);
+            CHECK(chunk_count(native) <= 16);
+            for (uint32_t i = 0; i < layers; ++i) {
+                const auto child = single_layer_plan(native, i);
+                CHECK(child.layer == 40 - layers + i);
+                CHECK(validate(child, reason));
+            }
+        }
+    }
 
     CHECK(chunk_count(chain) == 4);
     CHECK(internal_layer_region(chain, 0) != chain.region);
