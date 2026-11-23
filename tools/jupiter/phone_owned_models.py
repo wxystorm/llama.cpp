@@ -76,3 +76,42 @@ def inspect_model(path: Path, family: str = "auto") -> ModelLayout:
             f"hidden={hidden}, Q={heads}, KV={kv_heads}, head_dim={head_dim}")
     return ModelLayout(names[layers], layers, hidden, heads,
                        kv_heads, head_dim)
+
+
+def resolve_splits(model: ModelLayout, *, layouts: str | None = None,
+                   cpu_layers: int | None = None,
+                   cuda_layers: int | None = None,
+                   phone_layers: int | None = None) -> tuple[list[int], int]:
+    """Resolve model layers into CPU [0,c), CUDA [c,p), HTP [p,N).
+
+    A multi-layout sweep varies p and keeps c fixed. An explicit CUDA or
+    Phone count selects a single placement and cannot override a sweep.
+    """
+    if phone_layers is not None and not 1 <= phone_layers <= 8:
+        raise ValueError("--phone-layers must be 1..8")
+    if cuda_layers is not None and cuda_layers < 1:
+        raise ValueError("--cuda-layers must be positive")
+    if layouts is not None and (phone_layers is not None or cuda_layers is not None):
+        raise ValueError("Choose either --layouts or --phone-layers/"
+                         "--cuda-layers, not both")
+    if layouts:
+        positions = list(dict.fromkeys(int(s.strip()) for s in layouts.split(",")))
+    else:
+        first_phone = (model.layers - phone_layers if phone_layers is not None
+                       else model.default_pc_layers)
+        positions = [first_phone]
+    if not positions:
+        raise ValueError("At least one PC/Phone boundary is required")
+    if cpu_layers is None:
+        if cuda_layers is not None:
+            if len(positions) != 1:
+                raise ValueError("CUDA layer count requires one Phone layout")
+            cpu_layers = positions[0] - cuda_layers
+        else:
+            cpu_layers = model.default_cpu_layers
+    if cuda_layers is not None and positions[0] - cpu_layers != cuda_layers:
+        raise ValueError("--cuda-layers contradicts --cpu-layers"
+                         " and Phone layer boundary")
+    for position in positions:
+        model.validate_split(position, cpu_layers)
+    return positions, cpu_layers
