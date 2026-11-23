@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 from run_phone_owned_full_prefill import logits_comparison, read_logits
+from inspect_phone_owned_overlap import analyze as inspect_overlap
 
 
 def parser() -> argparse.ArgumentParser:
@@ -29,6 +30,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--target-tokens", type=int, default=175)
     p.add_argument("--chunks", default="88,87")
     p.add_argument("--out-dir", default="phone-owned-async-ab")
+    p.add_argument("--reverse-order", action="store_true",
+                   help="run async before sync to expose first-run cache bias")
     return p
 
 
@@ -42,7 +45,8 @@ def main() -> int:
     runner = Path(__file__).with_name("run_phone_owned_full_prefill.py")
     results = {}
     logs = {}
-    for variant in ("sync", "async"):
+    execution_order = ("async", "sync") if args.reverse_order else ("sync", "async")
+    for variant in execution_order:
         case_dir = output / variant
         command = [
             sys.executable, str(runner),
@@ -107,7 +111,31 @@ def main() -> int:
     sync_logits = read_logits(output / "sync" / "native-logits.f32")
     async_logits = read_logits(output / "async" / "native-logits.f32")
     parity = logits_comparison(sync_logits, async_logits)
+    inspection = inspect_overlap(logs["sync"], logs["async"])
+    sync_ms = results["sync"]["prompt_eval_ms"]
+    async_ms = results["async"]["prompt_eval_ms"]
     report = {
+        "execution_order": list(execution_order),
+        "prepare": {
+            "sync": inspection["synchronous_prepare"],
+            "async": inspection["asynchronous_prepare"],
+            "same_prepare_cost_class": inspection["same_prepare_cost_class"],
+        },
+        "overlap_timeline": {
+            "pc_ubatch_vs_phone_rpc_positive_windows":
+                inspection["pc_ubatch_vs_phone_rpc_positive_windows"],
+            "pc_ubatch_vs_phone_rpc_overlap_ms":
+                inspection["pc_ubatch_vs_phone_rpc_overlap_ms"],
+            "boundaries": inspection["boundaries"],
+        },
+        "observed_prefill_ratio_sync_over_async": (
+            sync_ms / async_ms if sync_ms is not None and async_ms else None
+        ),
+        "performance_interpretation": (
+            "NOT_COMPARABLE_DIFFERENT_PREPARE_CACHE_CLASSES"
+            if inspection["same_prepare_cost_class"] is not True
+            else "SAME_PREPARE_CLASS_SINGLE_RUN_REPEAT_IN_REVERSED_ORDER"
+        ),
         "parity": parity,
         "parity_input_a": "sync_native",
         "parity_input_b": "async_native",
