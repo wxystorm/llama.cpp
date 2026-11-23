@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import run_phone_owned_full_suite as suite
+from phone_owned_models import ModelLayout
 
 
 class TestPlanning(unittest.TestCase):
@@ -159,7 +160,9 @@ class TestResume(unittest.TestCase):
                 exe=str(exe), tokenizer=str(tok), model=str(model),
                 rpc="127.0.0.1:10140", prompts_dir=str(prompts),
                 pattern="prompt_*_*.txt", out_dir=str(out),
-                layouts="32", cpu_layers=16, sessions=4, chunk_size=88,
+                model_size="auto", layouts="32", cpu_layers=16,
+                cuda_layers=None, phone_layers=None,
+                sessions=4, chunk_size=88,
                 sequence_policy="fixed-control", min_chunk_json=None,
                 stage2_repeats=2, q_repeats=2,
                 refine_repeats=2, max_rounds=6, max_chunk=128,
@@ -191,6 +194,8 @@ class TestResume(unittest.TestCase):
                             case_dir=str(folder), attempt_dir=str(path))
 
             with patch.object(suite, "parse_args", return_value=args), \
+                 patch.object(suite, "inspect_model", return_value=ModelLayout(
+                     "14b", 40, 5120, 40, 8, 128)), \
                  patch.object(suite, "count_model_tokens",
                               side_effect=lambda _t, _m, p: int(p)), \
                  patch.object(suite, "perform_case",
@@ -206,6 +211,8 @@ class TestResume(unittest.TestCase):
 
             args.resume = True
             with patch.object(suite, "parse_args", return_value=args), \
+                 patch.object(suite, "inspect_model", return_value=ModelLayout(
+                     "14b", 40, 5120, 40, 8, 128)), \
                  patch.object(suite, "count_model_tokens",
                               side_effect=AssertionError("retokenized")), \
                  patch.object(suite, "perform_case",
