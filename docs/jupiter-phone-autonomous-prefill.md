@@ -58,9 +58,11 @@ PC-side `--async-phone` worker remain intact for regressions.
 
 ## Protocol and compatibility
 
-This branch increments Jupiter RPC patch from 4.0.5 to **4.0.6** and adds
-three opt-in commands: AUTO_START, AUTO_PUSH and AUTO_P2C_WAIT. The
-patch/HELLO check must reject old PC/Phone mixed binaries in native mode.
+This branch now requires Jupiter RPC **4.0.7** for ALL Phone-owned native
+modes: the PREPARE wire descriptor carries up to 16 exact ordered Chunk
+widths from Jupiter's original variable-length Sequence DP (in addition
+to AUTO_START, AUTO_PUSH and AUTO_P2C_WAIT). The patch/HELLO check must
+reject old mixed binaries before sending any extended PREPARE payload.
 All old command numbers remain unchanged because the new commands are
 appended. This transport is Jupiter's **Prefill-only equivalent of the
 main design's Phone task stream semantics**, not a byte-for-byte copy of
@@ -143,4 +145,7 @@ full-logits parity, checkpoints each case, optionally replays A-B-A, and
 generates per-group CSV statistics.
 
 See [Jupiter Phone-autonomous full suite](jupiter-phone-autonomous-full-suite.md)
-for commands, output schema and resume rules. No Decode is involved.
+for commands, output schema and resume rules. Its **formal default**
+uses fixed Context=2048 and the original Stage2 minimum efficient Chunk,
+per-Prompt q(x,y) calibration, exact Sequence DP and targeted refinement;
+any fixed-Chunk mode is explicitly labeled an ablation. No Decode is involved.
