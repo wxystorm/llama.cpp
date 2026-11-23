@@ -64,7 +64,17 @@ struct jupiter_stage_dump_state {
             return true;
         }
         const size_t bytes = ggml_nbytes(t);
-        if (bytes == 0 || bytes % sizeof(float) != 0 ||
+        // The standard Qwen3 last layer gathers only requested output rows.
+        // Early Prefill chunks have n_outputs=0 and cannot be compared at
+        // layer 39; skip their empty checkpoint instead of treating it as a
+        // numerical/model failure.
+        if (bytes == 0) {
+            LLAMA_LOG_INFO(
+                "[JUPITER_STAGE_DUMP] stage=%s status=SKIP"
+                " reason=NO_SELECTED_OUTPUT_TOKENS\n", stage.c_str());
+            return true;
+        }
+        if (bytes % sizeof(float) != 0 ||
                 bytes > size_t(512)*5120*sizeof(float)) {
             st->failed = true;
             LLAMA_LOG_ERROR("[JUPITER_STAGE_DUMP] stage=%s status=FAIL"
