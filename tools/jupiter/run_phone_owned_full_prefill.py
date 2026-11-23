@@ -30,6 +30,9 @@ def arguments() -> argparse.Namespace:
     p.add_argument("--rpc", required=True, help="same endpoint used for --rpc")
     p.add_argument("--prompt-file", required=True)
     p.add_argument("--sessions", type=int, choices=(1, 4), default=1)
+    p.add_argument("--pc-layers", type=int, default=32, help="first Phone HTP layer, 32..39")
+    p.add_argument("--cpu-layers", type=int, default=16, help="PC CPU prefix layer count")
+    p.add_argument("--context", type=int, default=512, help="fresh Prefill KV capacity, <=4096")
     p.add_argument("--target-tokens", type=int, default=175)
     p.add_argument("--chunks", default="88,87")
     p.add_argument("--mode", choices=("both", "legacy", "native"), default="both")
@@ -95,8 +98,12 @@ def main() -> int:
             or sum(chunks) != args.target_tokens
             or chunks[:-1] != [chunks[0]]*(len(chunks)-1)):
         raise ValueError("native requires equal full chunks plus one final tail; sum must equal --target-tokens")
-    if args.target_tokens > 512 or args.target_tokens < 2:
-        raise ValueError("native pilot requires 2..512 tokens")
+    if not 32 <= args.pc_layers <= 39 or not 0 <= args.cpu_layers < args.pc_layers:
+        raise ValueError("native requires 32..39 PC layers and 0 <= CPU layers < PC layers")
+    if not 256 <= args.context <= 4096 or args.context % 256 != 0:
+        raise ValueError("context must be 256..4096 and divisible by 256")
+    if args.target_tokens > args.context or args.target_tokens < 2 or len(chunks) > 16:
+        raise ValueError("native requires 2..context tokens and at most 16 chunks")
     prompt = prompt_path.read_text(encoding="utf-8-sig").rstrip("\r\n")
     if not prompt:
         raise ValueError("empty Prompt")
@@ -110,11 +117,11 @@ def main() -> int:
         env.pop("LLAMA_JUPITER_PLAN_FILE", None)
         env.update({
             "LLAMA_JUPITER_PREFILL": "1",
-            "LLAMA_JUPITER_PC_LAYERS": "32",
-            "LLAMA_JUPITER_CPU_LAYERS": "16",
+            "LLAMA_JUPITER_PC_LAYERS": str(args.pc_layers),
+            "LLAMA_JUPITER_CPU_LAYERS": str(args.cpu_layers),
             "LLAMA_JUPITER_HTP_SESSIONS": str(args.sessions),
             "LLAMA_JUPITER_HTP_ACTIVE_SESSIONS": str(args.sessions),
-            "LLAMA_JUPITER_HTP_CONTEXT_TOKENS": "512",
+            "LLAMA_JUPITER_HTP_CONTEXT_TOKENS": str(args.context),
             "LLAMA_JUPITER_SEQUENCE_PLAN": ",".join(map(str, chunks)),
             "LLAMA_JUPITER_WINDOW": "2",
             "LLAMA_JUPITER_GRAPH_PREBUILD": "0",
@@ -138,7 +145,7 @@ def main() -> int:
             str(exe), "-m", str(model),
             "--rpc", args.rpc,
             "--split-mode", "layer", "-ngl", "all",
-            "-c", "512", "-b", "512", "-ub", "128",
+            "-c", str(args.context), "-b", str(args.context), "-ub", str(chunks[0]),
             "-n", "1", "-t", "8",
             "--flash-attn", "on",
             "--no-warmup",
