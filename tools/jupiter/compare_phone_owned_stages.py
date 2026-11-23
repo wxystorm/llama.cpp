@@ -133,6 +133,19 @@ def main() -> int:
         "Raw LM Head logits CPU vs Native",
         cpu_output, native_output, args.vocab
     ))
+    # In the native runner, the host logits dump and raw GGML output are
+    # generated during the SAME request. Comparing these reveals an
+    # output-transfer or synchronization issue independent of model parity.
+    host_native_path = args.native_dir.parent / "native-logits.f32"
+    if host_native_path.is_file():
+        native_host = load_f32(host_native_path, args.vocab)
+        comparisons.append((
+            "Native raw LM Head vs native host logits",
+            native_output, native_host, args.vocab
+        ))
+    else:
+        print(f"[PHONE_PARITY] INFO: host logits not found at "
+              f"{host_native_path}; skipping same-run raw-to-host check")
     result = {
         "chunks": chunks,
         "n_embd": args.embd,
@@ -155,6 +168,12 @@ def main() -> int:
             # selected output token, not all 175 Prompt positions.
             parts = [{"chunk": len(chunks)-1, "tokens": 1, **summary}]
         summary["per_chunk"] = parts
+        if title == "Native raw LM Head vs native host logits":
+            summary["raw_host_exact_match"] = reference == candidate
+            summary["raw_top1"] = max(
+                range(args.vocab), key=lambda i: reference[i])
+            summary["host_top1"] = max(
+                range(args.vocab), key=lambda i: candidate[i])
         if len(reference) == n_elements and width == args.embd:
             summary["last_token"] = compare(
                 reference[-args.embd:], candidate[-args.embd:])
@@ -167,6 +186,11 @@ def main() -> int:
         print(f"  cosine={summary.get('cosine')} "
               f"rRMSE={summary.get('relative_rmse')} "
               f"RMSE={summary.get('rmse')} maxabs={summary.get('max_abs')}")
+        if "raw_host_exact_match" in summary:
+            print(f"  raw_host_exact_match="
+                  f"{summary['raw_host_exact_match']} "
+                  f"raw_top1={summary['raw_top1']} "
+                  f"host_top1={summary['host_top1']}")
         if "last_token" in summary:
             last = summary["last_token"]
             print(f"  final_input_token cosine={last.get('cosine')} "
