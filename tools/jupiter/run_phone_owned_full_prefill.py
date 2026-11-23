@@ -29,7 +29,7 @@ def arguments() -> argparse.Namespace:
     p.add_argument("--model", required=True)
     p.add_argument("--rpc", required=True, help="same endpoint used for --rpc")
     p.add_argument("--prompt-file", required=True)
-    p.add_argument("--sessions", type=int, choices=(1, 4), default=1)
+    p.add_argument("--sessions", type=int, choices=(1, 2, 3, 4), default=1)
     p.add_argument("--pc-layers", type=int, default=32, help="first Phone HTP layer, 32..39")
     p.add_argument("--cpu-layers", type=int, default=16, help="PC CPU prefix layer count")
     p.add_argument("--context", type=int, default=512, help="fresh Prefill KV capacity, <=4096")
