@@ -147,7 +147,7 @@ struct jupiter_stage_dump_state {
     }
 };
 
-// Native Phone-owned Prefill (Qwen3-14B pilot). Unlike the legacy Jupiter
+// Native Phone-owned Prefill (dense Qwen3-14B/32B). Unlike the legacy Jupiter
 // path, the CPU GGML custom op calls Phone-local Graphs for the planned
 // contiguous Transformer suffix. The output head stays on PC CUDA. Only fresh
 // Prefill is supported: the Phone-owned KV has no Decode handoff yet.
@@ -165,8 +165,8 @@ struct jupiter_phone_owned_native_state {
     uint32_t chunk_count = 0;
     std::array<uint32_t, 16> chunk_schedule {};
     uint32_t next_chunk = 0;
-    uint32_t phone_first_layer = 32;
-    uint32_t phone_layers = 8;
+    uint32_t phone_first_layer = 0;
+    uint32_t phone_layers = 0;
     bool prepared = false;
     bool completed = false;
     bool failed = false;
@@ -275,19 +275,23 @@ struct jupiter_phone_owned_native_state {
             return false;
         }
         const auto & hp = model.hparams;
-        const int native_first = llama_jupiter::model_pc_layers(32);
+        const int model_layers = int(hp.n_layer());
+        const int native_first = llama_jupiter::model_pc_layers(model_layers - 8);
         const uint32_t native_ctx = cparams.n_ctx_seq;
-         if (model.arch != LLM_ARCH_QWEN3 || hp.n_layer() != 40 ||
-                hp.n_embd != 5120 || hp.n_head() != 40 ||
-                hp.n_head_kv() != 8 || hp.n_embd_head_k() != 128 ||
-                native_first < 32 || native_first >= 40 ||
+        const bool supported_dense_qwen3 =
+            model.arch == LLM_ARCH_QWEN3 && hp.n_embd == 5120 &&
+            hp.n_head_kv() == 8 && hp.n_embd_head_k() == 128 &&
+            ((model_layers == 40 && hp.n_head() == 40) ||
+             (model_layers == 64 && hp.n_head() == 64));
+        if (!supported_dense_qwen3 ||
+                native_first < model_layers - 8 || native_first >= model_layers ||
                 !cparams.flash_attn || cparams.n_ctx != native_ctx ||
                 native_ctx < 256 || native_ctx > 4096 ||
                 tokens < 2 || tokens > native_ctx ||
                 first_chunk == 0 || first_chunk > tokens ||
                 first_chunk > 4096 ||
                 !model.output || !model.output_norm) {
-            fail("UNSUPPORTED_QWEN3_14B_FRESH_PREFILL_SHAPE_OR_KV");
+            fail("UNSUPPORTED_QWEN3_14B_OR_32B_FRESH_PREFILL_SHAPE_OR_KV");
             return false;
         }
         for (ggml_backend_t backend : backends) {
@@ -338,7 +342,7 @@ struct jupiter_phone_owned_native_state {
             return false;
         }
         phone_first_layer = uint32_t(native_first);
-        phone_layers = 40 - phone_first_layer;
+        phone_layers = uint32_t(model_layers) - phone_first_layer;
         const uint32_t active_sessions = std::min(sessions, phone_layers);
         std::vector<uint32_t> devices(phone_layers, 0);
         for (uint32_t i = 0; i < phone_layers; ++i) {
@@ -3625,7 +3629,7 @@ llm_graph_params llama_context::graph_params(
             jupiter_phone_native ? jupiter_phone_owned_native_state::graph_compute : nullptr,
         /*.jupiter_phone_owned_user =*/ jupiter_phone_native.get(),
         /*.jupiter_phone_first_layer =*/
-            jupiter_phone_native ? llama_jupiter::model_pc_layers(32) : 0,
+            jupiter_phone_native ? llama_jupiter::model_pc_layers(int(model.hparams.n_layer())-8) : 0,
     };
 }
 
