@@ -265,6 +265,8 @@ struct rpc_msg_phone_owned_plan_req {
     uint32_t layer;
     uint32_t total_tokens;
     uint32_t chunk_tokens;
+    uint32_t schedule_count;
+    uint32_t schedule[16];
     uint32_t n_embd;
     uint32_t position_base;
     uint32_t kv_capacity;
@@ -283,7 +285,7 @@ struct rpc_msg_phone_owned_plan_req {
     float rope_beta_fast;
     float rope_beta_slow;
 };
-static_assert(sizeof(rpc_msg_phone_owned_plan_req) == 108,
+static_assert(sizeof(rpc_msg_phone_owned_plan_req) == 176,
               "Jupiter Phone-owned plan wire ABI changed");
 
 struct rpc_msg_phone_owned_prepare_req {
@@ -579,7 +581,8 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
     }
 
     // Legacy Graph registration needs patch 4; synchronous Phone-owned
-    // RUN needs patch 5; autonomous Phone PUSH/P2C requires patch 6.
+    // RUN needs patch 5; autonomous Phone PUSH/P2C with arbitrary
+    // Jupiter Sequence DP chunks requires patch 7.
     // Keep older non-native Jupiter modes backwards-compatible.
     const bool native_phone_owned =
         std::getenv("LLAMA_JUPITER_PHONE_OWNED_NATIVE") != nullptr &&
@@ -587,7 +590,7 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
     const bool autonomous_phone_owned =
         std::getenv("LLAMA_JUPITER_PHONE_OWNED_AUTONOMOUS") != nullptr &&
         std::atoi(std::getenv("LLAMA_JUPITER_PHONE_OWNED_AUTONOMOUS")) != 0;
-    const uint8_t required_patch = autonomous_phone_owned ? 6 :
+    const uint8_t required_patch = autonomous_phone_owned ? 7 :
         native_phone_owned ? 5 : jupiter_graph_prebuild_enabled() ? 4 : 0;
     if (required_patch != 0 &&
         (response.major != RPC_PROTO_MAJOR_VERSION ||
@@ -2087,6 +2090,8 @@ static void jupiter_phone_owned_copy_plan(To & dst, const From & src) {
     dst.layer = src.layer;
     dst.total_tokens = src.total_tokens;
     dst.chunk_tokens = src.chunk_tokens;
+    dst.schedule_count = src.schedule_count;
+    for (uint32_t i = 0; i < 16; ++i) { dst.schedule[i] = src.schedule[i]; }
     dst.n_embd = src.n_embd;
     dst.position_base = src.position_base;
     dst.kv_capacity = src.kv_capacity;
