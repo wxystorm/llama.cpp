@@ -36,6 +36,8 @@ def arguments() -> argparse.Namespace:
     p.add_argument("--target-tokens", type=int, default=175)
     p.add_argument("--chunks", default="88,87")
     p.add_argument("--mode", choices=("both", "legacy", "native"), default="both")
+    p.add_argument("--async-phone", action="store_true",
+                   help="overlap PC prefix of next Chunk with Phone suffix of previous Chunk")
     p.add_argument("--stage-dump", action="store_true",
                    help="debug only: export PC intermediate F32 stage tensors "
                         "(inserts scheduler synchronization; not for timing)")
@@ -128,6 +130,7 @@ def main() -> int:
             "LLAMA_JUPITER_LOCAL_GRAPH_REUSE": "0",
             "LLAMA_JUPITER_ASYNC_C2P": "0",
             "LLAMA_JUPITER_PHONE_OWNED_NATIVE": "1" if native else "0",
+            "LLAMA_JUPITER_PHONE_OWNED_ASYNC": "1" if native and args.async_phone else "0",
             "LLAMA_JUPITER_PHONE_OWNED_ENDPOINT": args.rpc,
             "LLAMA_JUPITER_TIMELINE": "1",
             "LLAMA_JUPITER_TRACE": "1",
