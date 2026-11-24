@@ -67,10 +67,10 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
              (n_layer == 64 && n_head == 64)) && n_embd == 5120 &&
             n_head_kv == 8 && n_embd_head == 128;
         GGML_ASSERT(dense_qwen3_supported &&
-                    phone_first >= int(n_layer) - 16 &&
-                    phone_first < int(n_layer) &&
+                    phone_first > 0 && phone_first < int(n_layer) &&
+                    int(n_layer) - phone_first <= 64 &&
                     "Phone-owned Prefill supports Qwen3-14B/32B"
-                    " 1..16 contiguous final HTP layers");
+                    " contiguous final HTP layers fitting 64 RPC slots");
     }
 
     inpL = build_inp_embd(model.tok_embd);
