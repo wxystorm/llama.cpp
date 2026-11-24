@@ -1,8 +1,12 @@
 """Model-free checks for strict resident request mapping and log isolation."""
 import tempfile
+import json
 import unittest
+import urllib.error
+from unittest.mock import patch
 from pathlib import Path
-from resident_runtime import request_payload, request_log
+from resident_runtime import (request_payload, request_log, run_resident_cli,
+                              is_request_timeout, timeout_marker, PREFIX)
 
 
 class TestResident(unittest.TestCase):
@@ -37,6 +41,38 @@ class TestResident(unittest.TestCase):
             env["LLAMA_JUPITER_SEQUENCE_PLAN"] = "96,95,77"
             with self.assertRaises(ValueError):
                 request_payload(cmd, env, config, "b"*32)
+
+    def test_legacy_timeout_stops_child_and_preserves_partial_trace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cmd, env, config = self.setup_case(root)
+            config.update(native=False, window=1)
+            env.update(LLAMA_JUPITER_PHONE_OWNED_NATIVE="0",
+                       LLAMA_JUPITER_PHONE_OWNED_AUTONOMOUS="0",
+                       LLAMA_JUPITER_WINDOW="1")
+            env.pop("LLAMA_JUPITER_LOGITS_DUMP_FILE")
+            cmd[cmd.index("-ub") + 1] = "128"
+            server_log, sample = root / "server.log", root / "sample.log"
+            server_log.write_text("startup\n", encoding="utf-8")
+            env.update({PREFIX + "URL": "http://127.0.0.1:1", PREFIX + "KEY": "test",
+                        PREFIX + "CONFIG": json.dumps(config), PREFIX + "LOG": str(server_log),
+                        PREFIX + "TIMEOUT": "120", PREFIX + "RECOVER_TIMEOUT": "1"})
+
+            def timeout(url, key, payload, seconds):
+                with server_log.open("a", encoding="utf-8") as stream:
+                    stream.write("partial sequence plan, no completion\n")
+                raise TimeoutError("timed out")
+
+            with patch("resident_runtime.http_json", side_effect=timeout):
+                with self.assertRaises(SystemExit) as raised:
+                    run_resident_cli(cmd, env, sample)
+            self.assertEqual(raised.exception.code, 75)
+            info = json.loads(timeout_marker(server_log).read_text(encoding="utf-8"))
+            self.assertEqual(info["reason"], "HTTP_REQUEST_TIMEOUT")
+            self.assertIn("partial sequence plan", Path(info["partial_trace"]).read_text())
+            self.assertNotIn("partial sequence plan", sample.read_text())
+            self.assertTrue(is_request_timeout(urllib.error.URLError(TimeoutError())))
+            self.assertFalse(is_request_timeout(ValueError("timed out")))
 
     def test_log_isolation(self):
         with tempfile.TemporaryDirectory() as tmp:

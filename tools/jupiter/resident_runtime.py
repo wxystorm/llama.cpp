@@ -149,20 +149,53 @@ def request_log(path, offset, request_id):
     return data[first:stop+1]
 
 
+def timeout_marker(server_log):
+    return Path(server_log).with_suffix(".timeout.json")
+
+
+def is_request_timeout(exc):
+    return isinstance(exc, TimeoutError) or (
+        isinstance(exc, urllib.error.URLError) and
+        isinstance(exc.reason, TimeoutError))
+
+
+def record_request_timeout(server_log, offset, request_id, log_path, exc):
+    # Keep partial traces SEPARATE from the canonical successful sample log.
+    # A partial trace can contain a valid-looking plan but no completed run.
+    archive = log_path.with_name(log_path.stem + ".timeout-" + request_id + ".log")
+    with server_log.open("rb") as stream:
+        stream.seek(offset)
+        archive.write_bytes(stream.read())
+    marker = timeout_marker(server_log)
+    temp = marker.with_suffix(".tmp")
+    temp.write_text(json.dumps({
+        "reason": "HTTP_REQUEST_TIMEOUT", "id": request_id,
+        "sample_log": str(log_path.resolve()), "partial_trace": str(archive.resolve()),
+        "error": str(exc),
+    }, indent=2) + "\n", encoding="utf-8")
+    temp.replace(marker)
+
+
 def run_resident_cli(command, env, log_path):
     log_path = Path(log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_bytes(b"")
     server_log = Path(env[PREFIX + "LOG"])
+    request_in_flight = False
     try:
+        if timeout_marker(server_log).is_file():
+            # Never enqueue on a worker with an unresolved timed-out request.
+            raise RuntimeError("resident request already timed out; restart required")
         request_id = uuid.uuid4().hex
         config = json.loads(env[PREFIX + "CONFIG"])
         payload = request_payload(list(command), env, config, request_id)
         offset = server_log.stat().st_size
         t0 = time.perf_counter()
+        request_in_flight = True
         status, result = http_json(env[PREFIX + "URL"] + "/jupiter/prefill",
                                    env[PREFIX + "KEY"], payload,
                                    float(env[PREFIX + "TIMEOUT"]))
+        request_in_flight = False
         wall_ms = (time.perf_counter() - t0)*1000
         if status != 200:
             try:
@@ -209,6 +242,14 @@ def run_resident_cli(command, env, log_path):
         with log_path.open("ab") as stream:
             stream.write(f"\n[JUPITER_RESIDENT_ERROR] {exc}\nserver_log={server_log}\n".encode("utf-8"))
         print(f"[JUPITER_RESIDENT_ERROR] {exc}; see {log_path}", flush=True)
+        if request_in_flight and is_request_timeout(exc) and env.get(PREFIX + "RECOVER_TIMEOUT") == "1":
+            record_request_timeout(server_log, offset, request_id, log_path, exc)
+            print(f"[JUPITER_RESIDENT_TIMEOUT] id={request_id} "
+                  f"timeout_seconds={env[PREFIX + 'TIMEOUT']} sample={log_path}", flush=True)
+            # Stage2 catches ordinary RuntimeError and proceeds to the next
+            # sample; exit the child immediately instead. Completed samples
+            # have already been checkpointed. The suite owns the restart.
+            raise SystemExit(75)
         return 1
 
 
@@ -225,7 +266,8 @@ class ResidentServer:
         self.log = Path(output) / "resident-runtime" / (
             ("native" if native else "legacy") + "-" + uuid.uuid4().hex + ".log")
         self.key = uuid.uuid4().hex + uuid.uuid4().hex
-        self.timeout = max(1800, args.timeout_seconds)
+        self.timeout = (max(1800, args.timeout_seconds) if native else
+                        getattr(args, "legacy_request_timeout", 120))
         self.start_timeout = getattr(args, "resident_start_timeout", 1800)
         self.proc = self.url = None
 
@@ -295,7 +337,8 @@ class ResidentServer:
         return {PREFIX + "URL": self.url, PREFIX + "KEY": self.key,
                 PREFIX + "LOG": str(self.log.resolve()),
                 PREFIX + "CONFIG": json.dumps(self.config),
-                PREFIX + "TIMEOUT": str(self.timeout)}
+                PREFIX + "TIMEOUT": str(self.timeout),
+                PREFIX + "RECOVER_TIMEOUT": str(int(not self.config["native"]))}
 
     def close(self):
         proc = self.proc

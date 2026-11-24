@@ -22,6 +22,9 @@ param(
     [switch]$UseServer,
     [switch]$SkipLegacyLogitsCheck,
     [int]$ResidentStartTimeout = 1800,
+    [int]$LegacyRequestTimeout = 120,
+    [int]$LegacyRestartPrompts = 10,
+    [int]$LegacyTimeoutRetries = 2,
     [ValidateSet("auto", "14b", "32b")]
     [string]$ModelSize = "auto",
     [string]$Model = "",
@@ -103,7 +106,10 @@ try {
             throw "Missing resident server: $ServerExe. Build llama-server first."
         }
         $argsList += @("--resident-server", $ServerExe,
-                       "--resident-start-timeout", [string]$ResidentStartTimeout)
+                       "--resident-start-timeout", [string]$ResidentStartTimeout,
+                       "--legacy-request-timeout", [string]$LegacyRequestTimeout,
+                       "--legacy-restart-prompts", [string]$LegacyRestartPrompts,
+                       "--legacy-timeout-retries", [string]$LegacyTimeoutRetries)
     }
     if ($SkipLegacyLogitsCheck) { $argsList += "--skip-legacy-logits-check" }
     if ($OutDir) { $argsList += @("--out-dir", $OutDir) }

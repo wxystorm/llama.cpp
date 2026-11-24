@@ -31,13 +31,19 @@ from run_phone_owned_full_prefill import logits_comparison, read_logits
 from run_phone_owned_multi_prompt import count_model_tokens
 from phone_owned_models import inspect_model, resolve_splits
 from run_prefill_bench import read_plan
-from resident_runtime import ResidentServer
+from resident_runtime import ResidentServer, timeout_marker
 
 PROMPT_NAME = re.compile(r"^prompt_(.+)_(\d+)$", re.IGNORECASE)
 CHUNK_BUCKETS = (32, 64, 88, 96, 128, 192, 256, 384, 512, 768, 1024, 2048, 4096)
 # ShareGPT40: exactly five Prompt-length groups, ten prompts each.
 # Do not accidentally include the separate 2048 / 2048-4000 group.
 DEFAULT_GROUPS = "0,128,256,512,1024"
+# Only this exact previously shipped operational implementation may migrate.
+# Git for Windows can check out these identical files with either LF or CRLF.
+# All binaries, model, inputs, planner hashes and measurement options must
+# still match byte-for-byte the old manifest configuration.
+PRE_RECOVERY_CLIENT_SHA256 = ["cd94abdd509e680da0e98a40bd0e09fa8dc34dbf6314a8a4b8185ea83f3c881f","a5c3347df8fb4d947fa6d675e10a76512d8b3f143b9ca29b619479eae57c43de"]
+PRE_RECOVERY_DRIVER_SHA256 = ["ac6cb9b98f22a4ce317e6842e0c0cccdefafcb2a31db2d6d4957f46df374fba7","f2d45deb7cfa65191f0dce4e4a954066316aac251881c33a45f114e26d9348e1"]
 FIELDNAMES = (
     "layout", "group", "prompt", "kind", "repeat", "status", "tokens",
     "context", "chunks", "chunk_size", "n_chunks",
@@ -132,6 +138,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--resident-server", default=None,
                    help="opt-in rebuilt llama-server: resident calibration then native Prefill")
     p.add_argument("--resident-start-timeout", type=int, default=1800)
+    p.add_argument("--legacy-request-timeout", type=int, default=120,
+                   help="seconds per Legacy calibration HTTP request; native unchanged")
+    p.add_argument("--legacy-restart-prompts", type=int, default=10,
+                   help="restart Legacy after this many NEW completed Stage3 plans; 0 disables")
+    p.add_argument("--legacy-timeout-retries", type=int, default=2,
+                   help="additional worker restarts per timed-out Stage2/3 job")
     p.add_argument("--skip-legacy-logits-check", action="store_true",
                    help="resident Stage2/3 timing only; tolerate nonfinite legacy logits, "
                         "never weaken native output checks")
@@ -225,6 +237,28 @@ def discover(root: Path, pattern: str,
     return files
 
 
+def manifest_digest(config):
+    return hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
+
+
+def migrate_pre_recovery_manifest(old, config, resume):
+    """Allow the known control-layer-only upgrade, never arbitrary mismatch."""
+    previous = old.get("config")
+    if not resume or not isinstance(previous, dict):
+        return False
+    if old.get("sha256") != manifest_digest(previous):
+        return False
+    if (config.get("execution_backend") != "resident-server" or
+            previous.get("resident_client_sha256") not in PRE_RECOVERY_CLIENT_SHA256 or
+            previous.get("driver_sha256") not in PRE_RECOVERY_DRIVER_SHA256):
+        return False
+    expected = dict(config)
+    expected.pop("legacy_recovery_policy", None)
+    expected["resident_client_sha256"] = previous["resident_client_sha256"]
+    expected["driver_sha256"] = previous["driver_sha256"]
+    return expected == previous
+
+
 def preflight(args: argparse.Namespace, files: list[Path],
               layouts: list[int], output: Path) -> dict:
     cache_file = output / "token-cache.json"
@@ -302,15 +336,33 @@ def preflight(args: argparse.Namespace, files: list[Path],
             )
         },
     }
-    signature = hashlib.sha256(
-        json.dumps(config, sort_keys=True).encode()).hexdigest()
+    if args.resident_server:
+        config["legacy_recovery_policy"] = {
+            "request_timeout_seconds": getattr(args, "legacy_request_timeout", 120),
+            "restart_new_plans": getattr(args, "legacy_restart_prompts", 10),
+            "timeout_retries": getattr(args, "legacy_timeout_retries", 2),
+        }
+    signature = manifest_digest(config)
     manifest = {"sha256": signature, "config": config}
     manifest_path = output / "suite-manifest.json"
     if manifest_path.exists():
         old = json.loads(manifest_path.read_text(encoding="utf-8"))
         if old.get("sha256") != signature:
-            raise ValueError("Existing output uses different files/options. "
-                             "Choose a new --out-dir, not --resume.")
+            if not migrate_pre_recovery_manifest(old, config, args.resume):
+                raise ValueError("Existing output uses different files/options. "
+                                 "Choose a new --out-dir, not --resume.")
+            backup = output / ("suite-manifest.pre-recovery-" + old["sha256"][:16] + ".json")
+            if backup.exists():
+                if json.loads(backup.read_text(encoding="utf-8")) != old:
+                    raise ValueError("Existing pre-recovery manifest backup differs")
+            else:
+                write_json(backup, old)
+            manifest["previous_manifest_sha256"] = old["sha256"]
+            print(f"[PHONE_SUITE_MANIFEST_MIGRATION] old={old['sha256']} "
+                  f"new={signature} backup={backup} "
+                  "reason=RECOVERY_CONTROL_ONLY status=PASS", flush=True)
+        elif "previous_manifest_sha256" in old:
+            manifest["previous_manifest_sha256"] = old["previous_manifest_sha256"]
         if not args.resume and any(output.glob("cases/**/case-result.json")):
             raise ValueError("This output already has results; pass --resume "
                              "or choose a new --out-dir.")
@@ -434,8 +486,81 @@ def calibration_env(args: argparse.Namespace) -> dict[str, str]:
     return env
 
 
+class LegacyCalibration:
+    """Own one Legacy model at a time; retry only explicitly recorded timeouts.
+
+    Rotation is a scheduling policy, not an alteration of the DP objective.
+    Never retry a numerical/configuration/plan error as a transport timeout.
+    """
+    def __init__(self, args, layout, output, ubatch):
+        self.args, self.layout, self.output, self.ubatch = args, layout, output, ubatch
+        self.runtime = None
+        self.new_plans = 0
+
+    def __enter__(self):
+        return self
+
+    def start(self):
+        if self.runtime is None:
+            runtime = ResidentServer(self.args, self.layout, False, self.output, self.ubatch)
+            runtime.__enter__()
+            self.runtime = runtime
+            self.args._resident_env = runtime.child_env()
+            self.new_plans = 0
+
+    def close(self):
+        try:
+            if self.runtime is not None:
+                self.runtime.close()
+        finally:
+            self.runtime = None
+            self.args._resident_env = {}
+            self.new_plans = 0
+
+    def __exit__(self, *_exc):
+        self.close()
+
+    def run(self, command, log, *, count_plan=False):
+        retries = self.args.legacy_timeout_retries
+        for attempt in range(retries + 1):
+            self.start()
+            marker = timeout_marker(self.runtime.log)
+            try:
+                child_run(command, log, 0, env=calibration_env(self.args))
+            except RuntimeError:
+                if not marker.is_file():
+                    raise
+                failure = json.loads(marker.read_text(encoding="utf-8"))
+                if failure.get("reason") != "HTTP_REQUEST_TIMEOUT":
+                    raise
+                # Preserve the failed child output before the next child
+                # truncates its regular stdout log. Exact q CSVs stay intact.
+                archived = log.with_name(log.stem + ".timeout-" + failure["id"] + log.suffix)
+                if log.is_file():
+                    log.replace(archived)
+                print(f"[PHONE_SUITE_LEGACY_TIMEOUT] attempt={attempt+1}/{retries+1} "
+                      f"sample={failure['sample_log']} saved={archived}", flush=True)
+                self.close()
+                if attempt == retries:
+                    raise RuntimeError("Legacy HTTP timeout retry budget exhausted. "
+                                       "Restart Phone RPC/HTP and resume the same output directory.")
+                print(f"[PHONE_SUITE_LEGACY_RESTART] reason=HTTP_TIMEOUT "
+                      f"retry={attempt+1}/{retries} resume=1", flush=True)
+                continue
+            if marker.is_file():
+                raise RuntimeError("Legacy child unexpectedly succeeded after a request timeout")
+            if count_plan:
+                self.new_plans += 1
+                limit = self.args.legacy_restart_prompts
+                if limit and self.new_plans >= limit:
+                    print(f"[PHONE_SUITE_LEGACY_ROTATE] completed_new_plans={self.new_plans} "
+                          "reason=PERIODIC_RESTART", flush=True)
+                    self.close()
+            return
+
+
 def stage2_for_layout(args: argparse.Namespace, cases: list[dict],
-                      layout: int, output: Path) -> Path:
+                      layout: int, output: Path, legacy=None) -> Path:
     if args.min_chunk_json:
         source = Path(args.min_chunk_json).resolve()
     else:
@@ -469,8 +594,11 @@ def stage2_for_layout(args: argparse.Namespace, cases: list[dict],
             print(f"[PHONE_SUITE_STAGE2] layout={layout}"
                   f" sample={sample['name']} tokens={sample['tokens']}"
                   " policy=MEASURED_MINIMUM_B status=RUN", flush=True)
-            child_run(command, stage2 / "stage2-runner.stdout.log", 0,
-                      env=calibration_env(args))
+            if legacy is None:
+                child_run(command, stage2 / "stage2-runner.stdout.log", 0,
+                          env=calibration_env(args))
+            else:
+                legacy.run(command, stage2 / "stage2-runner.stdout.log")
     if not source.is_file():
         raise RuntimeError(f"Jupiter Stage2 min-chunk.json missing: {source}")
     info = json.loads(source.read_text(encoding="utf-8-sig"))
@@ -485,7 +613,7 @@ def stage2_for_layout(args: argparse.Namespace, cases: list[dict],
 
 
 def exact_jupiter_dp_plan(args: argparse.Namespace, case: dict,
-                          output: Path, stage2_json: Path) -> dict:
+                          output: Path, stage2_json: Path, legacy=None) -> dict:
     target = output / "calibration" / f"l{case['layout']:02d}" / \
         "plans" / case["name"].removesuffix(".txt")
     stage3 = target / "stage3"
@@ -529,8 +657,14 @@ def exact_jupiter_dp_plan(args: argparse.Namespace, case: dict,
         print(f"[PHONE_SUITE_STAGE3] layout={case['layout']}"
               f" prompt={case['name']} tokens={case['tokens']}"
               " policy=EXACT_MEASURED_Q_DP status=RUN", flush=True)
-        child_run(command, target / "stage3-runner.stdout.log", 0,
-                  env=calibration_env(args))
+        if legacy is None:
+            child_run(command, target / "stage3-runner.stdout.log", 0,
+                      env=calibration_env(args))
+        else:
+            legacy.run(command, target / "stage3-runner.stdout.log", count_plan=True)
+    elif legacy is not None:
+        print(f"[PHONE_SUITE_DP_RESUME] layout={case['layout']} "
+              f"prompt={case['name']} status=REUSE_PLAN", flush=True)
     if not plan_file.is_file() or not summary_path.is_file():
         raise RuntimeError(f"Jupiter Stage3 plan incomplete: {target}")
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
@@ -830,6 +964,16 @@ def run() -> int:
     args.run_mode = getattr(args, "run_mode", "both")
     args.resident_server = getattr(args, "resident_server", None)
     args.resident_start_timeout = getattr(args, "resident_start_timeout", 1800)
+    args.legacy_request_timeout = getattr(args, "legacy_request_timeout", 120)
+    args.legacy_restart_prompts = getattr(args, "legacy_restart_prompts", 10)
+    args.legacy_timeout_retries = getattr(args, "legacy_timeout_retries", 2)
+    if (args.legacy_request_timeout <= 0 or args.legacy_restart_prompts < 0 or
+            args.legacy_timeout_retries < 0):
+        raise ValueError("invalid Legacy recovery policy")
+    if args.resident_server:
+        print(f"[PHONE_SUITE_LEGACY_POLICY] request_timeout_seconds={args.legacy_request_timeout} "
+              f"restart_new_plans={args.legacy_restart_prompts} "
+              f"timeout_retries={args.legacy_timeout_retries}", flush=True)
     args.skip_legacy_logits_check = getattr(args, "skip_legacy_logits_check", False)
     if args.skip_legacy_logits_check and (not args.resident_server or args.sequence_policy != "jupiter-dp"):
         raise ValueError("--skip-legacy-logits-check requires resident jupiter-dp calibration")
@@ -947,19 +1091,16 @@ def execute_resident_suite(args, cases, output, plan, layout):
     resident_plans = {}
     ubatch = args.max_chunk
     if args.sequence_policy == "jupiter-dp":
-        with ResidentServer(args, layout, False, output, ubatch) as runtime:
-            args._resident_env = runtime.child_env()
-            try:
-                stage2 = stage2_for_layout(args, cases, layout, output)
-                for index, case in enumerate(pending, 1):
-                    key = (case["layout"], case["path"])
-                    if key in resident_plans:
-                        continue
-                    print(f"[PHONE_SUITE_RESIDENT_CALIBRATION] {index}/{len(pending)} "
-                          f"prompt={case['name']}", flush=True)
-                    resident_plans[key] = exact_jupiter_dp_plan(args, case, output, stage2)
-            finally:
-                args._resident_env = {}
+        with LegacyCalibration(args, layout, output, ubatch) as legacy:
+            stage2 = stage2_for_layout(args, cases, layout, output, legacy=legacy)
+            for index, case in enumerate(pending, 1):
+                key = (case["layout"], case["path"])
+                if key in resident_plans:
+                    continue
+                print(f"[PHONE_SUITE_RESIDENT_CALIBRATION] {index}/{len(pending)} "
+                      f"prompt={case['name']}", flush=True)
+                resident_plans[key] = exact_jupiter_dp_plan(
+                    args, case, output, stage2, legacy=legacy)
     else:
         ubatch = max(ubatch, max(max(case["chunks"]) for case in cases))
     with ResidentServer(args, layout, True, output, ubatch) as runtime:
