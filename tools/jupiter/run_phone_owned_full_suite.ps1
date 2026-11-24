@@ -18,6 +18,9 @@
 param(
     [string]$Exe = ".\build-phone-owned\bin\Release\llama-cli.exe",
     [string]$Tokenizer = ".\build-phone-owned\bin\Release\llama-tokenize.exe",
+    [string]$ServerExe = ".\build-phone-owned\bin\Release\llama-server.exe",
+    [switch]$UseServer,
+    [int]$ResidentStartTimeout = 1800,
     [ValidateSet("auto", "14b", "32b")]
     [string]$ModelSize = "auto",
     [string]$Model = "",
@@ -94,6 +97,13 @@ try {
         "--max-rounds", [string]$MaxRounds,
         "--timeout-seconds", [string]$TimeoutSeconds
     )
+    if ($UseServer) {
+        if (!(Test-Path -LiteralPath $ServerExe)) {
+            throw "Missing resident server: $ServerExe. Build llama-server first."
+        }
+        $argsList += @("--resident-server", $ServerExe,
+                       "--resident-start-timeout", [string]$ResidentStartTimeout)
+    }
     if ($OutDir) { $argsList += @("--out-dir", $OutDir) }
     if ($Layouts) { $argsList += @("--layouts", $Layouts) }
     if ($CpuLayers -ge 0) { $argsList += @("--cpu-layers", [string]$CpuLayers) }

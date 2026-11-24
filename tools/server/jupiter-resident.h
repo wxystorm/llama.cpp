@@ -89,6 +89,8 @@ inline int jupiter_resident_server(common_params & params) {
     jr_set_env("LLAMA_JUPITER_PHONE_OWNED_ASYNC", "0");
 
     const bool native = jr_env_enabled("LLAMA_JUPITER_PHONE_OWNED_NATIVE");
+    const int resident_window = native ? 2 : 1;
+    jr_set_env("LLAMA_JUPITER_WINDOW", std::to_string(resident_window));
     auto loaded = common_init_from_params(params);
     if (!loaded || !loaded->model() || !loaded->context()) {
         return 1;
@@ -128,7 +130,10 @@ inline int jupiter_resident_server(common_params & params) {
             if (!jr_id_valid(id)) {
                 throw std::invalid_argument("invalid request id");
             }
-            const auto prompt = body.at("prompt").get<std::string>();
+            auto prompt = body.at("prompt").get<std::string>();
+            if (params.escape) {
+                string_process_escapes(prompt);
+            }
             if (prompt.empty()) {
                 throw std::invalid_argument("empty Prompt");
             }
@@ -144,7 +149,7 @@ inline int jupiter_resident_server(common_params & params) {
             user.content = prompt;
             inputs.messages.push_back(std::move(user));
             const auto formatted = common_chat_templates_apply(templates.get(), inputs).prompt;
-            auto tokens = common_tokenize(vocab, formatted, true, true);
+            auto tokens = common_tokenize(vocab, formatted, llama_vocab_get_add_bos(vocab), true);
             const auto cuts = body.value("chunks", std::vector<uint32_t>{});
             const auto expected = body.value("expected_tokens", uint32_t(0));
             if (tokens.size() < 2 || tokens.size() > llama_n_ctx(ctx) ||
@@ -171,8 +176,8 @@ inline int jupiter_resident_server(common_params & params) {
                 throw std::invalid_argument("Autonomous requires a native resident model");
             }
             const int window = body.value("window", 1);
-            if (window != 1 && window != 2) {
-                throw std::invalid_argument("resident experiment supports windows 1 and 2");
+            if (window != resident_window) {
+                throw std::invalid_argument("window differs from immutable scheduler capacity");
             }
 
             jr_marker("BEGIN", id, "RUN");
@@ -180,7 +185,6 @@ inline int jupiter_resident_server(common_params & params) {
             // These flags are read at decode/graph execution time. Geometry,
             // placement, session count and model remain immutable at startup.
             jr_set_env("LLAMA_JUPITER_SEQUENCE_PLAN", sequence);
-            jr_set_env("LLAMA_JUPITER_WINDOW", std::to_string(window));
             jr_set_env("LLAMA_JUPITER_PHONE_OWNED_AUTONOMOUS", autonomous ? "1" : "0");
             const auto flags = body.value("flags", jr_json::object());
             for (const auto * key : {"TRACE", "PROFILE_STAGE", "Q_SWEEP", "TIMELINE",

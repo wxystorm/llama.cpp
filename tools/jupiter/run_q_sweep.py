@@ -21,6 +21,8 @@ import sys
 from pathlib import Path
 from typing import Iterable, List, Sequence
 
+from resident_runtime import enabled as resident_enabled, run_resident_cli
+
 
 PLAN_RE = re.compile(
     r"\[JUPITER_SEQUENCE_PLAN\].*?total=(\d+).*?chunks=([0-9,]+)"
@@ -184,6 +186,8 @@ def stream_process(
     - bytes are decoded by us, so one malformed model-output byte cannot kill
       the runner.
     """
+    if resident_enabled(env):
+        return run_resident_cli(list(cmd), env, log_path)
     with log_path.open("w", encoding="utf-8", newline="\n") as log:
         proc = subprocess.Popen(
             list(cmd),

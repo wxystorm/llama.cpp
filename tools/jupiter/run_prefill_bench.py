@@ -25,6 +25,7 @@ import sys
 from pathlib import Path
 
 from run_q_sweep import make_sweep_plan
+from resident_runtime import enabled as resident_enabled, run_resident_cli
 
 
 PROMPT_RE = re.compile(
@@ -130,20 +131,20 @@ def run_one(
     log: Path,
 ) -> None:
     log.parent.mkdir(parents=True, exist_ok=True)
-    with log.open("wb") as f:
-        proc = subprocess.run(
-            command,
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=f,
-            stderr=subprocess.STDOUT,
-            check=False,
-        )
-    if proc.returncode:
+    if resident_enabled(env):
+        rc = run_resident_cli(command, env, log)
+    else:
+        with log.open("wb") as f:
+            proc = subprocess.run(
+                command, env=env, stdin=subprocess.DEVNULL,
+                stdout=f, stderr=subprocess.STDOUT, check=False,
+            )
+        rc = proc.returncode
+    if rc:
         lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
         tail = "\n".join(lines[-45:])
         raise RuntimeError(
-            f"llama-cli exited {proc.returncode} (0x{proc.returncode & 0xffffffff:08X}); "
+            f"Prefill runner exited {rc} (0x{rc & 0xffffffff:08X}); "
             f"inspect log: {log}\n"
             f"--- last 45 lines of llama-cli ---\n{tail}"
         )

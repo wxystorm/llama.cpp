@@ -200,7 +200,9 @@ def verify_runtime(args: argparse.Namespace, plan: Path, chunks: list[int],
         "LLAMA_JUPITER_GRAPH_PREBUILD": "0",
         "LLAMA_JUPITER_TIMELINE": "0",
         "LLAMA_JUPITER_Q_SWEEP": "0",
-        "LLAMA_JUPITER_WINDOW": "2",
+        # Verification checks the exact cuts, not benchmark performance.
+        # The resident legacy scheduler has one immutable copy.
+        "LLAMA_JUPITER_WINDOW": ("1" if env.get("LLAMA_JUPITER_RESIDENT_URL") else "2"),
         "LLAMA_JUPITER_LOGITS_TOP10": "0",
     })
     env.pop("LLAMA_JUPITER_SEQUENCE_PLAN", None)

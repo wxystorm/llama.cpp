@@ -31,6 +31,7 @@ from run_phone_owned_full_prefill import logits_comparison, read_logits
 from run_phone_owned_multi_prompt import count_model_tokens
 from phone_owned_models import inspect_model, resolve_splits
 from run_prefill_bench import read_plan
+from resident_runtime import ResidentServer
 
 PROMPT_NAME = re.compile(r"^prompt_(.+)_(\d+)$", re.IGNORECASE)
 CHUNK_BUCKETS = (32, 64, 88, 96, 128, 192, 256, 384, 512, 768, 1024, 2048, 4096)
@@ -41,6 +42,8 @@ FIELDNAMES = (
     "layout", "group", "prompt", "kind", "repeat", "status", "tokens",
     "context", "chunks", "chunk_size", "n_chunks",
     "min_chunk", "plan_source", "plan_file", "run_mode", "first_mode",
+    "execution_backend", "prefill_metric", "sync_reset_ms", "autonomous_reset_ms",
+    "sync_request_wall_ms", "autonomous_request_wall_ms",
     "sync_ms", "autonomous_ms", "sync_tok_s", "autonomous_tok_s",
     "speedup", "sync_cache_hit", "autonomous_cache_hit",
     "warm_comparable", "top1_same", "max_abs", "relative_rmse",
@@ -126,6 +129,9 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--exe", required=True, help="rebuilt llama-cli.exe")
     p.add_argument("--tokenizer", required=True, help="matching llama-tokenize.exe")
+    p.add_argument("--resident-server", default=None,
+                   help="opt-in rebuilt llama-server: resident calibration then native Prefill")
+    p.add_argument("--resident-start-timeout", type=int, default=1800)
     p.add_argument("--model", required=True, help="dense Qwen3-14B/32B GGUF")
     p.add_argument("--model-size", choices=("auto", "14b", "32b"),
                    default="auto", help="verify GGUF architecture; default auto")
@@ -251,6 +257,11 @@ def preflight(args: argparse.Namespace, files: list[Path],
               f" tokens={n_tokens} ctx={ctx} chunks={chunks or 'JUPITER_DP_PENDING'}", flush=True)
     config = {
         "format": 1,
+        "execution_backend": "resident-server" if args.resident_server else "cli",
+        "resident_server": (file_signature(Path(args.resident_server))
+                            if args.resident_server else None),
+        "resident_client_sha256": hashlib.sha256(
+            Path(__file__).with_name("resident_runtime.py").read_bytes()).hexdigest(),
         "exe": file_signature(Path(args.exe)),
         "tokenizer": tokenizer_id,
         "model": model_id, "model_size": args.model_size,
@@ -414,6 +425,7 @@ def calibration_env(args: argparse.Namespace) -> dict[str, str]:
     })
     env.pop("LLAMA_JUPITER_SEQUENCE_PLAN", None)
     env.pop("LLAMA_JUPITER_PLAN_FILE", None)
+    env.update(getattr(args, "_resident_env", {}))
     return env
 
 
@@ -551,8 +563,10 @@ def exact_jupiter_dp_plan(args: argparse.Namespace, case: dict,
 def run_mode(args: argparse.Namespace, case: dict,
              mode: str, work: Path) -> dict:
     work.mkdir(parents=True, exist_ok=True)
+    child_env = os.environ.copy()
+    child_env.update(getattr(args, "_resident_env", {}))
     child_run(cli_for_case(args, case, mode, work),
-              work / "runner.stdout.log", args.timeout_seconds)
+              work / "runner.stdout.log", args.timeout_seconds, env=child_env)
     report = json.loads(
         (work / "results.json").read_text(encoding="utf-8"))["native"]
     log_file = work / "native-full-prefill.log"
@@ -588,7 +602,11 @@ def run_mode(args: argparse.Namespace, case: dict,
             "cache_hit": prep["zero_explicit_prepare_phases"],
             "top1": report["top1"],
             "logits": str(logits), "log": str(log_file),
-            "timing_tokens": report.get("prompt_eval_timing_tokens")}
+            "timing_tokens": report.get("prompt_eval_timing_tokens"),
+            "execution_backend": report.get("execution_backend", "cli"),
+            "prefill_metric": report.get("prefill_metric", "CLI_PROMPT_EVAL"),
+            "resident_reset_ms": report.get("resident_reset_ms"),
+            "resident_request_wall_ms": report.get("resident_request_wall_ms")}
 
 
 def parity_ok(parity: dict) -> bool:
@@ -676,6 +694,12 @@ def csv_row(row: dict) -> dict:
         "plan_file": row.get("plan_file", ""),
         "run_mode": row.get("run_mode", "both"),
         "first_mode": row.get("first_mode", ""),
+        "execution_backend": row.get("execution_backend", "cli"),
+        "prefill_metric": (auto or sync).get("prefill_metric", ""),
+        "sync_reset_ms": sync.get("resident_reset_ms"),
+        "autonomous_reset_ms": auto.get("resident_reset_ms"),
+        "sync_request_wall_ms": sync.get("resident_request_wall_ms"),
+        "autonomous_request_wall_ms": auto.get("resident_request_wall_ms"),
         "sync_ms": sync.get("ms"), "autonomous_ms": auto.get("ms"),
         "sync_tok_s": round(tokens*1000/sync["ms"], 3) if sync.get("ms") else "",
         "autonomous_tok_s": round(tokens*1000/auto["ms"], 3) if auto.get("ms") else "",
@@ -727,6 +751,7 @@ def group_summaries(rows: list[dict]) -> list[dict]:
         result.append({
             "layout": layout, "group": group,
             "run_mode": items[0].get("run_mode", "both"),
+            "execution_backend": items[0].get("execution_backend", "cli"),
             "passed_cases": len(items),
             "passed_pairs": sum(x.get("speedup") is not None for x in items),
             "distinct_prompts": len({x["name"] for x in items}),
@@ -767,6 +792,7 @@ def publish(output: Path, rows: list[dict],
     summary = {
         "manifest_sha256": manifest_sha,
         "run_mode": mode,
+        "execution_backend": (rows[0].get("execution_backend", "cli") if rows else ""),
         "expected_cases": expected_cases,
         "finished_cases": len(rows),
         "remaining_cases": expected_cases-len(rows),
@@ -794,6 +820,8 @@ def run() -> int:
     args = parse_args()
     # Retain backward-compatible programmatic callers with no run_mode.
     args.run_mode = getattr(args, "run_mode", "both")
+    args.resident_server = getattr(args, "resident_server", None)
+    args.resident_start_timeout = getattr(args, "resident_start_timeout", 1800)
     selected_modes(args.run_mode)
     if args.run_mode != "both":
         args.no_warmup = True
@@ -809,6 +837,19 @@ def run() -> int:
         args.out_dir = f"jupiter-autonomous-{model.family}-dp-2048"
         if args.run_mode != "both":
             args.out_dir += f"-{args.run_mode}-only"
+        if args.resident_server:
+            args.out_dir += "-resident"
+    if args.resident_server:
+        if len(layouts) != 1:
+            raise ValueError("resident experiment requires one immutable layout per suite")
+        if args.continue_on_error:
+            raise ValueError("resident fails closed after a device error; resume after recovery")
+        if args.min_chunk_json:
+            raise ValueError("resident requires its own Stage2 calibration; do not mix CLI profiles")
+        if not Path(args.resident_server).is_file():
+            raise FileNotFoundError(args.resident_server)
+        if args.resident_start_timeout <= 0:
+            raise ValueError("resident startup timeout must be positive")
     print(f"[PHONE_SUITE_MODEL] model=Qwen3-{model.family.upper()}"
           f" layers={model.layers} CPU={args.cpu_layers}"
           f" first_phone={layouts} GPU={[x-args.cpu_layers for x in layouts]}"
@@ -852,9 +893,11 @@ def run() -> int:
     cases = build_cases(plan, layouts, args.repeats, args.revisit_first)
     for case in cases:
         case["run_mode"] = args.run_mode
+        case["execution_backend"] = "resident-server" if args.resident_server else "cli"
     print(f"[PHONE_SUITE] model=Qwen3-{model.family.upper()}"
           f" prompts={len(files)} layouts={layouts} run_mode={args.run_mode}"
           f" repeats={args.repeats} total_cases={len(cases)}"
+          f" backend={'resident-server' if args.resident_server else 'cli'}"
           f" measured_runs={len(cases)*len(selected_modes(args.run_mode))}"
           f" context=2048 batch=2048 sequence_policy={args.sequence_policy}"
           f" warmup={not args.no_warmup} status=PLANNED", flush=True)
@@ -863,6 +906,52 @@ def run() -> int:
               " dry_run=PASS")
         return 0
 
+    if not args.resident_server:
+        return execute_cases(args, cases, output, plan)
+    return execute_resident_suite(args, cases, output, plan, layouts[0])
+
+
+def execute_resident_suite(args, cases, output, plan, layout):
+    # Never load two copies of a 14B/32B model at once. First finish all
+    # remaining exact DP plans on one legacy model; then release it and
+    # measure all prompts on one native model. Completed cases are retained.
+    def pending_case(case):
+        path = case_directory(output, case) / "case-result.json"
+        if not args.resume or not path.is_file():
+            return True
+        return not completed_case_matches(
+            json.loads(path.read_text(encoding="utf-8")), args.run_mode)
+
+    pending = [case for case in cases if pending_case(case)]
+    if not pending:
+        return execute_cases(args, cases, output, plan, resident_plans={})
+    resident_plans = {}
+    ubatch = args.max_chunk
+    if args.sequence_policy == "jupiter-dp":
+        with ResidentServer(args, layout, False, output, ubatch) as runtime:
+            args._resident_env = runtime.child_env()
+            try:
+                stage2 = stage2_for_layout(args, cases, layout, output)
+                for index, case in enumerate(pending, 1):
+                    key = (case["layout"], case["path"])
+                    if key in resident_plans:
+                        continue
+                    print(f"[PHONE_SUITE_RESIDENT_CALIBRATION] {index}/{len(pending)} "
+                          f"prompt={case['name']}", flush=True)
+                    resident_plans[key] = exact_jupiter_dp_plan(args, case, output, stage2)
+            finally:
+                args._resident_env = {}
+    else:
+        ubatch = max(ubatch, max(max(case["chunks"]) for case in cases))
+    with ResidentServer(args, layout, True, output, ubatch) as runtime:
+        args._resident_env = runtime.child_env()
+        try:
+            return execute_cases(args, cases, output, plan, resident_plans=resident_plans)
+        finally:
+            args._resident_env = {}
+
+
+def execute_cases(args, cases, output, plan, resident_plans=None):
     rows = []
     reference = {}
     stage2_by_layout = {}
@@ -889,11 +978,16 @@ def run() -> int:
             try:
                 if args.sequence_policy == "jupiter-dp":
                     layout = case["layout"]
-                    if layout not in stage2_by_layout:
-                        stage2_by_layout[layout] = stage2_for_layout(
-                            args, cases, layout, output)
-                    case = exact_jupiter_dp_plan(
-                        args, case, output, stage2_by_layout[layout])
+                    if resident_plans is not None:
+                        planned = resident_plans[(layout, case["path"])]
+                        case = dict(case, **{k: planned[k] for k in
+                                    ("chunks", "plan_file", "plan_source", "min_chunk")})
+                    else:
+                        if layout not in stage2_by_layout:
+                            stage2_by_layout[layout] = stage2_for_layout(
+                                args, cases, layout, output)
+                        case = exact_jupiter_dp_plan(
+                            args, case, output, stage2_by_layout[layout])
                 else:
                     case["plan_source"] = "JUPITER_FIXED_CHUNK_ABLATION"
                 row = perform_case(args, case, output, position)

@@ -17,6 +17,7 @@ import subprocess
 import sys
 from pathlib import Path
 from phone_owned_models import inspect_model, resolve_splits
+from resident_runtime import enabled as resident_enabled, run_resident_cli
 
 PLAN_RE = re.compile(r"\[JUPITER_SEQUENCE_PLAN\].*?total=(\d+).*?chunks=([0-9,]+)")
 TIMING_RE = re.compile(r"prompt eval time\s*=\s*([\d.]+)\s*ms\s*/\s*(\d+)\s*tokens")
@@ -188,13 +189,18 @@ def main() -> int:
         ]
         log_path = out / f"{mode}-full-prefill.log"
         print(f"[FULL_PREFILL_AB] mode={mode} sessions={args.sessions} log={log_path}", flush=True)
-        with log_path.open("wb") as f:
-            proc = subprocess.run(command, env=env, stdin=subprocess.DEVNULL,
-                                  stdout=f, stderr=subprocess.STDOUT, check=False)
+        resident = resident_enabled(env)
+        if resident:
+            rc = run_resident_cli(command, env, log_path)
+        else:
+            with log_path.open("wb") as f:
+                proc = subprocess.run(command, env=env, stdin=subprocess.DEVNULL,
+                                      stdout=f, stderr=subprocess.STDOUT, check=False)
+            rc = proc.returncode
         log = log_path.read_text(encoding="utf-8", errors="replace")
-        if proc.returncode:
+        if rc:
             tail = "\n".join(log.splitlines()[-55:])
-            raise RuntimeError(f"{mode} exited {proc.returncode}:\n{tail}")
+            raise RuntimeError(f"{mode} exited {rc}:\n{tail}")
         # The llama-server initialization normally probes seq_rm by doing a
         # synthetic two-token decode. In one-shot Phone-owned mode that would
         # consume the private HTP KV/run before the real 175-token Prompt.
@@ -203,7 +209,10 @@ def main() -> int:
             probe_marker = (
                 "[JUPITER_PHONE_OWNED_PREFILL] phase=SEQ_RM_PROBE"
             )
-            if probe_marker not in log or "synthetic_decode=SKIPPED" not in log:
+            if resident:
+                if "[JUPITER_RESIDENT_RESET]" not in log:
+                    raise RuntimeError(f"native resident request did not reset: {log_path}")
+            elif probe_marker not in log or "synthetic_decode=SKIPPED" not in log:
                 raise RuntimeError(
                     "native: mandatory memory-only seq_rm probe bypass "
                     "missing; rebuild llama-cli from the updated branch. "
@@ -294,7 +303,13 @@ def main() -> int:
             "plan": observed,
             "prompt_eval_ms": float(timing[-1].group(1)) if timing else None,
             "prompt_eval_timing_tokens": int(timing[-1].group(2)) if timing else None,
+            "execution_backend": "resident-server" if resident else "cli",
+            "prefill_metric": "DECODE_TO_LOGITS" if resident else "CLI_PROMPT_EVAL",
         }
+        if resident:
+            report = json.loads(log_path.with_suffix(".resident.json").read_text(encoding="utf-8"))
+            results[mode].update(resident_reset_ms=report["reset_ms"],
+                                 resident_request_wall_ms=report["request_wall_ms"])
         print(f"[FULL_PREFILL_AB] mode={mode} top1={results[mode]['top1']} "
               f"prompt_eval_ms={results[mode]['prompt_eval_ms']} status=PASS", flush=True)
     if all(x in results for x in ("legacy", "native")):
