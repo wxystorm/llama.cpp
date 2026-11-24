@@ -286,7 +286,8 @@ struct jupiter_phone_owned_native_state {
             ((model_layers == 40 && hp.n_head() == 40) ||
              (model_layers == 64 && hp.n_head() == 64));
         if (!supported_dense_qwen3 ||
-                native_first < model_layers - 16 || native_first >= model_layers ||
+                native_first <= 0 || native_first >= model_layers ||
+                model_layers - native_first > 64 ||
                 !cparams.flash_attn || cparams.n_ctx != native_ctx ||
                 native_ctx < 256 || native_ctx > 4096 ||
                 tokens < 2 || tokens > native_ctx ||
@@ -1170,7 +1171,7 @@ llama_context::llama_context(
         const bool htp_multi_session =
             htp_multi_env != nullptr && std::atoi(htp_multi_env) > 1;
         if (htp_multi_session && jupiter_phone_native) {
-            // Phone-owned native mode owns the selected final 1..16 Qwen3 layers
+            // Phone-owned native mode owns the selected contiguous Qwen3 suffix
             // as *CPU placeholders* on the PC. The actual HTP model/KV/Graph
             // allocations are owned by the remote Phone RPC server, so
             // model.dev_layer(il) contains no RPC backend for those layers.
