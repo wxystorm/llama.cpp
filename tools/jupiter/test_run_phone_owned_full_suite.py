@@ -101,6 +101,52 @@ class TestPlanning(unittest.TestCase):
         self.assertEqual(grouped[0]["sync_mean_ms"], 150.0)
 
 
+class TestSingleMode(unittest.TestCase):
+    def test_one_native_execution_no_extra_warmup_or_ab(self):
+        for mode in ("sync", "autonomous"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                output = Path(temp)
+                case = {"layout": 20, "group": "0", "name": "prompt_0_01.txt",
+                        "path": str(output / "prompt_0_01.txt"), "tokens": 74,
+                        "context": 2048, "chunks": [74], "kind": "normal",
+                        "repeat": 1}
+                args = argparse.Namespace(run_mode=mode, no_warmup=False,
+                                          mode_order="alternate")
+                def fake_native(_args, _case, run_mode, work):
+                    self.assertEqual(run_mode, mode)
+                    work.mkdir(parents=True, exist_ok=True)
+                    logits = work / "native-logits.f32"
+                    logits.write_bytes(b"fake")
+                    return {"ms": 1000.0, "cache_hit": False,
+                            "logits": str(logits), "top1": 7,
+                            "log": str(work / "native-full-prefill.log")}
+                with patch.object(suite, "run_mode", side_effect=fake_native) as run, \
+                     patch.object(suite, "logits_comparison",
+                                  side_effect=AssertionError("A/B comparison")):
+                    row = suite.perform_case(args, case, output, 0)
+                self.assertEqual(run.call_count, 1)
+                self.assertEqual(set(row["runs"]), {mode})
+                self.assertIsNone(row["warmup"])
+                self.assertIsNone(row["parity"])
+                self.assertIsNone(row["speedup"])
+                self.assertIsNone(row["warm_comparable"])
+                self.assertTrue(suite.completed_case_matches(row, mode))
+                self.assertFalse(suite.completed_case_matches(row, "both"))
+                self.assertEqual(suite.csv_row(row)[f"{mode}_tok_s"], 74.0)
+                suite.publish(output, [row], 1, "test", mode)
+                summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+                group = summary["group_summary"][0]
+                self.assertEqual(summary["run_mode"], mode)
+                self.assertEqual(summary["passed"], 1)
+                self.assertEqual(group["passed_cases"], 1)
+                self.assertEqual(group["passed_pairs"], 0)
+                self.assertEqual(group[f"{mode}_runs"], 1)
+                self.assertEqual(group[f"{mode}_weighted_tok_s"], 74.0)
+                other = "sync" if mode == "autonomous" else "autonomous"
+                self.assertEqual(group[f"{other}_runs"], 0)
+                self.assertEqual(group[f"{other}_mean_ms"], "")
+
+
 class TestOriginalJupiterDP(unittest.TestCase):
     def test_irregular_measured_dp_plan_is_used_without_repartition(self):
         with tempfile.TemporaryDirectory() as temp:

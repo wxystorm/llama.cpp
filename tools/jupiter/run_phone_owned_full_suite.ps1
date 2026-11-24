@@ -3,7 +3,8 @@
   Jupiter q(x,y)/Sequence DP full Prefill for Qwen3-14B or Qwen3-32B.
 .DESCRIPTION
   Fixed Context/Batch=2048; original measured Stage2 b, Stage3 q(x,y)/DP.
-  Phone-local HTP Graph + autonomous P2C is compared to native Sync.
+  Select a single native mode or compare Phone-autonomous P2C to native Sync.
+  Single modes skip extra warmup and A-B-A revisits.
   Select model by -ModelSize or -Model, optionally choose CPU/CUDA/HTP
   layer counts or a sweep of Phone boundaries. No Decode.
 .EXAMPLE
@@ -27,6 +28,8 @@ param(
     [string]$OutDir = "",
     [ValidateSet("jupiter-dp", "fixed-control")]
     [string]$SequencePolicy = "jupiter-dp",
+    [ValidateSet("both", "sync", "autonomous")]
+    [string]$RunMode = "both",
     [string]$Layouts = "",
     [int]$CpuLayers = -1,
     [int]$CudaLayers = -1,
@@ -79,6 +82,7 @@ try {
         "--pattern", $Pattern,
         "--groups", $Groups,
         "--sequence-policy", $SequencePolicy,
+        "--run-mode", $RunMode,
         "--expected-count", [string]$ExpectedCount,
         "--repeats", [string]$Repeats,
         "--sessions", [string]$Sessions,
@@ -98,13 +102,13 @@ try {
     if ($MinChunkJson) { $argsList += @("--min-chunk-json", $MinChunkJson) }
     if ($Resume) { $argsList += "--resume" }
     if ($DryRun) { $argsList += "--dry-run" }
-    if (!$NoRevisit) { $argsList += "--revisit-first" }
-    if ($NoWarmup) { $argsList += "--no-warmup" }
+    if ($RunMode -eq "both" -and !$NoRevisit) { $argsList += "--revisit-first" }
+    if ($NoWarmup -or $RunMode -ne "both") { $argsList += "--no-warmup" }
     if ($ContinueOnError) { $argsList += "--continue-on-error" }
 
     Write-Host "[JUPITER_FULL_SUITE] model=$Model model_size=$ModelSize context=2048 batch=2048"
     Write-Host "[JUPITER_FULL_SUITE] groups=$Groups (default ShareGPT40: 0/128/256/512/1024, 10 each)"
-    Write-Host "[JUPITER_FULL_SUITE] layouts=$Layouts cpu=$CpuLayers cuda=$CudaLayers phone=$PhoneLayers sessions=$Sessions"
+    Write-Host "[JUPITER_FULL_SUITE] layouts=$Layouts cpu=$CpuLayers cuda=$CudaLayers phone=$PhoneLayers sessions=$Sessions run_mode=$RunMode"
     & python @argsList
     $rc = $LASTEXITCODE
     if ($rc -ne 0) {

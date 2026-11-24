@@ -2,8 +2,9 @@
 """One-command Qwen3-14B/32B Phone-owned Prefill suite over ShareGPT prompts.
 
 Per Prompt: exact chat-templated Token count -> valid Chunk/KV plan ->
-optional same-shape Graph warmup -> Sync/Phone-autonomous native A/B ->
-complete F32 logits parity -> atomic checkpoint and grouped CSV summaries.
+one selected native mode OR optional same-shape warmup + Sync/Autonomous A/B
+with complete F32 logits parity -> atomic checkpoint and grouped CSV summaries.
+Single-mode runs execute once per Prompt/repeat, with no extra warmup or revisit.
 
 All runs are strictly sequential: the Phone RPC server owns one native HTP
 execution at a time. Decode is deliberately not exercised.
@@ -39,7 +40,7 @@ DEFAULT_GROUPS = "0,128,256,512,1024"
 FIELDNAMES = (
     "layout", "group", "prompt", "kind", "repeat", "status", "tokens",
     "context", "chunks", "chunk_size", "n_chunks",
-    "min_chunk", "plan_source", "plan_file", "first_mode",
+    "min_chunk", "plan_source", "plan_file", "run_mode", "first_mode",
     "sync_ms", "autonomous_ms", "sync_tok_s", "autonomous_tok_s",
     "speedup", "sync_cache_hit", "autonomous_cache_hit",
     "warm_comparable", "top1_same", "max_abs", "relative_rmse",
@@ -163,8 +164,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-rounds", type=int, default=6)
     p.add_argument("--max-chunk", type=int, default=128,
                    help="original Jupiter q(x,y) max UBatch/Chunk size")
+    p.add_argument("--run-mode", choices=("both", "sync", "autonomous"),
+                   default="both",
+                   help="both: original A/B with parity; single mode: one "
+                        "native Prefill per Prompt/repeat, no warmup or revisit")
     p.add_argument("--repeats", type=int, default=1,
-                   help="complete Sync/Auto A/B pairs per Prompt")
+                   help="measured executions (single mode) or A/B pairs per Prompt")
     p.add_argument("--expected-count", type=int, default=0,
                    help="fail preflight if not exactly this many unique Prompts")
     p.add_argument("--mode-order", choices=("alternate", "sync-first",
@@ -263,6 +268,7 @@ def preflight(args: argparse.Namespace, files: list[Path],
         "refine_repeats": args.refine_repeats,
         "max_rounds": args.max_rounds, "max_chunk": args.max_chunk,
         "repeats": args.repeats,
+        "run_mode": args.run_mode,
         "mode_order": args.mode_order, "warmup": not args.no_warmup,
         "revisit_first": args.revisit_first,
         "prompts": list(tokens.values()),
@@ -591,46 +597,64 @@ def parity_ok(parity: dict) -> bool:
             parity["relative_rmse"] <= 0.01)
 
 
+def selected_modes(mode: str) -> tuple[str, ...]:
+    if mode == "both":
+        return ("sync", "autonomous")
+    if mode in ("sync", "autonomous"):
+        return (mode,)
+    raise ValueError(f"Unknown run mode: {mode}")
+
+
+def completed_case_matches(previous: dict, mode: str) -> bool:
+    runs = previous.get("runs", {})
+    return (previous.get("status") == "PASS" and
+            set(runs) == set(selected_modes(mode)) and
+            all(Path(x.get("logits", "")).is_file() for x in runs.values()))
+
+
 def perform_case(args: argparse.Namespace, case: dict,
                  output: Path, position: int) -> dict:
     root = case_directory(output, case)
     attempt = next_attempt(root)
-    order = ["sync", "autonomous"]
-    if args.mode_order == "autonomous-first" or \
-            (args.mode_order == "alternate" and position % 2):
+    mode_choice = args.run_mode
+    order = list(selected_modes(mode_choice))
+    paired = mode_choice == "both"
+    if paired and (args.mode_order == "autonomous-first" or
+                   (args.mode_order == "alternate" and position % 2)):
         order.reverse()
     warmup_info = None
-    if not args.no_warmup:
+    if paired and not args.no_warmup:
         warm = run_mode(args, case, "sync", attempt / "warmup")
-        # For A-B-A, this warmup is the FIRST revisit of shape A after B:
-        # preserve its cache status before the paired measured runs refill it.
+        # Preserve the first A-B-A revisit cache state.
         warmup_info = {"cache_hit": warm["cache_hit"],
                        "prepare": warm["prepare"], "log": warm["log"]}
-        # Warmup is not a measurement and need not keep another F32 dump.
         Path(warm["logits"]).unlink(missing_ok=True)
-    runs = {}
-    for mode in order:
-        runs[mode] = run_mode(args, case, mode, attempt / mode)
-    parity = logits_comparison(
-        read_logits(Path(runs["sync"]["logits"])),
-        read_logits(Path(runs["autonomous"]["logits"])))
-    if not parity_ok(parity):
-        raise RuntimeError(
-            f"Complete Logits parity FAIL for {case['name']}: {parity}")
-    comparable = runs["sync"]["cache_hit"] and runs["autonomous"]["cache_hit"]
-    row = dict(case, status="PASS",
-               first_mode=order[0], runs=runs, parity=parity,
-               warmup=warmup_info,
-               revisit_first_cache_hit=(
-                   warmup_info["cache_hit"] if warmup_info is not None
-                   else runs[order[0]]["cache_hit"]
-               ) if case["kind"] == "revisit" else None,
-               warm_comparable=comparable,
-               sync_ms=runs["sync"]["ms"],
-               autonomous_ms=runs["autonomous"]["ms"],
-               speedup=runs["sync"]["ms"] / runs["autonomous"]["ms"],
-               case_dir=str(root), attempt_dir=str(attempt))
-    return row
+    runs = {mode: run_mode(args, case, mode, attempt / mode)
+            for mode in order}
+    parity = None
+    comparable = None
+    speedup = None
+    sync_ms = runs["sync"]["ms"] if "sync" in runs else None
+    autonomous_ms = runs["autonomous"]["ms"] if "autonomous" in runs else None
+    if paired:
+        parity = logits_comparison(
+            read_logits(Path(runs["sync"]["logits"])),
+            read_logits(Path(runs["autonomous"]["logits"])))
+        if not parity_ok(parity):
+            raise RuntimeError(
+                f"Complete Logits parity FAIL for {case['name']}: {parity}")
+        comparable = runs["sync"]["cache_hit"] and runs["autonomous"]["cache_hit"]
+        speedup = sync_ms / autonomous_ms
+    return dict(case, status="PASS", run_mode=mode_choice,
+                first_mode=order[0], runs=runs, parity=parity,
+                warmup=warmup_info,
+                revisit_first_cache_hit=(
+                    warmup_info["cache_hit"] if warmup_info is not None
+                    else runs[order[0]]["cache_hit"]
+                ) if case["kind"] == "revisit" else None,
+                warm_comparable=comparable, sync_ms=sync_ms,
+                autonomous_ms=autonomous_ms, speedup=speedup,
+                case_dir=str(root), attempt_dir=str(attempt))
 
 
 def csv_row(row: dict) -> dict:
@@ -649,6 +673,7 @@ def csv_row(row: dict) -> dict:
         "min_chunk": row.get("min_chunk"),
         "plan_source": row.get("plan_source", ""),
         "plan_file": row.get("plan_file", ""),
+        "run_mode": row.get("run_mode", "both"),
         "first_mode": row.get("first_mode", ""),
         "sync_ms": sync.get("ms"), "autonomous_ms": auto.get("ms"),
         "sync_tok_s": round(tokens*1000/sync["ms"], 3) if sync.get("ms") else "",
@@ -689,37 +714,44 @@ def group_summaries(rows: list[dict]) -> list[dict]:
     for (layout, group), items in groups.items():
         warm = [x for x in items if x.get("warm_comparable")]
         ratios = [x["speedup"] for x in warm]
-        sync_ms = [x["sync_ms"] for x in items]
-        auto_ms = [x["autonomous_ms"] for x in items]
+        sync = [x for x in items if x.get("sync_ms") is not None]
+        auto = [x for x in items if x.get("autonomous_ms") is not None]
+        def mean_ms(selected, key):
+            return round(statistics.mean(x[key] for x in selected), 3) if selected else ""
+        def median_ms(selected, key):
+            return round(statistics.median(x[key] for x in selected), 3) if selected else ""
+        def weighted_tok_s(selected, key):
+            return (round(1000*sum(x["tokens"] for x in selected)/
+                          sum(x[key] for x in selected), 3) if selected else "")
         result.append({
-            "layout": layout, "group": group, "passed_pairs": len(items),
+            "layout": layout, "group": group,
+            "run_mode": items[0].get("run_mode", "both"),
+            "passed_cases": len(items),
+            "passed_pairs": sum(x.get("speedup") is not None for x in items),
             "distinct_prompts": len({x["name"] for x in items}),
+            "sync_runs": len(sync), "autonomous_runs": len(auto),
+            "sync_cache_hits": sum(bool(x.get("runs", {}).get("sync", {}).get("cache_hit")) for x in sync),
+            "autonomous_cache_hits": sum(bool(x.get("runs", {}).get("autonomous", {}).get("cache_hit")) for x in auto),
             "warm_pairs": len(warm),
-            "sync_mean_ms": round(statistics.mean(sync_ms), 3),
-            "autonomous_mean_ms": round(statistics.mean(auto_ms), 3),
-            "sync_median_ms": round(statistics.median(sync_ms), 3),
-            "autonomous_median_ms": round(statistics.median(auto_ms), 3),
+            "sync_mean_ms": mean_ms(sync, "sync_ms"),
+            "autonomous_mean_ms": mean_ms(auto, "autonomous_ms"),
+            "sync_median_ms": median_ms(sync, "sync_ms"),
+            "autonomous_median_ms": median_ms(auto, "autonomous_ms"),
             "warm_geomean_speedup": (
                 round(statistics.geometric_mean(ratios), 4) if ratios else ""),
             "warm_mean_speedup": (
                 round(statistics.mean(ratios), 4) if ratios else ""),
-            "warm_mean_sync_ms": (
-                round(statistics.mean(x["sync_ms"] for x in warm), 3)
-                if warm else ""),
-            "warm_mean_autonomous_ms": (
-                round(statistics.mean(x["autonomous_ms"] for x in warm), 3)
-                if warm else ""),
-            "sync_weighted_tok_s": round(
-                1000*sum(x["tokens"] for x in items)/sum(sync_ms), 3),
-            "autonomous_weighted_tok_s": round(
-                1000*sum(x["tokens"] for x in items)/sum(auto_ms), 3),
+            "warm_mean_sync_ms": mean_ms(warm, "sync_ms"),
+            "warm_mean_autonomous_ms": mean_ms(warm, "autonomous_ms"),
+            "sync_weighted_tok_s": weighted_tok_s(sync, "sync_ms"),
+            "autonomous_weighted_tok_s": weighted_tok_s(auto, "autonomous_ms"),
         })
     return sorted(result, key=lambda x: (x["layout"], group_key(
         f"prompt_{x['group']}_01.txt")))
 
 
 def publish(output: Path, rows: list[dict],
-            expected_cases: int, manifest_sha: str) -> None:
+            expected_cases: int, manifest_sha: str, mode: str = "both") -> None:
     by_status = {k: sum(x["status"] == k for x in rows)
                  for k in ("PASS", "FAIL", "INTERRUPTED")}
     summaries = group_summaries(rows)
@@ -730,9 +762,10 @@ def publish(output: Path, rows: list[dict],
               FIELDNAMES)
     write_csv(output / "group-summary.csv", summaries,
               tuple(summaries[0]) if summaries else
-              ("layout", "group", "passed_pairs", "warm_pairs"))
+              ("layout", "group", "run_mode", "passed_cases", "passed_pairs", "warm_pairs"))
     summary = {
         "manifest_sha256": manifest_sha,
+        "run_mode": mode,
         "expected_cases": expected_cases,
         "finished_cases": len(rows),
         "remaining_cases": expected_cases-len(rows),
@@ -747,6 +780,10 @@ def publish(output: Path, rows: list[dict],
         "interpretation": (
             "Compare speedups only for warm-comparable A/B pairs; "
             "one full suite is a first measurement, not a confidence interval."
+            if mode == "both" else
+            "Single-mode native Prefill: no per-Prompt warmup, revisit or A/B "
+            "parity; cache hits/misses are recorded. Preparation may be included "
+            "in a cache-miss measurement."
         ),
     }
     write_json(output / "summary.json", summary)
@@ -754,6 +791,12 @@ def publish(output: Path, rows: list[dict],
 
 def run() -> int:
     args = parse_args()
+    # Retain backward-compatible programmatic callers with no run_mode.
+    args.run_mode = getattr(args, "run_mode", "both")
+    selected_modes(args.run_mode)
+    if args.run_mode != "both":
+        args.no_warmup = True
+        args.revisit_first = False
     # Validate against the GGUF before any expensive Stage2/Stage3 calibration.
     model = inspect_model(Path(args.model), args.model_size)
     layouts, args.cpu_layers = resolve_splits(
@@ -763,6 +806,8 @@ def run() -> int:
     args.model_layers = model.layers
     if args.out_dir is None:
         args.out_dir = f"jupiter-autonomous-{model.family}-dp-2048"
+        if args.run_mode != "both":
+            args.out_dir += f"-{args.run_mode}-only"
     print(f"[PHONE_SUITE_MODEL] model=Qwen3-{model.family.upper()}"
           f" layers={model.layers} CPU={args.cpu_layers}"
           f" first_phone={layouts} GPU={[x-args.cpu_layers for x in layouts]}"
@@ -804,9 +849,12 @@ def run() -> int:
                          f"found {len(files)}. Refusing partial experiment.")
     plan = preflight(args, files, layouts, output)
     cases = build_cases(plan, layouts, args.repeats, args.revisit_first)
+    for case in cases:
+        case["run_mode"] = args.run_mode
     print(f"[PHONE_SUITE] model=Qwen3-{model.family.upper()}"
-          f" prompts={len(files)} layouts={layouts}"
-          f" repeats={args.repeats} total_pairs={len(cases)}"
+          f" prompts={len(files)} layouts={layouts} run_mode={args.run_mode}"
+          f" repeats={args.repeats} total_cases={len(cases)}"
+          f" measured_runs={len(cases)*len(selected_modes(args.run_mode))}"
           f" context=2048 batch=2048 sequence_policy={args.sequence_policy}"
           f" warmup={not args.no_warmup} status=PLANNED", flush=True)
     if args.dry_run:
@@ -823,10 +871,7 @@ def run() -> int:
         stored = root / "case-result.json"
         if args.resume and stored.exists():
             previous = json.loads(stored.read_text(encoding="utf-8"))
-            logs = [Path(x.get("logits", "")) for x in
-                    previous.get("runs", {}).values()]
-            if previous.get("status") == "PASS" and len(logs) == 2 and \
-                    all(p.is_file() for p in logs):
+            if completed_case_matches(previous, args.run_mode):
                 row = previous
                 print(f"[PHONE_SUITE] {position+1}/{len(cases)}"
                       f" prompt={case['name']} layout={case['layout']}"
@@ -882,13 +927,20 @@ def run() -> int:
             reference[(case["layout"], case["group"],
                        case["path"], case["repeat"])] = row
         rows.append(row)
-        publish(output, rows, len(cases), plan["signature"])
+        publish(output, rows, len(cases), plan["signature"], args.run_mode)
         if row["status"] == "PASS":
-            print(f"[PHONE_SUITE] result=PASS"
-                  f" sync_ms={row['sync_ms']:.2f}"
-                  f" autonomous_ms={row['autonomous_ms']:.2f}"
-                  f" ratio={row['speedup']:.3f}"
-                  f" warm_comparable={row['warm_comparable']}", flush=True)
+            if args.run_mode == "both":
+                print(f"[PHONE_SUITE] result=PASS"
+                      f" sync_ms={row['sync_ms']:.2f}"
+                      f" autonomous_ms={row['autonomous_ms']:.2f}"
+                      f" ratio={row['speedup']:.3f}"
+                      f" warm_comparable={row['warm_comparable']}", flush=True)
+            else:
+                selected = row["runs"][args.run_mode]
+                print(f"[PHONE_SUITE] result=PASS mode={args.run_mode}"
+                      f" prefill_ms={selected['ms']:.2f}"
+                      f" tok_s={row['tokens']*1000/selected['ms']:.3f}"
+                      f" cache_hit={selected['cache_hit']}", flush=True)
         else:
             print(f"[PHONE_SUITE] result={row['status']}"
                   f" prompt={case['name']} error={row['error'][:300]}",
