@@ -42,7 +42,7 @@ FIELDNAMES = (
     "layout", "group", "prompt", "kind", "repeat", "status", "tokens",
     "context", "chunks", "chunk_size", "n_chunks",
     "min_chunk", "plan_source", "plan_file", "run_mode", "first_mode",
-    "execution_backend", "prefill_metric", "sync_reset_ms", "autonomous_reset_ms",
+    "execution_backend", "legacy_calibration_validation", "prefill_metric", "sync_reset_ms", "autonomous_reset_ms",
     "sync_request_wall_ms", "autonomous_request_wall_ms",
     "sync_ms", "autonomous_ms", "sync_tok_s", "autonomous_tok_s",
     "speedup", "sync_cache_hit", "autonomous_cache_hit",
@@ -132,6 +132,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--resident-server", default=None,
                    help="opt-in rebuilt llama-server: resident calibration then native Prefill")
     p.add_argument("--resident-start-timeout", type=int, default=1800)
+    p.add_argument("--skip-legacy-logits-check", action="store_true",
+                   help="resident Stage2/3 timing only; tolerate nonfinite legacy logits, "
+                        "never weaken native output checks")
     p.add_argument("--model", required=True, help="dense Qwen3-14B/32B GGUF")
     p.add_argument("--model-size", choices=("auto", "14b", "32b"),
                    default="auto", help="verify GGUF architecture; default auto")
@@ -258,6 +261,8 @@ def preflight(args: argparse.Namespace, files: list[Path],
     config = {
         "format": 1,
         "execution_backend": "resident-server" if args.resident_server else "cli",
+        "legacy_calibration_validation": ("TIMING_ONLY" if getattr(args, "skip_legacy_logits_check", False)
+                                          else "FINITE_ONLY" if args.resident_server else "CLI_UNVERIFIED"),
         "resident_server": (file_signature(Path(args.resident_server))
                             if args.resident_server else None),
         "resident_client_sha256": hashlib.sha256(
@@ -695,6 +700,7 @@ def csv_row(row: dict) -> dict:
         "run_mode": row.get("run_mode", "both"),
         "first_mode": row.get("first_mode", ""),
         "execution_backend": row.get("execution_backend", "cli"),
+        "legacy_calibration_validation": row.get("legacy_calibration_validation", "CLI_UNVERIFIED"),
         "prefill_metric": (auto or sync).get("prefill_metric", ""),
         "sync_reset_ms": sync.get("resident_reset_ms"),
         "autonomous_reset_ms": auto.get("resident_reset_ms"),
@@ -752,6 +758,7 @@ def group_summaries(rows: list[dict]) -> list[dict]:
             "layout": layout, "group": group,
             "run_mode": items[0].get("run_mode", "both"),
             "execution_backend": items[0].get("execution_backend", "cli"),
+            "legacy_calibration_validation": items[0].get("legacy_calibration_validation", "CLI_UNVERIFIED"),
             "passed_cases": len(items),
             "passed_pairs": sum(x.get("speedup") is not None for x in items),
             "distinct_prompts": len({x["name"] for x in items}),
@@ -793,6 +800,7 @@ def publish(output: Path, rows: list[dict],
         "manifest_sha256": manifest_sha,
         "run_mode": mode,
         "execution_backend": (rows[0].get("execution_backend", "cli") if rows else ""),
+        "legacy_calibration_validation": (rows[0].get("legacy_calibration_validation", "CLI_UNVERIFIED") if rows else ""),
         "expected_cases": expected_cases,
         "finished_cases": len(rows),
         "remaining_cases": expected_cases-len(rows),
@@ -822,6 +830,12 @@ def run() -> int:
     args.run_mode = getattr(args, "run_mode", "both")
     args.resident_server = getattr(args, "resident_server", None)
     args.resident_start_timeout = getattr(args, "resident_start_timeout", 1800)
+    args.skip_legacy_logits_check = getattr(args, "skip_legacy_logits_check", False)
+    if args.skip_legacy_logits_check and (not args.resident_server or args.sequence_policy != "jupiter-dp"):
+        raise ValueError("--skip-legacy-logits-check requires resident jupiter-dp calibration")
+    if args.skip_legacy_logits_check:
+        print("[PHONE_SUITE_WARNING] legacy_calibration_validation=TIMING_ONLY "
+              "accuracy=UNVERIFIED native_logits_check=STRICT", flush=True)
     selected_modes(args.run_mode)
     if args.run_mode != "both":
         args.no_warmup = True
@@ -839,6 +853,8 @@ def run() -> int:
             args.out_dir += f"-{args.run_mode}-only"
         if args.resident_server:
             args.out_dir += "-resident"
+        if args.skip_legacy_logits_check:
+            args.out_dir += "-legacy-timing-only"
     if args.resident_server:
         if len(layouts) != 1:
             raise ValueError("resident experiment requires one immutable layout per suite")
@@ -894,6 +910,9 @@ def run() -> int:
     for case in cases:
         case["run_mode"] = args.run_mode
         case["execution_backend"] = "resident-server" if args.resident_server else "cli"
+        case["legacy_calibration_validation"] = (
+            "TIMING_ONLY" if args.skip_legacy_logits_check else
+            "FINITE_ONLY" if args.resident_server else "CLI_UNVERIFIED")
     print(f"[PHONE_SUITE] model=Qwen3-{model.family.upper()}"
           f" prompts={len(files)} layouts={layouts} run_mode={args.run_mode}"
           f" repeats={args.repeats} total_cases={len(cases)}"

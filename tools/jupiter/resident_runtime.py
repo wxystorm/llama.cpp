@@ -179,6 +179,15 @@ def run_resident_cli(command, env, log_path):
             raise RuntimeError("invalid resident completion or missing reset")
         if payload["expected_tokens"] and result["tokens"] != payload["expected_tokens"]:
             raise RuntimeError("resident actual token count differs from exact DP plan")
+        timing_only = bool(config.get("legacy_timing_only", False)
+                           and not config["native"] and not payload["return_logits"])
+        if result.get("logits_validation") != ("TIMING_ONLY" if timing_only else "FINITE_ONLY"):
+            raise RuntimeError("resident logits validation policy mismatch")
+        if not timing_only and result.get("logits_finite") is not True:
+            raise RuntimeError("resident requires finite logits")
+        if timing_only and result.get("logits_finite") is not True:
+            print(f"[JUPITER_RESIDENT_TIMING_ONLY] nan={result.get('logits_nan')} "
+                  f"inf={result.get('logits_inf')} accuracy=UNVERIFIED", flush=True)
         logits = result.pop("logits", None)
         if payload["return_logits"]:
             if not isinstance(logits, list) or not logits or not all(math.isfinite(v) for v in logits):
@@ -209,7 +218,9 @@ class ResidentServer:
         self.config = dict(model=str(Path(args.model).resolve()), rpc=args.rpc,
                            context=2048, batch=2048, ubatch=ubatch,
                            threads=8, pc_layers=layout, cpu_layers=args.cpu_layers,
-                           sessions=args.sessions, native=native, window=2 if native else 1)
+                           sessions=args.sessions, native=native, window=2 if native else 1,
+                           legacy_timing_only=bool(not native and
+                               getattr(args, "skip_legacy_logits_check", False)))
         self.exe = Path(args.resident_server).resolve()
         self.log = Path(output) / "resident-runtime" / (
             ("native" if native else "legacy") + "-" + uuid.uuid4().hex + ".log")
@@ -223,6 +234,7 @@ class ResidentServer:
         env = {k: v for k, v in os.environ.items() if not k.startswith(PREFIX)}
         env.update({
             PREFIX + "SERVER": "1",
+            PREFIX + "LEGACY_TIMING_ONLY": str(int(cfg["legacy_timing_only"])),
             "LLAMA_JUPITER_PREFILL": "1",
             "LLAMA_JUPITER_PC_LAYERS": str(cfg["pc_layers"]),
             "LLAMA_JUPITER_CPU_LAYERS": str(cfg["cpu_layers"]),
@@ -267,6 +279,8 @@ class ResidentServer:
                     status, health = http_json(self.url + "/health", self.key, None, 10)
                     if status != 200 or not health.get("resident"):
                         raise RuntimeError("not the dedicated resident endpoint")
+                    if health.get("legacy_timing_only") != cfg["legacy_timing_only"]:
+                        raise RuntimeError("resident validation policy mismatch; rebuild llama-server")
                     print(f"[JUPITER_RESIDENT_READY] native={native} port={port}", flush=True)
                     return self
                 time.sleep(0.25)

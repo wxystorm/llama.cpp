@@ -73,6 +73,12 @@ inline int jupiter_resident_server(common_params & params) {
         return 1;
     }
     const bool native = jr_env_enabled("LLAMA_JUPITER_PHONE_OWNED_NATIVE");
+    // Explicit experimental timing-only opt-in. Never applies to native
+    // formal Prefill or requests that require real F32 logits.
+    const bool legacy_timing_only = !native &&
+        jr_env_enabled("LLAMA_JUPITER_RESIDENT_LEGACY_TIMING_ONLY");
+    std::fprintf(stderr, "[JUPITER_RESIDENT_POLICY] native=%d legacy_timing_only=%d\n",
+                 int(native), int(legacy_timing_only));
     params.n_parallel = 1;
     // Match server_n_outputs_max() for one text sequence, no draft.
     // Do not reserve a vocab row for every token in a calibration UBatch.
@@ -132,7 +138,8 @@ inline int jupiter_resident_server(common_params & params) {
     bool stopping = false;
     http.get("/health", [&](const server_http_req &) {
         return jr_response({{"status", "ok"}, {"resident", true},
-                            {"native", native}, {"ctx", llama_n_ctx(ctx)},
+                            {"native", native}, {"legacy_timing_only", legacy_timing_only},
+                            {"ctx", llama_n_ctx(ctx)},
                             {"batch", llama_n_batch(ctx)}, {"ubatch", llama_n_ubatch(ctx)}});
     });
     http.post("/jupiter/prefill", [&](const server_http_req & req) -> server_http_res_ptr {
@@ -254,21 +261,36 @@ inline int jupiter_resident_server(common_params & params) {
                     first_bad = i;
                 }
             }
+            const bool return_logits = body.value("return_logits", false);
+            const bool timing_only = legacy_timing_only && !return_logits;
+            const bool logits_finite = first_bad < 0;
             std::fprintf(stderr, "[JUPITER_RESIDENT_LOGITS] native=%d tokens=%zu vocab=%lld"
                          " finite=%zu nan=%zu inf=%zu zero=%zu first_bad=%lld"
-                         " prefill_ms=%.3f status=%s\n",
+                         " prefill_ms=%.3f validation=%s status=%s\n",
                          int(native), tokens.size(), (long long)n_vocab,
                          size_t(n_vocab) - nan_count - inf_count, nan_count,
                          inf_count, zero_count, (long long)first_bad, ms,
-                         first_bad < 0 ? "PASS" : "FAIL");
-            if (first_bad >= 0) {
+                         timing_only ? "TIMING_ONLY" : "FINITE_ONLY",
+                         logits_finite ? "PASS" : (timing_only ? "UNVERIFIED" : "FAIL"));
+            if (!logits_finite && !timing_only) {
                 throw std::runtime_error("NONFINITE_FINAL_LOGITS nan=" + std::to_string(nan_count) +
                     " inf=" + std::to_string(inf_count) + " first_bad=" + std::to_string(first_bad));
             }
+            // PASS is execution/reset success only. Do not invent a top1
+            // from NaNs or serialize invalid floats as legitimate logits.
             jr_json result = {{"id", id}, {"status", "PASS"}, {"tokens", tokens.size()},
                               {"prefill_ms", ms}, {"metric", "DECODE_TO_LOGITS"},
-                              {"top1", std::max_element(logits, logits + n_vocab) - logits}};
-            if (body.value("return_logits", false)) {
+                              {"logits_validation", timing_only ? "TIMING_ONLY" : "FINITE_ONLY"},
+                              {"logits_finite", logits_finite}, {"logits_nan", nan_count},
+                              {"logits_inf", inf_count}, {"logits_zero", zero_count},
+                              {"top1", nullptr}};
+            if (logits_finite) {
+                result["top1"] = std::max_element(logits, logits + n_vocab) - logits;
+            } else {
+                std::fprintf(stderr, "[JUPITER_RESIDENT_TIMING_ONLY] id=%s nan=%zu inf=%zu"
+                             " accuracy=UNVERIFIED\n", id.c_str(), nan_count, inf_count);
+            }
+            if (return_logits) {
                 result["logits"] = std::vector<float>(logits, logits + n_vocab);
             }
             // Measure only fresh Prefill through synchronized logits. Return

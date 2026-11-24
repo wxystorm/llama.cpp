@@ -20,6 +20,7 @@ param(
     [string]$Tokenizer = ".\build-phone-owned\bin\Release\llama-tokenize.exe",
     [string]$ServerExe = ".\build-phone-owned\bin\Release\llama-server.exe",
     [switch]$UseServer,
+    [switch]$SkipLegacyLogitsCheck,
     [int]$ResidentStartTimeout = 1800,
     [ValidateSet("auto", "14b", "32b")]
     [string]$ModelSize = "auto",
@@ -104,6 +105,7 @@ try {
         $argsList += @("--resident-server", $ServerExe,
                        "--resident-start-timeout", [string]$ResidentStartTimeout)
     }
+    if ($SkipLegacyLogitsCheck) { $argsList += "--skip-legacy-logits-check" }
     if ($OutDir) { $argsList += @("--out-dir", $OutDir) }
     if ($Layouts) { $argsList += @("--layouts", $Layouts) }
     if ($CpuLayers -ge 0) { $argsList += @("--cpu-layers", [string]$CpuLayers) }
