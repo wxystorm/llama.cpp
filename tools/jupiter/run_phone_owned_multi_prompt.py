@@ -4,7 +4,7 @@
 A -> B -> A checks whether the first Graph survives creation of a second
 execution shape. The phone RPC server must remain alive between invocations.
 Only fresh one-shot native Qwen3 Prefill is supported (context <=4096,
-1..16 Phone layers, no Decode KV handoff).
+model-dependent Phone suffix, no Decode KV handoff).
 """
 from __future__ import annotations
 
