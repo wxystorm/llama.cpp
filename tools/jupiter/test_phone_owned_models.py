@@ -33,6 +33,10 @@ class TestModelsAndSplits(unittest.TestCase):
         self.assertEqual(m.resolve_splits(model), ([32], 16))
         self.assertEqual(m.resolve_splits(model, layouts="32,34,39"),
                          ([32, 34, 39], 16))
+        self.assertEqual(m.resolve_splits(
+            model, phone_layers=24, cuda_layers=12), ([16], 4))
+        self.assertEqual(m.resolve_splits(
+            model, phone_layers=39, cuda_layers=1), ([1], 0))
 
     def test_32b_defaults_and_overrides(self):
         with patch.object(m, "read_gguf_weights",
@@ -47,6 +51,15 @@ class TestModelsAndSplits(unittest.TestCase):
             ([56, 58, 60, 63], 44))
         self.assertEqual(m.resolve_splits(
             model, phone_layers=4, cpu_layers=48), ([60], 48))
+        # >16 Phone layers are now valid in the model contract;
+        # the device memory planner still makes the actual admission decision.
+        for count in (16, 20, 24, 32, 40, 63):
+            positions, cpu = m.resolve_splits(
+                model, phone_layers=count, cuda_layers=1)
+            self.assertEqual(positions, [64 - count])
+            self.assertEqual(cpu, 63 - count)
+        self.assertEqual(m.resolve_splits(
+            model, phone_layers=24, cuda_layers=12), ([40], 28))
 
     def test_bad_gguf_dimensions_rejected(self):
         model = self.mock_gguf(64)
@@ -72,8 +85,8 @@ class TestModelsAndSplits(unittest.TestCase):
     def test_invalid_splits_rejected(self):
         model = m.ModelLayout("32b", 64, 5120, 64, 8, 128)
         for options in (
-            {"layouts": "55"}, {"layouts": "64"}, {"cpu_layers": 56},
-            {"phone_layers": 0}, {"phone_layers": 9},
+            {"layouts": "0"}, {"layouts": "64"}, {"cpu_layers": 56},
+            {"phone_layers": 0}, {"phone_layers": 64},
             {"cuda_layers": 0}, {"cuda_layers": 60},
             {"layouts": "56", "phone_layers": 8},
             {"layouts": "56", "cuda_layers": 12},
