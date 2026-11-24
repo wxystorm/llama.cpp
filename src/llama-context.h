@@ -148,6 +148,8 @@ struct llama_context {
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
 
+    bool jupiter_reset_prefill();
+
     //
     // state save/load
     //

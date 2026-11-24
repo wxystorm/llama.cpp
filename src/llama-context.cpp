@@ -659,22 +659,34 @@ struct jupiter_phone_owned_native_state {
         ++state->next_chunk;
     }
 
-    void reset_run() {
-        // The Phone RPC RESET must never free Graph/KV while a worker
-        // is executing a previously submitted Chunk.
+    bool reset_run() {
+        // Keep the object address stable: PC graphs reference this state.
+        // The Phone RPC RESET must never free Graph/KV while work is active.
         stop_async();
-        if (prepared && reset_fn) {
-            if (!reset_fn(endpoint.c_str(), run_id)) {
+        if (prepared) {
+            if (!reset_fn || !reset_fn(endpoint.c_str(), run_id)) {
                 LLAMA_LOG_ERROR(
                     "[JUPITER_PHONE_OWNED_PREFILL] phase=RESET"
                     " run=%" PRIu64 " status=FAIL\n", run_id);
-            } else {
-                LLAMA_LOG_INFO(
-                    "[JUPITER_PHONE_OWNED_PREFILL] phase=RESET"
-                    " run=%" PRIu64 " status=PASS\n", run_id);
+                return false;
             }
+            LLAMA_LOG_INFO(
+                "[JUPITER_PHONE_OWNED_PREFILL] phase=RESET"
+                " run=%" PRIu64 " status=PASS\n", run_id);
         }
-        prepared = false;
+        run_id = 0;
+        total_tokens = chunk_tokens = chunk_count = next_chunk = 0;
+        chunk_schedule.fill(0);
+        phone_first_layer = phone_layers = 0;
+        prepared = completed = failed = false;
+        failure.clear();
+        autonomous_enabled = async_enabled = async_stop = false;
+        async_completed = 0;
+        async_in_flight = 0;
+        async_error.clear();
+        async_jobs.clear();
+        async_final_output.clear();
+        return true;
     }
 };
 
@@ -2592,6 +2604,28 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
         }
     }
     return false; // all sequences use backend sampling
+}
+
+bool llama_context::jupiter_reset_prefill() {
+    const char * resident = std::getenv("LLAMA_JUPITER_RESIDENT_SERVER");
+    const char * prefill = std::getenv("LLAMA_JUPITER_PREFILL");
+    if (!resident || std::strcmp(resident, "1") != 0 ||
+            !prefill || std::strcmp(prefill, "1") != 0 || !memory || !sched) {
+        return false;
+    }
+    synchronize();
+    if (jupiter_phone_native && !jupiter_phone_native->reset_run()) {
+        return false;
+    }
+    // No prefix cache, stale graph inputs, or KV data crosses requests.
+    // The normal decode guard remains intact: only this explicit reset
+    // may open a new fresh Prefill, never an incremental Decode.
+    ggml_backend_sched_reset(sched.get());
+    gf_res_prev->reset();
+    memory->clear(true);
+    ggml_backend_sched_synchronize(sched.get());
+    perf_reset();
+    return true;
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
@@ -4874,6 +4908,10 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
 
 void llama_synchronize(llama_context * ctx) {
     ctx->synchronize();
+}
+
+bool llama_jupiter_reset_prefill(llama_context * ctx) {
+    return ctx && ctx->jupiter_reset_prefill();
 }
 
 float * llama_get_logits(llama_context * ctx) {

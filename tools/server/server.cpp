@@ -4,6 +4,7 @@
 #include "server-cors-proxy.h"
 #include "server-stream.h"
 #include "server-tools.h"
+#include "jupiter-resident.h"
 
 #include "arg.h"
 #include "build-info.h"
@@ -109,6 +110,15 @@ int llama_server(int argc, char ** argv) {
 
 int llama_server(common_params & params, int argc, char ** argv) {
     bool is_run_by_cli = (argv == nullptr);
+    const char * resident = std::getenv("LLAMA_JUPITER_RESIDENT_SERVER");
+    if (!is_run_by_cli && resident && std::string(resident) == "1") {
+        // An isolated experiment-only HTTP service, NOT the ordinary
+        // completion scheduler. Only one fresh Prefill is admitted at a time.
+        const int rc = jupiter_resident_server(params);
+        server_stream_session_manager_stop();
+        llama_backend_free();
+        return rc;
+    }
 
     common_models_handler models_handler;
 
