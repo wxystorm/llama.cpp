@@ -1305,21 +1305,23 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     if (jupiter_prefill) {
         // The original Jupiter layer planner supplies the PC boundary.
-        // Native Phone-owned HTP accepts a contiguous 1..16 layer suffix of
-        // either dense Qwen3 model; do not force the 14B L32 boundary on 32B.
+        // The suffix can span any available Qwen3 layers permitted by the
+        // native RPC layer-device array (64 slots). Real feasibility is
+        // decided by the existing per-session and global HTP memory planner.
         const bool native_qwen3_shape = arch == LLM_ARCH_QWEN3 &&
             ((n_layer_all == 40 && hparams.n_head() == 40) ||
              (n_layer_all == 64 && hparams.n_head() == 64)) &&
             hparams.n_embd == 5120 && hparams.n_head_kv() == 8 &&
             hparams.n_embd_head_k() == 128;
         if (jupiter_phone_native &&
-                (!native_qwen3_shape || jupiter_pc_layers < n_layer_all - 16 ||
-                 jupiter_pc_layers >= n_layer_all)) {
+                (!native_qwen3_shape || jupiter_pc_layers <= 0 ||
+                 jupiter_pc_layers >= n_layer_all ||
+                 n_layer_all - jupiter_pc_layers > 64)) {
             throw std::runtime_error(
                 "Jupiter native Phone-owned Prefill requires dense Qwen3-14B"
-                " (40 layers, PC boundary 24..39) or Qwen3-32B"
-                " (64 layers, PC boundary 48..63), with a contiguous"
-                " 1..16-layer Phone suffix and 5120 hidden features");
+                " (40 layers) or Qwen3-32B (64 layers), with a contiguous"
+                " Phone suffix bounded by the 64-layer RPC descriptor,"
+                " a nonempty PC prefix, and 5120 hidden features");
         }
         if (split_mode != LLAMA_SPLIT_MODE_LAYER) {
             throw std::runtime_error("LLAMA_JUPITER_PREFILL requires --split-mode layer");
