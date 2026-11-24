@@ -830,7 +830,7 @@ llama_context::llama_context(
             jupiter_stage_dump =
                 std::make_unique<jupiter_stage_dump_state>(
                      dump_dir, target, model.vocab.n_tokens(),
-                     hparams.n_layer, hparams.n_embd);
+                     hparams.n_layer(), hparams.n_embd);
             cparams.cb_eval = jupiter_stage_dump_state::observe;
             cparams.cb_eval_user_data = jupiter_stage_dump.get();
             LLAMA_LOG_INFO(
