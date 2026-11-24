@@ -34,13 +34,13 @@ def arguments() -> argparse.Namespace:
     p.add_argument("--prompt-file", required=True)
     p.add_argument("--sessions", type=int, choices=(1, 2, 3, 4), default=1)
     p.add_argument("--pc-layers", type=int, default=None,
-                   help="first Phone HTP layer (14B 24..39, 32B 48..63)")
+                   help="first Phone HTP layer (14B 1..39, 32B 1..63)")
     p.add_argument("--cpu-layers", type=int, default=None,
                    help="PC CPU prefix; auto 16 for 14B / 44 for 32B")
     p.add_argument("--cuda-layers", type=int, default=None,
                    help="number of PC CUDA layers, derives CPU count")
     p.add_argument("--phone-layers", type=int, default=None,
-                   help="number of Phone HTP suffix layers (1..16)")
+                   help="Phone suffix layers, bounded by model and 64 RPC slots")
     p.add_argument("--context", type=int, default=2048,
                    help="KV capacity, 256..4096; formal full suite locks 2048")
     p.add_argument("--target-tokens", type=int, default=175)
