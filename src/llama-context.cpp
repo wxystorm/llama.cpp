@@ -43,27 +43,31 @@ struct jupiter_stage_dump_state {
     std::filesystem::path dir;
     uint32_t target_tokens = 175;
     uint32_t output_width = 151936;
+    uint32_t n_layers = 0;
+    uint32_t hidden_width = 0;
     uint32_t active_tokens = 0;
     bool active = false;
     bool failed = false;
     std::map<std::string, uint32_t> seen;
 
     explicit jupiter_stage_dump_state(const std::string & dir_in,
-                                     uint32_t tokens, uint32_t vocab) :
-        dir(dir_in), target_tokens(tokens), output_width(vocab) {}
+                                     uint32_t tokens, uint32_t vocab,
+                                     uint32_t layers, uint32_t hidden) :
+        dir(dir_in), target_tokens(tokens), output_width(vocab),
+        n_layers(layers), hidden_width(hidden) {}
 
     static bool observe(ggml_tensor * t, bool ask, void * user_data) {
         auto * st = static_cast<jupiter_stage_dump_state *>(user_data);
         if (!st || !st->active || !t) { return false == ask; }
         const std::string stage(t->name);
-        // Capture every local Qwen3 suffix boundary so the first
-        // divergence can be found without repeatedly rebuilding the Phone.
+        // Inspect ALL model layers, including CPU/GPU and the first remote
+        // layer. Native only exposes its PC prefix and returned Phone hidden.
         bool layer_checkpoint = false;
         if (stage.rfind("l_out-", 0) == 0) {
             char * end = nullptr;
             const long layer = std::strtol(stage.c_str() + 6, &end, 10);
             layer_checkpoint = end && *end == '\0' &&
-                               layer >= 31 && layer <= 63;
+                               layer >= 0 && layer < long(st->n_layers);
         }
         const bool selected = layer_checkpoint ||
                               stage == "phone_owned_hidden" ||
@@ -72,7 +76,7 @@ struct jupiter_stage_dump_state {
         if (ask) { return selected; }
         if (!selected) { return true; }
         const int64_t expected_width =
-            stage == "result_output" ? st->output_width : 5120;
+            stage == "result_output" ? st->output_width : st->hidden_width;
         if (t->type != GGML_TYPE_F32 || t->ne[0] != expected_width ||
                 !ggml_is_contiguous(t)) {
             st->failed = true;
@@ -94,7 +98,7 @@ struct jupiter_stage_dump_state {
         }
         if (t->buffer == nullptr ||
                 bytes % sizeof(float) != 0 ||
-                bytes > size_t(4096)*5120*sizeof(float)) {
+                bytes > size_t(4096)*std::max(st->hidden_width, st->output_width)*sizeof(float)) {
             st->failed = true;
             LLAMA_LOG_ERROR("[JUPITER_STAGE_DUMP] stage=%s status=FAIL"
                             " reason=BAD_TENSOR_SIZE bytes=%zu\n",
@@ -825,7 +829,8 @@ llama_context::llama_context(
             }
             jupiter_stage_dump =
                 std::make_unique<jupiter_stage_dump_state>(
-                     dump_dir, target, model.vocab.n_tokens());
+                     dump_dir, target, model.vocab.n_tokens(),
+                     hparams.n_layer, hparams.n_embd);
             cparams.cb_eval = jupiter_stage_dump_state::observe;
             cparams.cb_eval_user_data = jupiter_stage_dump.get();
             LLAMA_LOG_INFO(

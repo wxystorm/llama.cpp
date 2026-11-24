@@ -390,6 +390,9 @@ struct ggml_backend_rpc_device_context {
     std::string name;
     std::string description;
     std::unordered_set<uint64_t> graph_uids;
+    // The legacy Jupiter UID describes topology/slot, not physical memory.
+    // Keep the most recently registered binding for each topology.
+    std::unordered_map<uint64_t, uint64_t> jupiter_graph_bindings;
 };
 
 struct ggml_backend_rpc_buffer_type_context {
@@ -422,12 +425,16 @@ struct ggml_backend_rpc_event_context {
 
 static std::atomic<uint64_t> g_jupiter_event_id {1};
 static std::atomic<uint64_t> g_jupiter_legacy_compute_lane_id {1};
+static std::atomic<uint64_t> g_rpc_buffer_generation {1};
 
 struct ggml_backend_rpc_buffer_context {
     std::shared_ptr<socket_t> sock;
     void * base_ptr;
     uint64_t remote_ptr;
     std::string endpoint;
+    // An allocator can reuse the same remote pointer and data address after
+    // freeing a buffer. A fresh allocation must still invalidate bindings.
+    uint64_t generation = g_rpc_buffer_generation.fetch_add(1);
 
     // Jupiter rebuilds the local llama graph for each ubatch so it can rotate
     // scheduler copies without globally synchronizing. The remote OpenCL tensor
@@ -1540,7 +1547,7 @@ static uint64_t rpc_hash_u64(uint64_t h, uint64_t v) {
     return h;
 }
 
-static uint64_t rpc_graph_jupiter_uid(const ggml_cgraph * cgraph) {
+static uint64_t rpc_graph_jupiter_uid(const ggml_cgraph * cgraph, uint64_t * binding = nullptr) {
     // Build a pointer-independent topology signature. The DFS index captures
     // source/view relationships, while tensor names capture the scheduler slot
     // suffix (#0/#1). Shapes/op_params distinguish the short tail graph.
@@ -1568,8 +1575,27 @@ static uint64_t rpc_graph_jupiter_uid(const ggml_cgraph * cgraph) {
     uid = jupiter_hash_bytes(uid, &cgraph->n_nodes, sizeof(cgraph->n_nodes));
     const uint32_t tensor_count = (uint32_t) ordered.size();
     uid = jupiter_hash_bytes(uid, &tensor_count, sizeof(tensor_count));
+    uint64_t bound = jupiter_hash_bytes(0xcbf29ce484222325ULL, &tensor_count, sizeof(tensor_count));
 
     for (const ggml_tensor * tensor : ordered) {
+        // GRAPH_RECOMPUTE sends no tensors: the phone uses the pointers
+        // from the previous GRAPH_COMPUTE/REGISTER. Include ALL leaves,
+        // views, weights, KV and intermediate tensors in binding identity.
+        if (binding) {
+            uint64_t generation = 0, remote = 0, data = 0;
+            if (tensor->buffer && ggml_backend_buffer_is_rpc(tensor->buffer)) {
+                const auto * buf = static_cast<const ggml_backend_rpc_buffer_context *>(
+                    tensor->buffer->context);
+                if (buf) {
+                    generation = buf->generation;
+                    remote = buf->remote_ptr;
+                    data = reinterpret_cast<uint64_t>(tensor->data);
+                }
+            }
+            bound = jupiter_hash_bytes(bound, &generation, sizeof(generation));
+            bound = jupiter_hash_bytes(bound, &remote, sizeof(remote));
+            bound = jupiter_hash_bytes(bound, &data, sizeof(data));
+        }
         uid = jupiter_hash_bytes(uid, &tensor->type, sizeof(tensor->type));
         uid = jupiter_hash_bytes(uid, &tensor->op, sizeof(tensor->op));
         uid = jupiter_hash_bytes(uid, tensor->ne, sizeof(tensor->ne));
@@ -1604,7 +1630,21 @@ static uint64_t rpc_graph_jupiter_uid(const ggml_cgraph * cgraph) {
         uid = jupiter_hash_bytes(uid, &it->second, sizeof(it->second));
     }
 
+    if (binding) {
+        *binding = bound != 0 ? bound : 1;
+    }
     return uid != 0 ? uid : 0x4a55504954455231ULL;
+}
+
+static bool rpc_jupiter_force_graph_build() {
+    const char * value = std::getenv("LLAMA_JUPITER_RPC_FORCE_GRAPH_BUILD");
+    return value && std::atoi(value) != 0;
+}
+
+static bool rpc_jupiter_binding_matches(
+        const ggml_backend_rpc_device_context * ctx, uint64_t uid, uint64_t binding) {
+    const auto it = ctx->jupiter_graph_bindings.find(uid);
+    return it != ctx->jupiter_graph_bindings.end() && it->second == binding;
 }
 
 static int rpc_graph_jupiter_slot(const ggml_cgraph * cgraph) {
@@ -1775,8 +1815,13 @@ static bool ggml_backend_rpc_graph_prebuild(ggml_backend_t backend, ggml_cgraph 
     }
     auto * dev = ggml_backend_get_device(backend);
     auto * dev_ctx = static_cast<ggml_backend_rpc_device_context *>(dev->context);
-    const uint64_t uid = rpc_graph_effective_uid(cgraph);
-    if (dev_ctx->graph_uids.find(uid) != dev_ctx->graph_uids.end()) {
+    uint64_t binding = 0;
+    const bool jupiter = jupiter_prefill_enabled();
+    const uint64_t uid = jupiter ? rpc_graph_jupiter_uid(cgraph, &binding) :
+                                   rpc_graph_effective_uid(cgraph);
+    if (dev_ctx->graph_uids.find(uid) != dev_ctx->graph_uids.end() &&
+            (!jupiter || (!rpc_jupiter_force_graph_build() &&
+                          rpc_jupiter_binding_matches(dev_ctx, uid, binding)))) {
         return true;
     }
 
@@ -1795,6 +1840,9 @@ static bool ggml_backend_rpc_graph_prebuild(ggml_backend_t backend, ggml_cgraph 
         return false;
     }
     dev_ctx->graph_uids.insert(uid);
+    if (jupiter) {
+        dev_ctx->jupiter_graph_bindings[uid] = binding;
+    }
     GGML_LOG_INFO("[JUPITER_GRAPH_PREBUILD] phase=PHONE_REGISTER uid=%" PRIu64
                   " slot=%d nodes=%d bytes=%zu wall_ms=%.3f status=READY\n",
                   uid, rpc_graph_jupiter_slot(cgraph), cgraph->n_nodes,
@@ -1827,9 +1875,32 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         }
     }
 
-    const uint64_t graph_uid = rpc_graph_effective_uid(cgraph); //这个是客户端的
+    const bool jupiter = jupiter_prefill_enabled();
+    uint64_t binding = 0;
+    const uint64_t graph_uid = jupiter ? rpc_graph_jupiter_uid(cgraph, &binding) :
+                                         rpc_graph_effective_uid(cgraph);
     bool reuse = rpc_dev_ctx->graph_uids.find(graph_uid) != rpc_dev_ctx->graph_uids.end();
-    const int jupiter_slot = jupiter_prefill_enabled() ? rpc_graph_jupiter_slot(cgraph) : -1;
+    const int jupiter_slot = jupiter ? rpc_graph_jupiter_slot(cgraph) : -1;
+    if (jupiter) {
+        const bool forced = rpc_jupiter_force_graph_build();
+        const bool matched = rpc_jupiter_binding_matches(rpc_dev_ctx, graph_uid, binding);
+        if (reuse && (forced || !matched)) {
+            GGML_LOG_INFO("[JUPITER_GRAPH_BINDING] device=%u uid=%" PRIu64
+                          " slot=%d action=REBUILD reason=%s binding=%" PRIu64 "\n",
+                          rpc_ctx->device, graph_uid, jupiter_slot,
+                          forced ? "FORCED_DIAGNOSTIC" : "REMOTE_BINDING_CHANGED", binding);
+            reuse = false;
+        }
+    }
+    // Register the replacement under the SAME topology UID; do not grow the
+    // phone cache for each allocator address. The legacy compute lane orders
+    // graph replacement and execution, including queued C2P mode.
+    const auto remember_graph = [&] {
+        rpc_dev_ctx->graph_uids.insert(graph_uid);
+        if (jupiter) {
+            rpc_dev_ctx->jupiter_graph_bindings[graph_uid] = binding;
+        }
+    };
 
     if (rpc_ctx->comm) {
         uint64_t task = 0;
@@ -1842,7 +1913,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             std::vector<uint8_t> input;
             serialize_graph(rpc_ctx->device, graph_uid, cgraph, input);
             task = rpc_ctx->comm->enqueue_graph_build(std::move(input), graph_uid, jupiter_slot);
-            rpc_dev_ctx->graph_uids.insert(graph_uid);
+            remember_graph();
         }
         if (timeline) {
             const int64_t t1 = ggml_time_us();
@@ -1883,7 +1954,6 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             sizeof(request));
         RPC_STATUS_ASSERT(status);
     } else {
-        rpc_dev_ctx->graph_uids.insert(graph_uid);
         std::vector<uint8_t> input;
         serialize_graph(rpc_ctx->device, graph_uid, cgraph, input);
         bool status = send_rpc_compute_cmd(
@@ -1906,6 +1976,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             n_tensors,
             input.size());
         RPC_STATUS_ASSERT(status);
+        remember_graph();
     }
     return GGML_STATUS_SUCCESS;
 }
