@@ -161,7 +161,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--stage2-repeats", type=int, default=2)
     p.add_argument("--q-repeats", type=int, default=2)
     p.add_argument("--refine-repeats", type=int, default=2)
-    p.add_argument("--max-rounds", type=int, default=6)
+    p.add_argument("--max-rounds", type=int, default=0,
+                   help="0: exact DP refinement until measured; positive: finite budget")
     p.add_argument("--max-chunk", type=int, default=128,
                    help="original Jupiter q(x,y) max UBatch/Chunk size")
     p.add_argument("--run-mode", choices=("both", "sync", "autonomous"),
@@ -816,7 +817,7 @@ def run() -> int:
     if (args.repeats < 1 or args.expected_count < 0 or args.chunk_size < 1 or
             args.timeout_seconds < 0 or args.stage2_repeats < 1 or
             args.q_repeats < 1 or args.refine_repeats < 1 or
-            args.max_rounds < 1 or args.max_chunk < 1 or
+            args.max_rounds < 0 or args.max_chunk < 1 or
             args.max_chunk > 2048):
         raise ValueError("Invalid repeat, expected-count, Chunk or timeout")
     if args.min_chunk_json and not Path(args.min_chunk_json).is_file():

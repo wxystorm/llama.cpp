@@ -43,7 +43,7 @@ param(
     [int]$Stage2Repeats = 2,
     [int]$QRepeats = 2,
     [int]$RefineRepeats = 2,
-    [int]$MaxRounds = 6,
+    [int]$MaxRounds = 0,
     [int]$TimeoutSeconds = 1800,
     [switch]$Resume,
     [switch]$DryRun,

@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import itertools
 import json
 import os
 import sys
@@ -88,11 +89,13 @@ def read_profile(path: Path) -> list[dict[str, str]]:
 
 def write_profile(rows: Sequence[dict[str, str]], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as f:
+    temp = path.with_name(path.name + ".tmp")
+    with temp.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
         writer.writeheader()
         for row in rows:
             writer.writerow({name: row[name] for name in FIELDNAMES})
+    temp.replace(path)
 
 
 def targeted_rows(
@@ -147,7 +150,9 @@ def get_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-subsequences", type=int, default=None)
     p.add_argument("--metric", choices=["compute_ms", "wall_ms"], default="compute_ms")
     p.add_argument("--repeats", type=int, default=3)
-    p.add_argument("--max-rounds", type=int, default=3)
+    p.add_argument("--max-rounds", type=int, default=0,
+                   help="0: refine until the selected plan is fully measured; "
+                        "positive: explicit finite iteration budget")
     p.add_argument(
         "--accept-measured-candidate", action="store_true",
         help="budgeted DP: after the last refinement round, use its selected "
@@ -204,7 +209,8 @@ def main() -> int:
     if (
         args.min_chunk <= 0 or args.max_chunk < args.min_chunk
         or args.cpu_layers < 0 or args.cpu_layers >= args.pc_layers
-        or args.repeats < 1 or args.max_rounds < 1
+        or args.repeats < 1 or args.max_rounds < 0
+        or (args.accept_measured_candidate and args.max_rounds == 0)
         or args.batch > args.context or args.max_chunk > args.batch
     ):
         raise ValueError("invalid chunk bounds, batch/context or repeat/round count")
@@ -297,7 +303,12 @@ def main() -> int:
     )
 
     selected_candidate = None
-    for iteration in range(1, args.max_rounds + 1):
+    # The exact solver has a finite coordinate domain. Each incomplete
+    # iteration must strictly increase fully measured coverage. With
+    # unlimited rounds there is therefore no artificial prompt failure.
+    rounds = (range(1, args.max_rounds + 1) if args.max_rounds
+              else itertools.count(1))
+    for iteration in rounds:
         profile = QProfile(all_rows, metric=args.metric,
                            require_cpu=args.cpu_layers > 0)
         solution = solve_sequence(
@@ -388,6 +399,12 @@ def main() -> int:
                 )
 
             all_rows.extend(point_rows)
+            updated = QProfile(all_rows, metric=args.metric,
+                               require_cpu=args.cpu_layers > 0)
+            if not updated.is_measured(x, y):
+                raise RuntimeError(
+                    f"Refinement made no valid progress at q({x},{y}); "
+                    "check complete CPU/CUDA/HTP stage coverage")
             write_profile(all_rows, merged_profile)
             print(
                 f"[JUPITER_REFINE_COMMIT] x={x} y={y} "

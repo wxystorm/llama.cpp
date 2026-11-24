@@ -254,7 +254,8 @@ def parser() -> argparse.ArgumentParser:
                    help="comma-separated first-chunk seeds; auto if omitted")
     p.add_argument("--q-repeats", type=int, default=2)
     p.add_argument("--refine-repeats", type=int, default=2)
-    p.add_argument("--max-rounds", type=int, default=6)
+    p.add_argument("--max-rounds", type=int, default=0,
+                   help="0: converge with complete measured q coverage; positive: finite budget")
     p.add_argument("--accept-measured-candidate", action="store_true",
                    help="stop after a bounded number of refinement rounds and "
                         "verify its last measured candidate, rather than require "
@@ -333,7 +334,8 @@ def main() -> int:
                 flush=True,
             )
     if (args.cpu_layers < 0 or args.cpu_layers >= pc or
-            args.q_repeats < 1 or args.refine_repeats < 1 or args.max_rounds < 1 or
+            args.q_repeats < 1 or args.refine_repeats < 1 or args.max_rounds < 0 or
+            (args.accept_measured_candidate and args.max_rounds == 0) or
             args.ubatch < max_chunk or args.batch < args.ubatch or
             args.context < args.batch):
         raise ValueError("invalid repeat count, max-rounds or context/batch bounds")
