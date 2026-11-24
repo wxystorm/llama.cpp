@@ -283,6 +283,21 @@ class Test32BFullSuite(unittest.TestCase):
             self.assertEqual(manifest["phone_layer_counts"], [8])
             self.assertEqual(manifest["prompts"][0]["tokens"], 358)
             self.assertEqual(manifest["prompts"][0]["context"], 2048)
+            # The full-suite dry-run must also admit >16 Phone layers
+            # without changing Context or the 16-Chunk DP capacity.
+            args.out_dir = str(base / "output-phone24")
+            args.phone_layers = 24
+            with patch.object(suite, "parse_args", return_value=args), \
+                 patch.object(suite, "inspect_model", return_value=spec), \
+                 patch.object(suite, "count_model_tokens", return_value=358):
+                self.assertEqual(suite.run(), 0)
+            extended = json.loads(
+                (base / "output-phone24" / "suite-manifest.json").read_text(
+                    encoding="utf-8"))["config"]
+            self.assertEqual(extended["cpu_layers"], 28)
+            self.assertEqual(extended["layouts"], [40])
+            self.assertEqual(extended["phone_layer_counts"], [24])
+            self.assertEqual(extended["context"], 2048)
 
 
 if __name__ == "__main__":
