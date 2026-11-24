@@ -9,14 +9,17 @@
 #include <string>
 #include <vector>
 
-static ggml_phone_owned::region_plan qwen3_14b_plan() {
+static ggml_phone_owned::region_plan qwen3_14b_plan(uint32_t phone_layers) {
     ggml_phone_owned::region_plan p {};
-    p.version         = ggml_phone_owned::k_multi_plan_version;
-    p.flags           = ggml_phone_owned::flags_for_layers(8);
+    p.version         = phone_layers == 1 ?
+        ggml_phone_owned::k_plan_version : ggml_phone_owned::k_multi_plan_version;
+    p.flags           = phone_layers == 1 ?
+        ggml_phone_owned::k_flag_flash_attn :
+        ggml_phone_owned::flags_for_layers(phone_layers);
     p.run_id          = 20261122;
     p.p2c_run_id      = 20261122;
     p.region          = 0;
-    p.layer           = 32;
+    p.layer           = 40 - phone_layers;
     p.total_tokens    = 175;
     p.chunk_tokens    = 88;
     p.n_embd          = 5120;
@@ -40,20 +43,40 @@ static ggml_phone_owned::region_plan qwen3_14b_plan() {
 }
 
 int main(int argc, char ** argv) {
-    if (argc < 3 || argc > 4 ||
-            (std::atoi(argv[2]) < 1 || std::atoi(argv[2]) > 4)) {
+    if (argc < 3 || std::atoi(argv[2]) < 1 || std::atoi(argv[2]) > 4) {
         std::fprintf(stderr,
-            "usage: %s <phone-host:port> <sessions:1..4> [--run|--auto-run]\n"
+            "usage: %s <phone-host:port> <sessions:1..4>"
+            " [--layers <1..39>] [--run|--auto-run]\n"
             "Requires a rebuilt phone RPC server exposing HTP devices\n"
             "and a local Qwen3-14B GGUF tensor source.\n", argv[0]);
         return 2;
     }
-    if (argc == 4 && std::string(argv[3]) != "--run" &&
-            std::string(argv[3]) != "--auto-run") {
-        return 2;
+    // Preserve the old eight-layer smoke as the default, while allowing
+    // any 14B suffix with a nonempty PC prefix.
+    uint32_t phone_layers = 8;
+    bool execute = false;
+    bool autonomous = false;
+    for (int i = 3; i < argc; ++i) {
+        const std::string arg(argv[i]);
+        if (arg == "--run" || arg == "--auto-run") {
+            if (execute) { return 2; }
+            execute = true;
+            autonomous = arg == "--auto-run";
+        } else if (arg == "--layers" && i + 1 < argc) {
+            char * end = nullptr;
+            const char * value = argv[++i];
+            const unsigned long count = std::strtoul(value, &end, 10);
+            if (end == value || *end != '\0' || count < 1 || count >= 40 ||
+                    count > ggml_phone_owned::k_max_phone_layers_per_region) {
+                std::fprintf(stderr, "invalid 14B Phone layer count: %s\n", value);
+                return 2;
+            }
+            phone_layers = static_cast<uint32_t>(count);
+        } else {
+            return 2;
+        }
     }
     // Refuse older server protocol before sending native opcodes.
-    const bool autonomous = argc == 4 && std::string(argv[3]) == "--auto-run";
 #ifdef _WIN32
     _putenv_s("LLAMA_JUPITER_PHONE_OWNED_NATIVE", "1");
     if (autonomous) { _putenv_s("LLAMA_JUPITER_PHONE_OWNED_AUTONOMOUS", "1"); }
@@ -62,16 +85,16 @@ int main(int argc, char ** argv) {
     if (autonomous) { setenv("LLAMA_JUPITER_PHONE_OWNED_AUTONOMOUS", "1", 1); }
 #endif
     const std::string endpoint(argv[1]);
-    const bool execute = argc == 4;
     const int sessions = std::atoi(argv[2]);
-    auto p = qwen3_14b_plan();
+    auto p = qwen3_14b_plan(phone_layers);
     const char * reason = "NONE";
     if (!ggml_phone_owned::validate(p, reason)) {
         std::fprintf(stderr, "invalid plan: %s\n", reason);
         return 2;
     }
-    // The original eight-layer S4 layout remains [0,0,1,1,2,2,3,3].
-    std::vector<uint32_t> devices(8, 0);
+    // Map every Phone layer to its balanced HTP Session; the original
+    // eight-layer S4 layout remains [0,0,1,1,2,2,3,3].
+    std::vector<uint32_t> devices(phone_layers, 0);
     for (size_t i = 0; i < devices.size(); ++i) {
         devices[i] = static_cast<uint32_t>(i*sessions/devices.size());
     }
@@ -81,10 +104,10 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "native phone-owned prepare FAILED\n");
         return 1;
     }
-    std::printf("[PHONE_OWNED_SMOKE] event=PREPARE sessions=%d"
+    std::printf("[PHONE_OWNED_SMOKE] event=PREPARE sessions=%d layers=%u"
                 " graphs=%u model_load_ms=%.3f build_ms=%.3f"
                 " buffer_ms=%.3f precompile_ms=%.3f wall_ms=%.3f status=PASS\n",
-                sessions, prep.graphs, prep.model_load_ms, prep.build_ms,
+                sessions, phone_layers, prep.graphs, prep.model_load_ms, prep.build_ms,
                 prep.buffer_alloc_ms, prep.precompile_ms, prep.wall_ms);
 
     bool ok = true;
@@ -119,7 +142,7 @@ int main(int argc, char ** argv) {
                 endpoint.c_str(), p.run_id, p.p2c_run_id,
                 p.region, output, st);
             ok = ok && output.size() == size_t(last_tokens)*p.n_embd &&
-                st.layers == 8 && st.tokens == last_tokens &&
+                st.layers == phone_layers && st.tokens == last_tokens &&
                 std::all_of(output.begin(), output.end(),
                     [](float x) { return std::isfinite(x); });
             std::printf("[PHONE_OWNED_SMOKE] AUTO_P2C"
@@ -152,7 +175,7 @@ int main(int argc, char ** argv) {
                         chunk, st.tokens, st.layers, st.upload_ms,
                         st.compute_ms, st.output_copy_ms, st.wall_ms,
                         finite ? "PASS" : "FAIL");
-            if (!finite) { ok = false; break; }
+            if (!finite || st.layers != phone_layers) { ok = false; break; }
         }
     }
 

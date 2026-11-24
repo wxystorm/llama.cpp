@@ -77,6 +77,16 @@ inline uint32_t flags_for_layers(uint32_t n_layers) {
     return k_flag_flash_attn |
         (n_layers << k_layer_count_shift);
 }
+// The RPC PREPARE wire request carries one device index per Phone layer,
+// NOT one index per HTP Session. Keep this limit tied to the 64-slot
+// protocol descriptor instead of the original eight-layer pilot.
+inline bool valid_layer_device_count(
+        const region_plan & plan, size_t mapped_layers) {
+    return mapped_layers != 0 &&
+        mapped_layers <= k_max_phone_layers_per_region &&
+        mapped_layers == layer_count(plan);
+}
+
 inline uint32_t internal_layer_region(
         const region_plan & parent, uint32_t offset) {
     return layer_count(parent) == 1 ? parent.region :

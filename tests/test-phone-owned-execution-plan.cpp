@@ -77,6 +77,21 @@ int main() {
             CHECK(validate(child, reason));
         }
     }
+    // Model-driven 14B suffixes have 1..39 Phone layers. The C ABI
+    // must accept every matching device map, not only the old eight-layer
+    // pilot. A device index is supplied per layer, not per HTP Session.
+    for (uint32_t count : {1u, 8u, 9u, 16u, 20u, 24u, 32u, 39u}) {
+        auto native14 = a;
+        native14.region = 0;
+        native14.layer = 40 - count;
+        native14.version = count == 1 ? k_plan_version : k_multi_plan_version;
+        native14.flags = count == 1 ? k_flag_flash_attn : flags_for_layers(count);
+        CHECK(validate(native14, reason));
+        CHECK(valid_layer_device_count(native14, count));
+        CHECK(!valid_layer_device_count(native14, 0));
+        CHECK(!valid_layer_device_count(native14, count - 1));
+        CHECK(!valid_layer_device_count(native14, count + 1));
+    }
     // The RPC PREPARE descriptor has 64 layer-device slots, while the
     // model loader requires at least one PC layer. Plans of >16 Phone
     // layers must not be rejected by the generic graph/transport contract.
@@ -93,6 +108,10 @@ int main() {
         native32.flags = flags_for_layers(count);
         CHECK(validate(native32, reason));
         CHECK(layer_count(native32) == count);
+        CHECK(valid_layer_device_count(native32, count));
+        CHECK(!valid_layer_device_count(native32, 0));
+        CHECK(!valid_layer_device_count(native32, count - 1));
+        CHECK(!valid_layer_device_count(native32, count + 1));
         const auto last = single_layer_plan(native32, count - 1);
         CHECK(last.layer == 63);
         CHECK(validate(last, reason));
@@ -102,6 +121,7 @@ int main() {
     too_many_phone_layers.version = k_multi_plan_version;
     too_many_phone_layers.flags = flags_for_layers(65);
     CHECK(!validate(too_many_phone_layers, reason));
+    CHECK(!valid_layer_device_count(too_many_phone_layers, 65));
     CHECK(owned_task_uid(15, 0) != owned_task_uid(1, 0));
     CHECK(chunk_count(a) == 4);
     // Jupiter original q(x,y) Sequence DP can use nonuniform widths.

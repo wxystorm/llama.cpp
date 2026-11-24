@@ -2124,12 +2124,15 @@ bool prepare(const char * endpoint,
     stats = {};
     const char * why = nullptr;
     const size_t count = ggml_phone_owned::layer_count(plan);
-    if (!endpoint || !ggml_phone_owned::validate(plan, why) ||
-            count == 0 ||
-            count > ggml_phone_owned::k_max_phone_layers_per_region ||
-            layer_devices.size() != count) {
-        GGML_LOG_ERROR("[JUPITER_PHONE_OWNED] prepare rejected: %s\n",
-                       why ? why : "DEVICE_MAP_OR_ENDPOINT");
+    const bool valid_plan = ggml_phone_owned::validate(plan, why);
+    if (!endpoint || !valid_plan ||
+            !ggml_phone_owned::valid_layer_device_count(plan, layer_devices.size())) {
+        GGML_LOG_ERROR("[JUPITER_PHONE_OWNED] prepare rejected: %s"
+                       " layers=%zu mapped=%zu capacity=%u\n",
+                       !valid_plan ? (why ? why : "INVALID_PLAN") :
+                       "DEVICE_MAP_OR_ENDPOINT",
+                       count, layer_devices.size(),
+                       ggml_phone_owned::k_max_phone_layers_per_region);
         return false;
     }
     rpc_msg_phone_owned_prepare_req req {};
@@ -3400,8 +3403,9 @@ static bool jupiter_phone_owned_dump_stage(
         const std::vector<float> & values) {
     const char * directory =
         std::getenv("GGML_RPC_PHONE_OWNED_STAGE_DUMP_DIR");
-    // Native Phone suffix may end at Qwen3-14B L39 or Qwen3-32B L63.
-    if (!directory || !*directory || layer < 32 || layer > 63) {
+    // The Phone suffix boundary is model/placement-dependent (e.g. L20
+    // for 14B Phone20), not always L32. The caller owns a validated plan.
+    if (!directory || !*directory) {
         return true;
     }
     if (values.empty() || values.size() % 5120 != 0) {
@@ -5361,16 +5365,24 @@ static bool ggml_backend_rpc_phone_owned_native_prepare(
         const ggml_rpc_phone_owned_plan * input,
         const uint32_t * layer_devices, uint32_t n_devices,
         ggml_rpc_phone_owned_prepare_stats * stats) {
-    if (!endpoint || !input || !layer_devices || !stats ||
-            n_devices == 0 || n_devices > 8) {
+    if (!endpoint || !input || !layer_devices || !stats) {
+        GGML_LOG_ERROR("[JUPITER_PHONE_OWNED] prepare rejected:"
+                       " MISSING_C_ABI_ARGUMENT\n");
         return false;
     }
     *stats = {};
     ggml_phone_owned::region_plan plan {};
     jupiter_phone_owned_copy_plan(plan, *input);
     const char * reason = "NONE";
-    if (!ggml_phone_owned::validate(plan, reason) ||
-            n_devices != ggml_phone_owned::layer_count(plan)) {
+    const bool valid_plan = ggml_phone_owned::validate(plan, reason);
+    if (!valid_plan ||
+            !ggml_phone_owned::valid_layer_device_count(plan, n_devices)) {
+        GGML_LOG_ERROR("[JUPITER_PHONE_OWNED] prepare rejected: %s"
+                       " layers=%u mapped=%u capacity=%u\n",
+                       valid_plan ? "LAYER_DEVICE_COUNT_MISMATCH" :
+                           (reason ? reason : "INVALID_PLAN"),
+                       ggml_phone_owned::layer_count(plan), n_devices,
+                       ggml_phone_owned::k_max_phone_layers_per_region);
         return false;
     }
     ggml_jupiter_phone_owned::prepare_stats native {};
