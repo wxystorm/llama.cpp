@@ -286,6 +286,7 @@ class Test32BFullSuite(unittest.TestCase):
             # The full-suite dry-run must also admit >16 Phone layers
             # without changing Context or the 16-Chunk DP capacity.
             args.out_dir = str(base / "output-phone24")
+            args.cpu_layers = None  # Let the new CPU boundary be re-derived.
             args.phone_layers = 24
             with patch.object(suite, "parse_args", return_value=args), \
                  patch.object(suite, "inspect_model", return_value=spec), \
