@@ -49,6 +49,87 @@ struct jupiter_stage_dump_state {
     bool active = false;
     bool failed = false;
     std::map<std::string, uint32_t> seen;
+    std::unordered_set<int> detail_layers;
+    uint64_t detail_index = 0;
+
+    // A detailed diagnostic is intentionally statistics-only. Preserve the
+    // existing per-layer F32 dump format and normal benchmark behavior.
+    void configure_detail(const char * list) {
+        if (!list || !*list) { return; }
+        const char * p = list;
+        while (*p) {
+            char * end = nullptr;
+            const long layer = std::strtol(p, &end, 10);
+            if (end == p || layer < -1 || layer >= long(n_layers) ||
+                    (*end != '\0' && *end != ',')) {
+                throw std::runtime_error("invalid LLAMA_JUPITER_STAGE_DUMP_DETAIL_LAYERS");
+            }
+            detail_layers.insert(int(layer));
+            if (*end == '\0') { break; }
+            p = end + 1;
+            if (!*p) {
+                throw std::runtime_error("trailing comma in stage detail layers");
+            }
+        }
+    }
+
+    bool wants_detail(const std::string & name) const {
+        if (detail_layers.empty()) { return false; }
+        const size_t dash = name.rfind('-');
+        if (dash == std::string::npos) {
+            return detail_layers.count(-1) &&
+                   (name == "norm" || name == "result_norm" || name == "result_output");
+        }
+        char * end = nullptr;
+        const char * p = name.c_str() + dash + 1;
+        const long layer = std::strtol(p, &end, 10);
+        return end != p && *end == '\0' && layer >= 0 && layer < long(n_layers) &&
+               detail_layers.count(int(layer));
+    }
+
+    void inspect_detail(ggml_tensor * t) {
+        const size_t bytes = ggml_nbytes(t);
+        if (!t->buffer || !bytes || bytes > (64u << 20) ||
+                t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
+            return;
+        }
+        std::vector<float> values(bytes / sizeof(float));
+        ggml_backend_tensor_get(t, values.data(), 0, bytes);
+        size_t nonfinite = 0;
+        double square_sum = 0.0;
+        double absmax = 0.0;
+        for (const float v : values) {
+            if (!std::isfinite(v)) {
+                ++nonfinite;
+            } else {
+                square_sum += double(v)*double(v);
+                absmax = std::max(absmax, std::abs(double(v)));
+            }
+        }
+        const size_t width = size_t(t->ne[0]);
+        size_t bad_rows = 0;
+        std::string first_rows;
+        for (size_t row = 0; width && row < values.size()/width; ++row) {
+            const auto begin = values.begin() + row*width;
+            if (std::any_of(begin, begin + width, [](float v) { return !std::isfinite(v); })) {
+                if (bad_rows < 16) {
+                    if (!first_rows.empty()) { first_rows += ","; }
+                    first_rows += std::to_string(row);
+                }
+                ++bad_rows;
+            }
+        }
+        LLAMA_LOG_INFO(
+            "[JUPITER_OP_DIAG] seq=%" PRIu64 " name=%s op=%s"
+            " shape=%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64
+            " nonfinite=%zu elements=%zu bad_rows=%zu first_bad_rows=%s"
+            " finite_rms=%.7g absmax=%.7g\n",
+            ++detail_index, t->name, ggml_op_name(t->op),
+            t->ne[0], t->ne[1], t->ne[2], t->ne[3], nonfinite, values.size(),
+            bad_rows, first_rows.empty() ? "-" : first_rows.c_str(),
+            nonfinite == values.size() ? 0.0 :
+                std::sqrt(square_sum/double(values.size()-nonfinite)), absmax);
+    }
 
     explicit jupiter_stage_dump_state(const std::string & dir_in,
                                      uint32_t tokens, uint32_t vocab,
@@ -73,7 +154,11 @@ struct jupiter_stage_dump_state {
                               stage == "phone_owned_hidden" ||
                               stage == "result_norm" ||
                               stage == "result_output";
-        if (ask) { return selected; }
+        const bool detail = st->wants_detail(stage) &&
+                            t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) &&
+                            t->op != GGML_OP_NONE && !ggml_is_empty(t);
+        if (ask) { return selected || detail; }
+        if (detail) { st->inspect_detail(t); }
         if (!selected) { return true; }
         const int64_t expected_width =
             stage == "result_output" ? st->output_width : st->hidden_width;
@@ -831,6 +916,8 @@ llama_context::llama_context(
                 std::make_unique<jupiter_stage_dump_state>(
                      dump_dir, target, model.vocab.n_tokens(),
                      hparams.n_layer(), hparams.n_embd);
+            jupiter_stage_dump->configure_detail(
+                std::getenv("LLAMA_JUPITER_STAGE_DUMP_DETAIL_LAYERS"));
             cparams.cb_eval = jupiter_stage_dump_state::observe;
             cparams.cb_eval_user_data = jupiter_stage_dump.get();
             LLAMA_LOG_INFO(

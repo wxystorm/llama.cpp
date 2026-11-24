@@ -1309,6 +1309,19 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
     RPC_STATUS_ASSERT(status);
 }
 
+// Debug only: compare the host-visible bytes before/after the actual
+// inter-session RPC copy. Equality does NOT prove the consumer DSP sees
+// coherent cache lines. The caller's scheduler owns the synchronization.
+static bool jupiter_rpc_copy_diag_flag(const char * name) {
+    const char * value = std::getenv(name);
+    return jupiter_prefill_enabled() && value && std::atoi(value) != 0;
+}
+
+static size_t jupiter_rpc_copy_nonfinite(const std::vector<float> & data) {
+    return std::count_if(data.begin(), data.end(),
+                         [](float v) { return !std::isfinite(v); });
+}
+
 static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
     if (ggml_backend_buffer_is_rpc(src->buffer)) {
         // check if src and dst are on the same server
@@ -1320,13 +1333,63 @@ static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, con
             return false;
         }
         ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
-        rpc_msg_copy_tensor_req request;
-        request.src = serialize_tensor(src);
-        request.dst = serialize_tensor(dst);
-        rpc_msg_copy_tensor_rsp response;
-        bool status = send_rpc_cmd(ctx->sock, RPC_CMD_COPY_TENSOR, &request, sizeof(request), &response, sizeof(response));
-        RPC_STATUS_ASSERT(status);
-        return response.result;
+        const bool audit = jupiter_rpc_copy_diag_flag("LLAMA_JUPITER_RPC_AUDIT_SESSION_COPY");
+        const bool force_host = jupiter_rpc_copy_diag_flag("LLAMA_JUPITER_RPC_FORCE_HOST_SESSION_COPY");
+        const size_t bytes = ggml_nbytes(src);
+        const auto * src_buft = static_cast<const ggml_backend_rpc_buffer_type_context *>(
+            ggml_backend_buffer_get_type(src_buffer)->context);
+        const auto * dst_buft = static_cast<const ggml_backend_rpc_buffer_type_context *>(
+            ggml_backend_buffer_get_type(dst_buffer)->context);
+        const bool eligible = (audit || force_host) && src_buft && dst_buft &&
+            src_buft->device != dst_buft->device && src->type == GGML_TYPE_F32 &&
+            dst->type == GGML_TYPE_F32 && ggml_is_contiguous(src) &&
+            ggml_is_contiguous(dst) && ggml_are_same_layout(src, dst) &&
+            bytes > 0 && bytes <= (16u << 20) && bytes % sizeof(float) == 0;
+        std::vector<float> before;
+        if (eligible) {
+            before.resize(bytes / sizeof(float));
+            ggml_backend_tensor_get(src, before.data(), 0, bytes);
+        }
+
+        bool copied = false;
+        const bool pc_staging = eligible && force_host;
+        if (pc_staging) {
+            // Deliberately route the same activation through the existing
+            // GET/SET protocol rather than RPC_CMD_COPY_TENSOR. Never change
+            // weights or non-contiguous layouts.
+            ggml_backend_tensor_set(dst, before.data(), 0, bytes);
+            copied = true;
+        } else {
+            rpc_msg_copy_tensor_req request;
+            request.src = serialize_tensor(src);
+            request.dst = serialize_tensor(dst);
+            rpc_msg_copy_tensor_rsp response;
+            bool status = send_rpc_cmd(ctx->sock, RPC_CMD_COPY_TENSOR, &request, sizeof(request), &response, sizeof(response));
+            RPC_STATUS_ASSERT(status);
+            copied = response.result != 0;
+        }
+
+        if (eligible && copied) {
+            std::vector<float> after(before.size());
+            ggml_backend_tensor_get(dst, after.data(), 0, bytes);
+            const bool equal = std::memcmp(before.data(), after.data(), bytes) == 0;
+            const uint64_t h_src = fnv_hash(reinterpret_cast<const uint8_t *>(before.data()), bytes);
+            const uint64_t h_dst = fnv_hash(reinterpret_cast<const uint8_t *>(after.data()), bytes);
+            GGML_LOG_INFO(
+                "[JUPITER_RPC_COPY_AUDIT] src_device=%u dst_device=%u src=%s dst=%s"
+                " rows=%" PRId64 " width=%" PRId64 " bytes=%zu path=%s"
+                " src_nonfinite=%zu dst_nonfinite=%zu src_hash=%016" PRIx64
+                " dst_hash=%016" PRIx64 " host_bytes=%s\n",
+                src_buft->device, dst_buft->device, src->name, dst->name,
+                ggml_nrows(src), src->ne[0], bytes,
+                pc_staging ? "PC_STAGING" : "PHONE_COPY",
+                jupiter_rpc_copy_nonfinite(before), jupiter_rpc_copy_nonfinite(after),
+                h_src, h_dst, equal ? "MATCH" : "MISMATCH");
+        } else if (eligible) {
+            GGML_LOG_WARN("[JUPITER_RPC_COPY_AUDIT] src=%s dst=%s status=FALLBACK_UNAUDITED\n",
+                          src->name, dst->name);
+        }
+        return copied;
     }
     return false;
 }

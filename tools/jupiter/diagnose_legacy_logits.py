@@ -39,8 +39,18 @@ def main():
     p.add_argument("--chunks", default=None, help="optional exact plan; otherwise natural UBatch split")
     p.add_argument("--force-build", action="store_true")
     p.add_argument("--stage-dump", action="store_true")
+    p.add_argument("--detail-layers", default=None,
+                   help="comma-separated layer ids; -1 includes final RMSNorm/head; implies stage dump")
+    p.add_argument("--audit-copies", action="store_true",
+                   help="compare source/destination host-visible F32 bytes for cross-session copies")
+    p.add_argument("--force-host-copy", action="store_true",
+                   help="diagnostic PC-staged GET/SET for eligible cross-session activations; implies audit")
     p.add_argument("--out-dir", required=True)
     args = p.parse_args()
+    if args.detail_layers:
+        args.stage_dump = True
+    if args.force_host_copy:
+        args.audit_copies = True
     if not 0 <= args.cpu_layers < args.pc_layers:
         raise ValueError("require nonempty PC CUDA prefix")
     if not 2 <= args.target_tokens <= min(args.context, args.batch):
@@ -63,7 +73,8 @@ def main():
     for key in list(env):
         if key.startswith("LLAMA_JUPITER_RESIDENT_"):
             env.pop(key)
-    for key in ("LLAMA_JUPITER_STAGE_DUMP_DIR", "LLAMA_JUPITER_STAGE_DUMP_TOKENS"):
+    for key in ("LLAMA_JUPITER_STAGE_DUMP_DIR", "LLAMA_JUPITER_STAGE_DUMP_TOKENS",
+                "LLAMA_JUPITER_STAGE_DUMP_DETAIL_LAYERS"):
         env.pop(key, None)
     env.update({
         "LLAMA_JUPITER_PHONE_OWNED_NATIVE": "0",
@@ -76,6 +87,8 @@ def main():
         "LLAMA_JUPITER_PROFILE_STAGE": "0",
         "LLAMA_JUPITER_LOCAL_GRAPH_REUSE": "0",
         "LLAMA_JUPITER_RPC_FORCE_GRAPH_BUILD": str(int(args.force_build)),
+        "LLAMA_JUPITER_RPC_AUDIT_SESSION_COPY": str(int(args.audit_copies)),
+        "LLAMA_JUPITER_RPC_FORCE_HOST_SESSION_COPY": str(int(args.force_host_copy)),
         "LLAMA_JUPITER_LOGITS_HASH": "1",
         "LLAMA_JUPITER_LOGITS_DUMP_FILE": str(logits_path),
     })
@@ -84,16 +97,28 @@ def main():
     if args.stage_dump:
         env["LLAMA_JUPITER_STAGE_DUMP_DIR"] = str(out / "stages")
         env["LLAMA_JUPITER_STAGE_DUMP_TOKENS"] = str(args.target_tokens)
+        if args.detail_layers:
+            env["LLAMA_JUPITER_STAGE_DUMP_DETAIL_LAYERS"] = args.detail_layers
     cmd = make_cli(args, prompt)
     cmd[cmd.index("-lv") + 1] = "4"
     print(f"[LEGACY_DIAG] tokens={args.target_tokens} window={args.window} "
           f"ubatch={args.max_chunk} force_build={int(args.force_build)} "
-          f"stage_dump={int(args.stage_dump)} log={log_path}", flush=True)
+          f"stage_dump={int(args.stage_dump)} audit_copies={int(args.audit_copies)} "
+          f"force_host_copy={int(args.force_host_copy)} detail_layers={args.detail_layers} "
+          f"log={log_path}", flush=True)
     rc = stream_process(cmd, env, log_path)
     log = log_path.read_text(encoding="utf-8", errors="replace")
     for line in log.splitlines():
-        if "[JUPITER_GRAPH_BINDING]" in line or "[JUPITER_LOGITS_HASH]" in line:
+        if ("[JUPITER_GRAPH_BINDING]" in line or "[JUPITER_LOGITS_HASH]" in line
+                or "[JUPITER_RPC_COPY_AUDIT]" in line):
             print(line)
+    if args.detail_layers:
+        details = [line for line in log.splitlines() if "[JUPITER_OP_DIAG]" in line]
+        bad_ops = [line for line in details if re.search(r"\bnonfinite=[1-9]\d*\b", line)]
+        print(f"[LEGACY_DIAG_OPS] records={len(details)} nonfinite_records={len(bad_ops)}")
+        if bad_ops:
+            first = details.index(bad_ops[0])
+            print("\n".join(details[max(0, first-8):first+4]))
     if args.stage_dump:
         records = list(STAGE.finditer(log))
         print(f"[LEGACY_DIAG_STAGE] records={len(records)}")
