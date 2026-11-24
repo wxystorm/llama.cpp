@@ -72,9 +72,16 @@ inline int jupiter_resident_server(common_params & params) {
         std::fprintf(stderr, "Resident Jupiter only supports local text Prefill\n");
         return 1;
     }
+    const bool native = jr_env_enabled("LLAMA_JUPITER_PHONE_OWNED_NATIVE");
     params.n_parallel = 1;
+    // Match server_n_outputs_max() for one text sequence, no draft.
+    // Do not reserve a vocab row for every token in a calibration UBatch.
+    params.n_outputs_max = 1;
     params.kv_unified = false;
-    params.warmup = false;
+    // Stage2/3's legacy CLI initializes the model with its usual startup
+    // warmup. Native must never consume a Phone-owned run with fake tokens.
+    // This is startup-only and never included in measured Prefill.
+    params.warmup = !native;
     params.no_perf = false;
     params.sampling.backend_sampling = false;
     // Never permit a request to select filesystem dump paths or a model.
@@ -88,7 +95,6 @@ inline int jupiter_resident_server(common_params & params) {
     jr_set_env("LLAMA_JUPITER_ASYNC_C2P", "0");
     jr_set_env("LLAMA_JUPITER_PHONE_OWNED_ASYNC", "0");
 
-    const bool native = jr_env_enabled("LLAMA_JUPITER_PHONE_OWNED_NATIVE");
     const int resident_window = native ? 2 : 1;
     jr_set_env("LLAMA_JUPITER_WINDOW", std::to_string(resident_window));
     auto loaded = common_init_from_params(params);
@@ -99,7 +105,20 @@ inline int jupiter_resident_server(common_params & params) {
     auto * ctx = loaded->context();
     const auto * vocab = llama_model_get_vocab(model);
     const auto templates = common_chat_templates_init(model, "");
-    if (!templates || !llama_jupiter_reset_prefill(ctx)) {
+    if (!templates) {
+        std::fprintf(stderr, "[JUPITER_RESIDENT] chat template initialization failed\n");
+        return 1;
+    }
+    // Use the same capability probe as the regular CLI/server initialization.
+    // The existing native-specific implementation is memory-only.
+    const auto seq_rm = common_context_can_seq_rm(ctx);
+    if (seq_rm == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+        std::fprintf(stderr, "[JUPITER_RESIDENT] KV capability probe failed native=%d\n", int(native));
+        return 1;
+    }
+    std::fprintf(stderr, "[JUPITER_RESIDENT_INIT] native=%d startup_warmup=%d n_outputs_max=%d seq_rm=%d\n",
+                 int(native), int(params.warmup), params.n_outputs_max, int(seq_rm));
+    if (!llama_jupiter_reset_prefill(ctx)) {
         std::fprintf(stderr, "[JUPITER_RESIDENT] startup reset failed\n");
         return 1;
     }
@@ -196,6 +215,10 @@ inline int jupiter_resident_server(common_params & params) {
             // Explicit fresh sequence ID 0, full prompt in one decode batch.
             // Only the final token requests logits; no generated-token decode.
             llama_batch batch = llama_batch_get_one(tokens.data(), int32_t(tokens.size()));
+            std::vector<int8_t> output(tokens.size(), 0);
+            output.back() = 1;
+            batch.logits = output.data();
+            llama_set_embeddings(ctx, false);
             llama_perf_context_reset(ctx);
             const auto t0 = ggml_time_us();
             decoding = true;
@@ -204,12 +227,43 @@ inline int jupiter_resident_server(common_params & params) {
             if (rc != 0) {
                 throw std::runtime_error("llama_decode failed: " + std::to_string(rc));
             }
-            const float * logits = llama_get_logits_ith(ctx, -1);
+            const float * logits = llama_get_logits_ith(ctx, int32_t(tokens.size() - 1));
             const double ms = (ggml_time_us() - t0) / 1000.0;
             const auto n_vocab = llama_vocab_n_tokens(vocab);
-            if (!logits || n_vocab <= 0 || !std::isfinite(ms) || ms <= 0.0 ||
-                    !std::all_of(logits, logits + n_vocab, [](float f) { return std::isfinite(f); })) {
-                throw std::runtime_error("invalid final logits or Prefill timing");
+            if (!std::isfinite(ms) || ms <= 0.0) {
+                throw std::runtime_error("INVALID_PREFILL_TIMING ms=" + std::to_string(ms));
+            }
+            if (n_vocab <= 0) {
+                throw std::runtime_error("INVALID_VOCAB_SIZE n_vocab=" + std::to_string(n_vocab));
+            }
+            if (!logits) {
+                throw std::runtime_error("MISSING_FINAL_LOGITS tokens=" + std::to_string(tokens.size()));
+            }
+            size_t nan_count = 0, inf_count = 0, zero_count = 0;
+            int64_t first_bad = -1;
+            for (int64_t i = 0; i < n_vocab; ++i) {
+                const float v = logits[i];
+                if (std::isnan(v)) {
+                    ++nan_count;
+                } else if (std::isinf(v)) {
+                    ++inf_count;
+                } else if (v == 0.0f) {
+                    ++zero_count;
+                }
+                if (!std::isfinite(v) && first_bad < 0) {
+                    first_bad = i;
+                }
+            }
+            std::fprintf(stderr, "[JUPITER_RESIDENT_LOGITS] native=%d tokens=%zu vocab=%lld"
+                         " finite=%zu nan=%zu inf=%zu zero=%zu first_bad=%lld"
+                         " prefill_ms=%.3f status=%s\n",
+                         int(native), tokens.size(), (long long)n_vocab,
+                         size_t(n_vocab) - nan_count - inf_count, nan_count,
+                         inf_count, zero_count, (long long)first_bad, ms,
+                         first_bad < 0 ? "PASS" : "FAIL");
+            if (first_bad >= 0) {
+                throw std::runtime_error("NONFINITE_FINAL_LOGITS nan=" + std::to_string(nan_count) +
+                    " inf=" + std::to_string(inf_count) + " first_bad=" + std::to_string(first_bad));
             }
             jr_json result = {{"id", id}, {"status", "PASS"}, {"tokens", tokens.size()},
                               {"prefill_ms", ms}, {"metric", "DECODE_TO_LOGITS"},
