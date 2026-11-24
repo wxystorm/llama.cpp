@@ -107,12 +107,13 @@ exceeds the Phone's actual HTP memory budget, fail with the reason and do
 not manufacture an incompatible baseline.
 
 The original Jupiter **model-partition DP** still exists in
-`jupiter_planner.py`; this full suite uses a specified
-hardware-feasible, previously tested layer boundary L32 for both modes.
-It does not claim to search every original Jupiter model-partition
-alternative, because the Phone-owned native suffix presently supports
-only 1..8 contiguous Transformer layers. This preserves the same
-fixed placement in both A/B modes without misrepresenting its origin.
+`jupiter_planner.py`. This suite fixes a chosen PC/Phone boundary for
+both measured A/B modes; it does not search every model-partition
+alternative. The selected Phone suffix is bounded by the model's total
+Transformer layer count and the RPC's **64 layer-device slots**, not by
+an artificial 8- or 16-layer cutoff. The existing HTP per-session and
+global memory admission checks still decide whether the chosen placement
+can actually run.
 
 
 ### Selecting a different dataset (opt-in)
@@ -200,6 +201,34 @@ reuse a different model's loaded HTP weights/Graph cache.
 32B Prefill numerical correctness and timing are **not yet device-validated**.
 Only real Sync/Autonomous full-F32 Logits parity and Phone cache logs can
 establish acceptance.
+
+### Phone layers beyond 16 (model-driven, not an arbitrary cutoff)
+
+`-PhoneLayers` now accepts any positive layer count that leaves at least
+one PC Transformer layer and fits the existing **64-entry RPC layer-device
+array**. With the two supported Qwen3 models, the *software* bounds are
+14B: 1..39 Phone layers, and 32B: 1..63 Phone layers (assuming the PC
+layer boundary and CPU/CUDA split are valid). These are **not** empirical
+hardware capacity claims; weights, F16 KV, HTP scratch, per-session VMEM
+and global Phone RAM are still checked at runtime.
+
+```powershell
+# Validate 32B CPU28 + CUDA12 + Phone24 without starting inference
+.\tools\jupiter\run_phone_owned_full_suite.ps1 `
+  -ModelSize 32b -CudaLayers 12 -PhoneLayers 24 -DryRun `
+  -OutDir ".\jupiter-32b-cpu28-gpu12-phone24"
+
+# Keep the real experiment small until memory/Graph Prepare passes
+.\tools\jupiter\run_phone_owned_full_suite.ps1 `
+  -ModelSize 32b -CudaLayers 12 -PhoneLayers 24 `
+  -Pattern "prompt_256_01.txt" -ExpectedCount 1 `
+  -OutDir ".\jupiter-32b-phone24-smoke"
+```
+
+**The 16-slot `schedule` array limits the number of Prefill Chunks per
+Prompt. It has nothing to do with the number of Phone Transformer layers.**
+Changing the Layer limit does not change the Chunk limit or the RPC wire
+version; rebuild PC and Android/Phone executables from the updated branch.
 
 ## Results and resume
 
