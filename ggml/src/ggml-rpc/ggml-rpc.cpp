@@ -9,6 +9,7 @@
 #include "transport.h"
 
 #include <array>
+#include <iterator>  // std::size for the fixed RPC layer-device array
 #include <cinttypes>
 #include <cmath>
 #include <limits>
