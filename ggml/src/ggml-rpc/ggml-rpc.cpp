@@ -290,7 +290,7 @@ static_assert(sizeof(rpc_msg_phone_owned_plan_req) == 176,
 
 struct rpc_msg_phone_owned_prepare_req {
     rpc_msg_phone_owned_plan_req plan;
-    uint32_t layer_devices[64];
+    uint32_t layer_devices[ggml_phone_owned::k_max_phone_layers_per_region];
 };
 struct rpc_msg_phone_owned_prepare_rsp {
     uint8_t ok;
@@ -2124,7 +2124,9 @@ bool prepare(const char * endpoint,
     const char * why = nullptr;
     const size_t count = ggml_phone_owned::layer_count(plan);
     if (!endpoint || !ggml_phone_owned::validate(plan, why) ||
-            count == 0 || count > 64 || layer_devices.size() != count) {
+            count == 0 ||
+            count > ggml_phone_owned::k_max_phone_layers_per_region ||
+            layer_devices.size() != count) {
         GGML_LOG_ERROR("[JUPITER_PHONE_OWNED] prepare rejected: %s\n",
                        why ? why : "DEVICE_MAP_OR_ENDPOINT");
         return false;
@@ -3140,7 +3142,8 @@ bool rpc_server::phone_owned_prepare(
     jupiter_phone_owned_copy_plan(plan, request.plan);
     const char * why = "NONE";
     const size_t count = ggml_phone_owned::layer_count(plan);
-    if (!ggml_phone_owned::validate(plan, why) || count == 0 || count > 16 ||
+    if (!ggml_phone_owned::validate(plan, why) || count == 0 ||
+            count > std::size(request.layer_devices) ||
             ggml_phone_owned::chunk_count(plan) > 16 ||
             local_tensor_source.get_info == nullptr ||
             local_tensor_source.read == nullptr) {
