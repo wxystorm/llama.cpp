@@ -189,9 +189,9 @@ int main() {
     new_request.rope_freq_scale = 0.5f;
     CHECK(!same_execution_template(chain, new_request));
 
-    // Jupiter's native suffix can now be 1..8 layers with a bounded,
-    // context-dependent Chunk/KV geometry; the original 8-layer/512 pilot
-    // remains valid while longer prompts require appropriately sized Chunks.
+    // Regression subset: check the original 1..8-layer pilot across
+    // Context/Chunk geometries. The extended 16..64 layer plan contract
+    // is exercised separately above and does not change the Chunk limit.
     for (uint32_t layers = 1; layers <= 8; ++layers) {
         for (uint32_t ctx : {512u, 1024u, 2048u, 4096u}) {
             auto native = a;
