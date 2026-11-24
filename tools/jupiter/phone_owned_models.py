@@ -11,6 +11,10 @@ from pathlib import Path
 
 from jupiter_memory_partition import read_gguf_weights
 
+# ggml-rpc.cpp PREPARE request holds 64 layer-device indices. This is a
+# wire-format capacity, not an experimentally chosen limit on HTP layers.
+RPC_LAYER_DEVICE_SLOTS = 64
+
 
 @dataclass(frozen=True)
 class ModelLayout:
@@ -23,7 +27,8 @@ class ModelLayout:
 
     @property
     def phone_first_min(self) -> int:
-        return self.layers - 16
+        # Preserve at least one PC Transformer layer and honor the RPC array.
+        return max(1, self.layers - RPC_LAYER_DEVICE_SLOTS)
 
     @property
     def phone_first_max(self) -> int:
@@ -87,8 +92,11 @@ def resolve_splits(model: ModelLayout, *, layouts: str | None = None,
     A multi-layout sweep varies p and keeps c fixed. An explicit CUDA or
     Phone count selects a single placement and cannot override a sweep.
     """
-    if phone_layers is not None and not 1 <= phone_layers <= 16:
-        raise ValueError("--phone-layers must be 1..16")
+    max_phone = min(model.layers - 1, RPC_LAYER_DEVICE_SLOTS)
+    if phone_layers is not None and not 1 <= phone_layers <= max_phone:
+        raise ValueError(f"--phone-layers must be 1..{max_phone} for "
+                         f"Qwen3-{model.family} (keep a PC prefix; "
+                         f"RPC capacity={RPC_LAYER_DEVICE_SLOTS})")
     if cuda_layers is not None and cuda_layers < 1:
         raise ValueError("--cuda-layers must be positive")
     if layouts is not None and (phone_layers is not None or cuda_layers is not None):
