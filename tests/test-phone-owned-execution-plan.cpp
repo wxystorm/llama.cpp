@@ -77,6 +77,31 @@ int main() {
             CHECK(validate(child, reason));
         }
     }
+    // The RPC PREPARE descriptor has 64 layer-device slots, while the
+    // model loader requires at least one PC layer. Plans of >16 Phone
+    // layers must not be rejected by the generic graph/transport contract.
+    for (uint32_t count : {16u, 20u, 24u, 32u, 48u, 63u, 64u}) {
+        auto native32 = a;
+        native32.region = 0;
+        native32.layer = 64 - count;
+        native32.n_heads = 64;
+        native32.total_tokens = 2048;
+        native32.chunk_tokens = 128;
+        native32.kv_capacity = 2048;
+        native32.n_kv = 2048;
+        native32.version = k_multi_plan_version;
+        native32.flags = flags_for_layers(count);
+        CHECK(validate(native32, reason));
+        CHECK(layer_count(native32) == count);
+        const auto last = single_layer_plan(native32, count - 1);
+        CHECK(last.layer == 63);
+        CHECK(validate(last, reason));
+    }
+    auto too_many_phone_layers = a;
+    too_many_phone_layers.layer = 0;
+    too_many_phone_layers.version = k_multi_plan_version;
+    too_many_phone_layers.flags = flags_for_layers(65);
+    CHECK(!validate(too_many_phone_layers, reason));
     CHECK(owned_task_uid(15, 0) != owned_task_uid(1, 0));
     CHECK(chunk_count(a) == 4);
     // Jupiter original q(x,y) Sequence DP can use nonuniform widths.
