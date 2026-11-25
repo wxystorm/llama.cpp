@@ -8,7 +8,11 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    7
+#define RPC_PROTO_PATCH_VERSION    8
+
+// Patch 8: opt-in native calibration namespace + final P2C timing footer.
+// Ordinary native PREPARE/START/PUSH/P2C wire payloads remain unchanged.
+#define GGML_RPC_PHONE_OWNED_CALIBRATION_FLAG 2u
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");

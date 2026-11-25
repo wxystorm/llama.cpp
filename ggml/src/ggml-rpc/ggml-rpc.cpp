@@ -49,6 +49,11 @@ static bool jupiter_trace_enabled() {
 
 // Independent, opt-in timing. Do not enable the synchronous q(x,y) profiler
 // or the verbose Jupiter TRACE in formal Prefill benchmarks.
+static bool jupiter_native_calibration_enabled() {
+    const char * value = std::getenv("LLAMA_JUPITER_RESIDENT_NATIVE_CALIBRATION");
+    return value && std::atoi(value) != 0;
+}
+
 static bool jupiter_timeline_enabled() {
     const char * value = std::getenv("LLAMA_JUPITER_TIMELINE");
     return value != nullptr && std::atoi(value) != 0;
@@ -126,6 +131,8 @@ enum rpc_cmd {
     RPC_CMD_PHONE_OWNED_AUTO_START,
     RPC_CMD_PHONE_OWNED_AUTO_PUSH,
     RPC_CMD_PHONE_OWNED_AUTO_P2C_WAIT,
+    // Same START descriptor; final P2C reply adds a bounded profile footer.
+    RPC_CMD_PHONE_OWNED_AUTO_START_PROFILE,
     RPC_CMD_COUNT,
 };
 
@@ -318,6 +325,21 @@ struct rpc_msg_phone_owned_run_rsp {
     double output_copy_ms;
     double wall_ms;
 };
+// One record per completed local Chunk, not a PC-issued Graph command.
+// All times are Phone-local; wire transfer and PC wait are not included.
+struct rpc_msg_phone_owned_chunk_profile {
+    uint32_t chunk;
+    uint32_t tokens;
+    uint32_t layers;
+    uint32_t sessions;
+    double upload_ms;
+    double compute_ms;
+    double output_copy_ms;
+    double wall_ms;
+};
+static_assert(sizeof(rpc_msg_phone_owned_chunk_profile) == 48, "profile wire ABI");
+static_assert(ggml_phone_owned::k_flag_calibration ==
+              GGML_RPC_PHONE_OWNED_CALIBRATION_FLAG, "calibration flag ABI");
 struct rpc_msg_phone_owned_reset_req {
     uint64_t run_id;
 };
@@ -597,7 +619,8 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
     const bool autonomous_phone_owned =
         std::getenv("LLAMA_JUPITER_PHONE_OWNED_AUTONOMOUS") != nullptr &&
         std::atoi(std::getenv("LLAMA_JUPITER_PHONE_OWNED_AUTONOMOUS")) != 0;
-    const uint8_t required_patch = (autonomous_phone_owned || native_phone_owned)
+    const uint8_t required_patch = jupiter_native_calibration_enabled() ? 8 :
+        (autonomous_phone_owned || native_phone_owned)
         ? 7 : jupiter_graph_prebuild_enabled() ? 4 : 0;
     if (required_patch != 0 &&
         (response.major != RPC_PROTO_MAJOR_VERSION ||
@@ -2373,9 +2396,10 @@ bool auto_start(const char * endpoint, uint64_t run_id, uint64_t p2c_run_id,
     };
     rpc_msg_jupiter_rsp rsp {};
     auto sock = get_socket(endpoint);
+    const auto command = jupiter_native_calibration_enabled()
+        ? RPC_CMD_PHONE_OWNED_AUTO_START_PROFILE : RPC_CMD_PHONE_OWNED_AUTO_START;
     return sock && send_rpc_cmd(
-        sock, RPC_CMD_PHONE_OWNED_AUTO_START,
-        &req, sizeof(req), &rsp, sizeof(rsp)) && rsp.ok == 1;
+        sock, command, &req, sizeof(req), &rsp, sizeof(rsp)) && rsp.ok == 1;
 }
 
 bool auto_push(const char * endpoint, uint64_t run_id, uint64_t p2c_run_id,
@@ -2434,10 +2458,43 @@ bool auto_p2c_wait(const char * endpoint, uint64_t run_id,
     std::memcpy(&rsp, response.data(), sizeof(rsp));
     if (!rsp.ok || !rsp.output_floats ||
             rsp.output_floats >
-                ggml_phone_owned::k_max_activation_bytes / sizeof(float) ||
-            response.size() != sizeof(rsp) +
-                size_t(rsp.output_floats)*sizeof(float)) {
+                ggml_phone_owned::k_max_activation_bytes / sizeof(float)) {
         return false;
+    }
+    const size_t payload_bytes = sizeof(rsp) + size_t(rsp.output_floats)*sizeof(float);
+    if (!jupiter_native_calibration_enabled()) {
+        if (response.size() != payload_bytes) { return false; }
+    } else {
+        uint32_t count = 0;
+        if (response.size() < payload_bytes + sizeof(count)) { return false; }
+        std::memcpy(&count, response.data() + payload_bytes, sizeof(count));
+        if (!count || count > ggml_phone_owned::k_native_schedule_slots ||
+                response.size() != payload_bytes + sizeof(count) +
+                    size_t(count)*sizeof(rpc_msg_phone_owned_chunk_profile)) {
+            return false;
+        }
+        uint32_t prefix = 0;
+        for (uint32_t i = 0; i < count; ++i) {
+            rpc_msg_phone_owned_chunk_profile item {};
+            std::memcpy(&item, response.data() + payload_bytes + sizeof(count) +
+                        i*sizeof(item), sizeof(item));
+            if (item.chunk != i || !item.tokens || item.layers != rsp.layers ||
+                    !item.sessions || item.sessions > 4 ||
+                    item.sessions > item.layers ||
+                    !std::isfinite(item.upload_ms) || item.upload_ms < 0 ||
+                    !std::isfinite(item.compute_ms) || item.compute_ms <= 0 ||
+                    !std::isfinite(item.output_copy_ms) || item.output_copy_ms < 0 ||
+                    !std::isfinite(item.wall_ms) || item.wall_ms <= 0 ||
+                    (i + 1 == count && item.tokens != rsp.tokens)) {
+                return false;
+            }
+            GGML_LOG_INFO("[JUPITER_NATIVE_PHONE_PROFILE] run=%" PRIu64
+                          " chunk=%u prefix=%u tokens=%u layers=%u sessions=%u"
+                          " upload_ms=%.6f htp_ms=%.6f copy_ms=%.6f wall_ms=%.6f\n",
+                          run_id, i, prefix, item.tokens, item.layers, item.sessions,
+                          item.upload_ms, item.compute_ms, item.output_copy_ms, item.wall_ms);
+            prefix += item.tokens;
+        }
     }
     output.resize(rsp.output_floats);
     std::memcpy(output.data(), response.data() + sizeof(rsp),
@@ -2498,7 +2555,7 @@ public:
     bool jupiter_sync(rpc_msg_jupiter_rsp & response);
     bool phone_owned_prepare(const rpc_msg_phone_owned_prepare_req & req, rpc_msg_phone_owned_prepare_rsp & rsp);
     bool phone_owned_run(const std::vector<uint8_t> & request, std::vector<uint8_t> & response);
-    bool phone_owned_auto_start(const rpc_msg_phone_owned_auto_start_req & req);
+    bool phone_owned_auto_start(const rpc_msg_phone_owned_auto_start_req & req, bool profile = false);
     bool phone_owned_auto_push(std::vector<uint8_t> request);
     bool phone_owned_auto_p2c_wait(const rpc_msg_phone_owned_auto_p2c_wait_req & req,
                                     std::vector<uint8_t> & response);
@@ -2572,6 +2629,7 @@ private:
         uint32_t n_embd = 0;
         ggml_phone_owned::region_plan plan {};
         uint32_t layer_count = 0;
+        bool profile = false;
         std::shared_ptr<ggml_phone_autonomous::prefill_queue> queue;
     };
     std::mutex phone_owned_auto_mutex;
@@ -3341,6 +3399,13 @@ bool rpc_server::phone_owned_prepare(
         phone_owned_standby.clear();
     };
 
+    // Calibration and formal measurement use identical Layer math but must
+    // not share cached Graph/KV templates. Keep immutable weights resident.
+    if (!phone_owned_standby.empty() &&
+            ggml_phone_owned::is_calibration_flags(phone_owned_standby.front().plan.flags) !=
+            ggml_phone_owned::is_calibration_flags(plan.flags)) {
+        flush_standby("CALIBRATION_NAMESPACE_CHANGE");
+    }
     size_t hit_index = phone_owned_standby.size();
     if (jupiter_phone_owned_persistence_enabled()) {
         for (size_t i = 0; i < phone_owned_standby.size(); ++i) {
@@ -3669,7 +3734,7 @@ bool rpc_server::phone_owned_run(
 }
 
 bool rpc_server::phone_owned_auto_start(
-        const rpc_msg_phone_owned_auto_start_req & req) {
+        const rpc_msg_phone_owned_auto_start_req & req, bool profile) {
     if (!req.run_id || !req.p2c_run_id ||
             req.max_in_flight < 1 || req.max_in_flight > 4) {
         return false;
@@ -3682,6 +3747,7 @@ bool rpc_server::phone_owned_auto_start(
         return false;
     }
     auto state = std::make_shared<phone_owned_auto_state>();
+    uint32_t active_sessions = 0;
     {
         std::lock_guard<std::mutex> graph_lock(phone_owned_mutex);
         const auto it = phone_owned_chains.find({req.run_id, req.region});
@@ -3691,6 +3757,14 @@ bool rpc_server::phone_owned_auto_start(
             return false;
         }
         const auto & plan = it->second.plan;
+        if (profile != ggml_phone_owned::is_calibration_flags(plan.flags)) {
+            GGML_LOG_ERROR("[PHONE_AUTO] START_REJECT reason=CALIBRATION_NAMESPACE_MISMATCH\n");
+            return false;
+        }
+        const std::unordered_set<uint32_t> sessions(
+            it->second.devices.begin(), it->second.devices.end());
+        active_sessions = uint32_t(sessions.size());
+        state->profile = profile;
         state->run_id = req.run_id;
         state->p2c_run_id = req.p2c_run_id;
         state->region = req.region;
@@ -3704,9 +3778,32 @@ bool rpc_server::phone_owned_auto_start(
         // Reuse exactly the proven local HTP Graph, KV FIFO and error path.
         state->queue = std::make_shared<ggml_phone_autonomous::prefill_queue>(
             n_chunks, req.max_in_flight,
-            [this](uint32_t chunk, const std::vector<uint8_t> & payload,
-                   std::vector<uint8_t> & result) -> bool {
-                const bool ok = phone_owned_run(payload, result);
+            [this, profile, n_chunks, active_sessions,
+             profiles = std::vector<rpc_msg_phone_owned_chunk_profile>{}]
+            (uint32_t chunk, const std::vector<uint8_t> & payload,
+                   std::vector<uint8_t> & result) mutable -> bool {
+                bool ok = phone_owned_run(payload, result);
+                if (ok && profile) {
+                    rpc_msg_phone_owned_run_rsp rsp {};
+                    if (chunk != profiles.size() || result.size() < sizeof(rsp)) {
+                        return false;
+                    }
+                    std::memcpy(&rsp, result.data(), sizeof(rsp));
+                    if (!rsp.ok || !rsp.layers || !rsp.tokens) { return false; }
+                    profiles.push_back({chunk, rsp.tokens, rsp.layers, active_sessions,
+                        rsp.upload_ms, rsp.compute_ms, rsp.output_copy_ms, rsp.wall_ms});
+                    if (chunk + 1 == n_chunks) {
+                        // The worker, not the PC, collects every Chunk's
+                        // local services. Piggyback only on final P2C.
+                        const uint32_t count = uint32_t(profiles.size());
+                        const size_t offset = result.size();
+                        result.resize(offset + sizeof(count) +
+                                      profiles.size()*sizeof(profiles[0]));
+                        std::memcpy(result.data() + offset, &count, sizeof(count));
+                        std::memcpy(result.data() + offset + sizeof(count),
+                                    profiles.data(), profiles.size()*sizeof(profiles[0]));
+                    }
+                }
                 GGML_LOG_INFO(
                     "[PHONE_AUTO] EXEC_DONE chunk=%u status=%s\n",
                     chunk, ok ? "PASS" : "FAIL");
@@ -3806,13 +3903,22 @@ bool rpc_server::phone_owned_auto_p2c_wait(
     std::memcpy(&rsp, response.data(), sizeof(rsp));
     const uint32_t final_tokens = ggml_phone_owned::chunk_size(
         active->plan, ggml_phone_owned::chunk_count(active->plan) - 1);
+    const size_t payload_bytes = sizeof(rsp) +
+        size_t(rsp.output_floats)*sizeof(float);
+    const uint32_t chunks = ggml_phone_owned::chunk_count(active->plan);
+    const size_t trailer_bytes = active->profile ?
+        sizeof(uint32_t) + size_t(chunks)*sizeof(rpc_msg_phone_owned_chunk_profile) : 0;
     if (!rsp.ok || rsp.tokens != final_tokens ||
             rsp.layers != active->layer_count ||
             rsp.output_floats != uint64_t(final_tokens)*active->n_embd ||
-            response.size() != sizeof(rsp) +
-                size_t(rsp.output_floats)*sizeof(float)) {
+            response.size() != payload_bytes + trailer_bytes) {
         GGML_LOG_ERROR("[PHONE_AUTO] P2C_RETURN status=FAIL reason=OUTPUT_SHAPE\n");
         return false;
+    }
+    if (active->profile) {
+        uint32_t count = 0;
+        std::memcpy(&count, response.data() + payload_bytes, sizeof(count));
+        if (count != chunks) { return false; }
     }
     GGML_LOG_INFO(
         "[PHONE_AUTO] P2C_RETURN run=%" PRIu64 " p2c_run=%" PRIu64
@@ -5027,11 +5133,13 @@ static void rpc_serve_client(rpc_server & server,
                 if (!send_msg(sock, rsp.data(), rsp.size())) { return; }
                 break;
             }
-            case RPC_CMD_PHONE_OWNED_AUTO_START: {
+            case RPC_CMD_PHONE_OWNED_AUTO_START:
+            case RPC_CMD_PHONE_OWNED_AUTO_START_PROFILE: {
                 rpc_msg_phone_owned_auto_start_req req {};
                 if (!recv_msg(sock, &req, sizeof(req))) { return; }
                 rpc_msg_jupiter_rsp rsp {};
-                rsp.ok = server.phone_owned_auto_start(req) ? 1 : 0;
+                rsp.ok = server.phone_owned_auto_start(req,
+                    cmd == RPC_CMD_PHONE_OWNED_AUTO_START_PROFILE) ? 1 : 0;
                 if (!send_msg(sock, &rsp, sizeof(rsp))) { return; }
                 break;
             }

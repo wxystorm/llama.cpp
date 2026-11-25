@@ -1830,15 +1830,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             const double wall_ms =
                     (jupiter_stage_t1_us - jupiter_stage_t0_us) / 1000.0;
 
+            // Attribute native bridge wait separately from real CPU work.
+            // This only observes the existing split; do not split/fuse anew.
+            int native_bridge = 0;
+            for (int j = 0; j < split->graph.n_nodes; ++j) {
+                if (strcmp(split->graph.nodes[j]->name, "phone_owned_hidden") == 0) {
+                    ++native_bridge;
+                }
+            }
             GGML_LOG_INFO(
-                    "[JUPITER_STAGE_PROFILE] split=%d backend=%s nodes=%d inputs=%d input_ms=%.3f compute_ms=%.3f wall_ms=%.3f\n",
+                    "[JUPITER_STAGE_PROFILE] split=%d backend=%s nodes=%d inputs=%d input_ms=%.3f compute_ms=%.3f wall_ms=%.3f native_bridge=%d\n",
                     split_id,
                     ggml_backend_name(split_backend),
                     split->graph.n_nodes,
                     split->n_inputs,
                     input_ms,
                     compute_ms,
-                    wall_ms);
+                    wall_ms,
+                    native_bridge);
         }
 
         // record the event of this copy

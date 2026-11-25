@@ -73,6 +73,11 @@ inline int jupiter_resident_server(common_params & params) {
         return 1;
     }
     const bool native = jr_env_enabled("LLAMA_JUPITER_PHONE_OWNED_NATIVE");
+    const bool native_calibration = jr_env_enabled("LLAMA_JUPITER_RESIDENT_NATIVE_CALIBRATION");
+    if (native_calibration && !native) {
+        std::fprintf(stderr, "Native calibration requires Phone-owned model loading\n");
+        return 1;
+    }
     // Explicit experimental timing-only opt-in. Never applies to native
     // formal Prefill or requests that require real F32 logits.
     const bool legacy_timing_only = !native &&
@@ -139,6 +144,7 @@ inline int jupiter_resident_server(common_params & params) {
     http.get("/health", [&](const server_http_req &) {
         return jr_response({{"status", "ok"}, {"resident", true},
                             {"native", native}, {"legacy_timing_only", legacy_timing_only},
+                            {"native_calibration", native_calibration},
                             {"ctx", llama_n_ctx(ctx)},
                             {"batch", llama_n_batch(ctx)}, {"ubatch", llama_n_ubatch(ctx)}});
     });
@@ -176,8 +182,25 @@ inline int jupiter_resident_server(common_params & params) {
             inputs.messages.push_back(std::move(user));
             const auto formatted = common_chat_templates_apply(templates.get(), inputs).prompt;
             auto tokens = common_tokenize(vocab, formatted, llama_vocab_get_add_bos(vocab), true);
-            const auto cuts = body.value("chunks", std::vector<uint32_t>{});
+            auto cuts = body.value("chunks", std::vector<uint32_t>{});
             const auto expected = body.value("expected_tokens", uint32_t(0));
+            const auto flags = body.value("flags", jr_json::object());
+            if (body.value("calibration", false) != native_calibration) {
+                throw std::invalid_argument("resident calibration namespace mismatch");
+            }
+            if (native_calibration && cuts.empty() && !flags.value("PROFILE_STAGE", false)) {
+                // Tokenizer probe only: still a real native, exact ordered
+                // Plan derived from the server's own templated token count.
+                const uint32_t width = llama_n_ubatch(ctx);
+                if (!width || tokens.size() > uint64_t(width)*16) {
+                    throw std::invalid_argument("native calibration probe exceeds 16 Chunk slots");
+                }
+                for (uint32_t remaining = uint32_t(tokens.size()); remaining;) {
+                    const uint32_t next = std::min(remaining, width);
+                    cuts.push_back(next);
+                    remaining -= next;
+                }
+            }
             if (tokens.size() < 2 || tokens.size() > llama_n_ctx(ctx) ||
                     tokens.size() > llama_n_batch(ctx) ||
                     (expected && expected != tokens.size()) ||
@@ -201,6 +224,9 @@ inline int jupiter_resident_server(common_params & params) {
             if (autonomous && !native) {
                 throw std::invalid_argument("Autonomous requires a native resident model");
             }
+            if (native_calibration && (!autonomous || body.value("return_logits", false))) {
+                throw std::invalid_argument("native calibration requires autonomous input and no logits export");
+            }
             const int window = body.value("window", 1);
             if (window != resident_window) {
                 throw std::invalid_argument("window differs from immutable scheduler capacity");
@@ -208,11 +234,14 @@ inline int jupiter_resident_server(common_params & params) {
 
             jr_marker("BEGIN", id, "RUN");
             began = true;
+            if (native_calibration) {
+                std::fprintf(stderr, "[JUPITER_NATIVE_CALIBRATION] mode=PHONE_AUTONOMOUS profile=%d\n",
+                             int(flags.value("PROFILE_STAGE", false)));
+            }
             // These flags are read at decode/graph execution time. Geometry,
             // placement, session count and model remain immutable at startup.
             jr_set_env("LLAMA_JUPITER_SEQUENCE_PLAN", sequence);
             jr_set_env("LLAMA_JUPITER_PHONE_OWNED_AUTONOMOUS", autonomous ? "1" : "0");
-            const auto flags = body.value("flags", jr_json::object());
             for (const auto * key : {"TRACE", "PROFILE_STAGE", "Q_SWEEP", "TIMELINE",
                                      "SCHED_ALLOC_TIMING", "LOGITS_HASH"}) {
                 const std::string name = std::string("LLAMA_JUPITER_") + key;

@@ -21,6 +21,11 @@ static constexpr uint32_t k_max_phone_layers_per_region = 64;
 static constexpr uint32_t k_wire_region_limit = 64;
 static constexpr uint32_t k_internal_region_base = k_wire_region_limit;
 static constexpr uint32_t k_flag_flash_attn = 1;
+// Parent-plan cache namespace only; child Layer graphs use the same math.
+static constexpr uint32_t k_flag_calibration = 2;
+inline bool is_calibration_flags(uint32_t flags) {
+    return (flags & k_flag_calibration) != 0;
+}
 static constexpr uint32_t k_rope_neox = 2; // GGML_ROPE_TYPE_NEOX
 static constexpr uint32_t k_f16 = 1;      // GGML_TYPE_F16
 static constexpr uint32_t k_slots = 2;
@@ -160,9 +165,9 @@ inline bool validate(const region_plan & p, const char * & reason) {
     reason = "NONE";
     const uint32_t layers = layer_count(p);
     const bool legacy = p.version == k_plan_version &&
-        p.flags == k_flag_flash_attn;
+        (p.flags & ~k_flag_calibration) == k_flag_flash_attn;
     const bool multi = p.version == k_multi_plan_version &&
-        (p.flags & 0xffffu) == k_flag_flash_attn &&
+        ((p.flags & 0xffffu) & ~k_flag_calibration) == k_flag_flash_attn &&
         layers >= 2 && layers <= k_max_phone_layers_per_region;
     if ((!legacy && !multi) ||
             p.layer >= 256 || layers > 256 - p.layer ||

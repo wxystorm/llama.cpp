@@ -451,6 +451,10 @@ struct jupiter_phone_owned_native_state {
         // count in the upper flag bits. Do not encode a one-layer v3 plan.
         plan.version = phone_layers == 1 ? 2 : 3;
         plan.flags = phone_layers == 1 ? 1 : 1 | (phone_layers << 16);
+        const char * calibration = std::getenv("LLAMA_JUPITER_RESIDENT_NATIVE_CALIBRATION");
+        if (calibration && std::atoi(calibration) != 0) {
+            plan.flags |= GGML_RPC_PHONE_OWNED_CALIBRATION_FLAG;
+        }
         plan.run_id = (uint64_t) ggml_time_us();
         plan.p2c_run_id = plan.run_id;
         plan.region = 0;
@@ -616,6 +620,25 @@ struct jupiter_phone_owned_native_state {
             return;
         }
         const size_t n_floats = size_t(expected_tokens)*5120;
+        // In calibration, the CPU custom node includes queue admission,
+        // network transfer and final P2C wait. None are CPU math. Measure
+        // the complete callback once and subtract it from the tagged split.
+        const char * calibration = std::getenv("LLAMA_JUPITER_RESIDENT_NATIVE_CALIBRATION");
+        const char * profile = std::getenv("LLAMA_JUPITER_PROFILE_STAGE");
+        struct bridge_timer {
+            bool enabled;
+            uint32_t chunk;
+            uint32_t tokens;
+            int64_t start;
+            ~bridge_timer() {
+                if (enabled) {
+                    LLAMA_LOG_INFO("[JUPITER_NATIVE_BRIDGE_PROFILE] chunk=%u tokens=%u bridge_ms=%.6f\n",
+                                   chunk, tokens, (ggml_time_us() - start)/1000.0);
+                }
+            }
+        } timer {calibration && std::atoi(calibration) != 0 &&
+                 profile && std::atoi(profile) != 0,
+                 state->next_chunk, expected_tokens, ggml_time_us()};
         if (state->autonomous_enabled) {
             const uint32_t chunk = state->next_chunk;
             const uint32_t last = state->chunk_count - 1;
