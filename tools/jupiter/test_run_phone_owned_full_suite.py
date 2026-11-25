@@ -292,7 +292,8 @@ class TestNativeCalibrationRoute(unittest.TestCase):
             root = Path(tmp)
             args = argparse.Namespace(resume=False, sequence_policy="jupiter-dp",
                                       calibration_backend="native-autonomous", max_chunk=128)
-            cases = [{"layout": 52, "path": "p.txt", "name": "p.txt"}]
+            cases = [{"layout": 52, "path": "p.txt", "name": "p.txt",
+                      "kind": "normal", "group": "256", "repeat": 1}]
             plan = {"signature": "test"}
             seen = []
 
