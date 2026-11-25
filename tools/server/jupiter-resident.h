@@ -301,6 +301,9 @@ inline int jupiter_resident_server(common_params & params) {
                          inf_count, zero_count, (long long)first_bad, ms,
                          timing_only ? "TIMING_ONLY" : "FINITE_ONLY",
                          logits_finite ? "PASS" : (timing_only ? "UNVERIFIED" : "FAIL"));
+            if (native && zero_count == size_t(n_vocab)) {
+                throw std::runtime_error("ALL_ZERO_NATIVE_LOGITS");
+            }
             if (!logits_finite && !timing_only) {
                 throw std::runtime_error("NONFINITE_FINAL_LOGITS nan=" + std::to_string(nan_count) +
                     " inf=" + std::to_string(inf_count) + " first_bad=" + std::to_string(first_bad));

@@ -129,11 +129,16 @@ def profile_rows(text, metric="compute_ms", min_tokens=1, require_cpu=False):
             bridge_ms = float(m[3])
             continue
         m = STAGE.search(line)
+        if "[JUPITER_STAGE_PROFILE]" in line and not m:
+            raise ValueError("malformed native PC stage record")
         if m:
             device = m[1]
             if not (device.startswith("CPU") or device.startswith("CUDA")):
                 raise ValueError("unexpected PC backend in native calibration: " + device)
             inp, compute, wall = map(float, m.groups()[1:4])
+            if (not all(math.isfinite(v) and v >= 0 for v in (inp, compute, wall))
+                    or inp + compute > wall + 0.02):
+                raise ValueError("invalid native PC stage duration")
             tagged = int(m[5])
             if tagged:
                 if tagged != 1 or not device.startswith("CPU") or bridge_ms is None or bridge_count:

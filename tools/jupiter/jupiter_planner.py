@@ -446,7 +446,8 @@ def cmd_extract_q(args: argparse.Namespace) -> None:
     with _open_text_auto(args.log) as stream:
         text = stream.read()
     if native_calibration_active() or "[JUPITER_NATIVE_CALIBRATION]" in text:
-        rows = profile_rows(text, args.metric, args.min_tokens)
+        rows = profile_rows(text, args.metric, args.min_tokens,
+                            require_cpu=int(os.environ.get("LLAMA_JUPITER_CPU_LAYERS", "0")) > 0)
         with open(args.output, "w", newline="", encoding="utf-8") as stream:
             writer = csv.DictWriter(stream, fieldnames=NATIVE_FIELDS)
             writer.writeheader()

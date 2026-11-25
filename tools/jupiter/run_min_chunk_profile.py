@@ -108,7 +108,9 @@ def first_chunk_service_times(text: str, tokens: int) -> dict[str, float]:
     smaller token counts cannot supply the measurement.
     """
     if native_calibration_active() or "[JUPITER_NATIVE_CALIBRATION]" in text:
-        rows = [r for r in profile_rows(text) if (r["x"], r["y"]) == (tokens, 0)]
+        rows = [r for r in profile_rows(
+            text, require_cpu=int(os.environ.get("LLAMA_JUPITER_CPU_LAYERS", "0")) > 0)
+                if (r["x"], r["y"]) == (tokens, 0)]
         gpu = [r for r in rows if r["device"].startswith("CUDA")]
         phone = [r for r in rows if r["device"] == PHONE]
         if not gpu or len(phone) != 1:

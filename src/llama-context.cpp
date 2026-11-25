@@ -625,6 +625,8 @@ struct jupiter_phone_owned_native_state {
         // the complete callback once and subtract it from the tagged split.
         const char * calibration = std::getenv("LLAMA_JUPITER_RESIDENT_NATIVE_CALIBRATION");
         const char * profile = std::getenv("LLAMA_JUPITER_PROFILE_STAGE");
+        const bool measure_bridge = calibration && std::atoi(calibration) != 0 &&
+                                    profile && std::atoi(profile) != 0;
         struct bridge_timer {
             bool enabled;
             uint32_t chunk;
@@ -636,9 +638,8 @@ struct jupiter_phone_owned_native_state {
                                    chunk, tokens, (ggml_time_us() - start)/1000.0);
                 }
             }
-        } timer {calibration && std::atoi(calibration) != 0 &&
-                 profile && std::atoi(profile) != 0,
-                 state->next_chunk, expected_tokens, ggml_time_us()};
+        } timer {measure_bridge, state->next_chunk, expected_tokens,
+                 measure_bridge ? ggml_time_us() : 0};
         if (state->autonomous_enabled) {
             const uint32_t chunk = state->next_chunk;
             const uint32_t last = state->chunk_count - 1;

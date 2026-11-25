@@ -286,6 +286,51 @@ class TestResume(unittest.TestCase):
                 self.assertEqual(suite.run(), 0)
 
 
+class TestNativeCalibrationRoute(unittest.TestCase):
+    def test_native_calibration_then_unprofiled_native_worker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = argparse.Namespace(resume=False, sequence_policy="jupiter-dp",
+                                      calibration_backend="native-autonomous", max_chunk=128)
+            cases = [{"layout": 52, "path": "p.txt", "name": "p.txt"}]
+            plan = {"signature": "test"}
+            seen = []
+
+            class Worker:
+                def __init__(self, _args, layout, native, output, ubatch, *, calibration=False):
+                    self.calibration = calibration
+                    self.native = native
+                    seen.append((native, calibration))
+                def __enter__(self):
+                    return self
+                def __exit__(self, *_exc):
+                    pass
+                def child_env(self):
+                    return {"LLAMA_JUPITER_RESIDENT_NATIVE_CALIBRATION":
+                            str(int(self.calibration))}
+
+            def stage2(_args, _cases, _layout, _output):
+                self.assertEqual(_args._resident_env["LLAMA_JUPITER_RESIDENT_NATIVE_CALIBRATION"], "1")
+                return root / "min-chunk.json"
+
+            def stage3(_args, case, _output, stage2_json):
+                self.assertEqual(_args._resident_env["LLAMA_JUPITER_RESIDENT_NATIVE_CALIBRATION"], "1")
+                return dict(case, chunks=[96,96], plan_source="JUPITER_NATIVE_STAGE2_B_QXY_EXACT_DP")
+
+            def formal(_args, _cases, _output, _plan, resident_plans):
+                self.assertEqual(_args._resident_env["LLAMA_JUPITER_RESIDENT_NATIVE_CALIBRATION"], "0")
+                self.assertEqual(resident_plans[(52, "p.txt")]["chunks"], [96,96])
+                return 0
+
+            with patch.object(suite, "ResidentServer", Worker), \
+                 patch.object(suite, "stage2_for_layout", side_effect=stage2), \
+                 patch.object(suite, "exact_jupiter_dp_plan", side_effect=stage3), \
+                 patch.object(suite, "execute_cases", side_effect=formal), \
+                 patch.object(suite, "LegacyCalibration", side_effect=AssertionError("Legacy fallback")):
+                self.assertEqual(suite.execute_resident_suite(args, cases, root, plan, 52), 0)
+            self.assertEqual(seen, [(True, True), (True, False)])
+
+
 class Test32BFullSuite(unittest.TestCase):
     def test_32b_fixed_2048_one_prompt_dry_run(self):
         with tempfile.TemporaryDirectory() as root:

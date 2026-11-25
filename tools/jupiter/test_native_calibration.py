@@ -58,6 +58,8 @@ class TestNativeCalibration(unittest.TestCase):
             validate_run(text + "\n[RPC_GRAPH] cmd=GRAPH_COMPUTE")
         with self.assertRaises(ValueError):
             profile_rows(text.replace("native_bridge=1", "native_bridge=0"))
+        with self.assertRaises(ValueError):
+            profile_rows(text.replace("compute_ms=10.000", "compute_ms=nan"))
     def test_long_sweep_respects_native_wire_capacity(self):
         plans = print_sweep_plans(1855, [64,96,128], 64,128, max_subsequences=16)
         self.assertTrue(plans)

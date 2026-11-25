@@ -3,13 +3,15 @@
   Jupiter q(x,y)/Sequence DP full Prefill for Qwen3-14B or Qwen3-32B.
 .DESCRIPTION
   Fixed Context/Batch=2048; original measured Stage2 b, Stage3 q(x,y)/DP.
+  UseServer now calibrates on the native Phone autonomous FIFO, not Legacy RPC.
+  Rebuild both PC and Phone (RPC patch 8); use a NEW output for native profiles.
   Select a single native mode or compare Phone-autonomous P2C to native Sync.
   Single modes skip extra warmup and A-B-A revisits.
   Select model by -ModelSize or -Model, optionally choose CPU/CUDA/HTP
   layer counts or a sweep of Phone boundaries. No Decode.
 .EXAMPLE
   .\tools\jupiter\run_phone_owned_full_suite.ps1 -ModelSize 32b -DryRun
-  .\tools\jupiter\run_phone_owned_full_suite.ps1 -ModelSize 32b
+  .\tools\jupiter\run_phone_owned_full_suite.ps1 -ModelSize 32b -UseServer
   .\tools\jupiter\run_phone_owned_full_suite.ps1 -ModelSize 32b -CpuLayers 48 -Layouts 56
   .\tools\jupiter\run_phone_owned_full_suite.ps1 -ModelSize 32b -CudaLayers 8 -PhoneLayers 8 -Resume
   .\tools\jupiter\run_phone_owned_full_suite.ps1 -ModelSize 32b -CpuLayers 44 -Layouts "56,58,60,63" -OutDir ".\jupiter-32b-layout-sweep"
