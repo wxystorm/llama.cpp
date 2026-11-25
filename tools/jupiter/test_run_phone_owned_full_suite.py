@@ -363,6 +363,77 @@ class TestNativeCalibrationRoute(unittest.TestCase):
             self.assertEqual(seen, [(True, True), (True, False)])
 
 
+class TestOfflineSuiteRoute(unittest.TestCase):
+    def test_ready_profile_only_opens_formal_worker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = argparse.Namespace(resume=True, sequence_policy=suite.offline.POLICY,
+                                      run_mode="autonomous", calibration_backend="native-autonomous",
+                                      max_chunk=256)
+            cases = [dict(layout=52, path="p.txt", name="p.txt", tokens=130,
+                          kind="normal", group="0", repeat=1),
+                     dict(layout=52, path="q.txt", name="q.txt", tokens=130,
+                          kind="normal", group="0", repeat=1)]
+            profile = dict(root=root, b=24, plans={130: [65,65]})
+            workers = []
+
+            class Worker:
+                def __init__(self, _args, layout, native, output, ubatch, *, calibration=False):
+                    workers.append((native, calibration, ubatch))
+                def __enter__(self):
+                    return self
+                def __exit__(self, *_exc):
+                    pass
+                def child_env(self):
+                    return {"LLAMA_JUPITER_RESIDENT_NATIVE_CALIBRATION": "0"}
+
+            def formal(_args, _cases, _output, _plan, resident_plans):
+                for path in ("p.txt", "q.txt"):
+                    planned = resident_plans[(52, path)]
+                    self.assertEqual(planned["chunks"], [65,65])
+                    self.assertEqual(planned["plan_source"], "JUPITER_NATIVE_OFFLINE_INTERPOLATED_DP")
+                return 0
+
+            with patch.object(suite, "bind_offline_profile", return_value=profile) as binding, \
+                 patch.object(suite, "ResidentServer", Worker), \
+                 patch.object(suite, "execute_cases", side_effect=formal), \
+                 patch.object(suite, "stage2_for_layout", side_effect=AssertionError("per-Prompt Stage2")), \
+                 patch.object(suite, "exact_jupiter_dp_plan", side_effect=AssertionError("per-Prompt Stage3")), \
+                 patch.object(suite, "LegacyCalibration", side_effect=AssertionError("Legacy fallback")):
+                self.assertEqual(suite.execute_resident_suite(args, cases, root, {}, 52), 0)
+                binding.assert_called_once()
+            self.assertEqual(workers, [(True, False, 256)])
+
+    def test_profile_only_does_not_discover_benchmark_prompts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name in ("model.gguf", "llama-cli.exe", "llama-tokenize.exe", "llama-server.exe"):
+                (root/name).write_bytes(b"fake")
+            args = argparse.Namespace(
+                exe=str(root/"llama-cli.exe"), tokenizer=str(root/"llama-tokenize.exe"),
+                model=str(root/"model.gguf"), resident_server=str(root/"llama-server.exe"),
+                model_size="32b", rpc="127.0.0.1:10140", prompts_dir=str(root/"nonexistent"),
+                pattern="prompt_*_*.txt", groups="0,128,256,512,1024",
+                out_dir=str(root/"out"), layouts="52", cpu_layers=36,
+                cuda_layers=None, phone_layers=None, sessions=4, chunk_size=128,
+                sequence_policy=suite.offline.POLICY, min_chunk_json=None,
+                stage2_repeats=2, q_repeats=2, refine_repeats=2, max_rounds=0,
+                max_chunk=None, repeats=1, expected_count=50, mode_order="alternate",
+                no_warmup=True, revisit_first=False, resume=True,
+                continue_on_error=False, timeout_seconds=1800, dry_run=False,
+                profile_only=True, run_mode="autonomous")
+            spec = ModelLayout("32b", 64, 5120, 64, 8, 128)
+            fake = dict(root=root/"profile", b=24, plans={130:[65,65]})
+            with patch.object(suite, "parse_args", return_value=args), \
+                 patch.object(suite, "inspect_model", return_value=spec), \
+                 patch.object(suite, "ensure_offline_profile", return_value=fake) as build, \
+                 patch.object(suite, "discover", side_effect=AssertionError("benchmark discovery")), \
+                 patch.object(suite, "execute_resident_suite", side_effect=AssertionError("formal run")):
+                self.assertEqual(suite.run(), 0)
+                self.assertEqual(args.max_chunk, 256)
+                build.assert_called_once()
+
+
 class Test32BFullSuite(unittest.TestCase):
     def test_32b_fixed_2048_one_prompt_dry_run(self):
         with tempfile.TemporaryDirectory() as root:

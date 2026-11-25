@@ -20,7 +20,7 @@ from pathlib import Path
 from jupiter_planner import QProfile, solve_sequence_table, sequence_points
 from min_chunk_profile import select_min_chunk
 from native_calibration import PHONE, PHONE_RECORD, BRIDGE, UBATCH, STAGE, profile_rows, validate_run
-from resident_runtime import run_resident_cli
+from resident_runtime import run_resident_cli, PREFIX
 from run_phone_owned_multi_prompt import count_model_tokens
 
 POLICY = "jupiter-offline-dp"
@@ -578,9 +578,23 @@ def build_profile(args, layout, root, manifest, runtime_env):
     # If maximum does not divide the context, explicitly test max width too.
     if maximum not in capacity:
         capacity_rows.extend(m.run("capacity", calibration_plan(CONTEXT, [(maximum, 0)], maximum), 1))
+    capacity_logs = sorted({r["log"] for r in capacity_rows})
+    prepare_lines = [line for path in capacity_logs
+                     for line in Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+                     if "phase=PREPARE_DONE" in line]
+    # The current protocol reports successful allocation/Prepare but not
+    # Phone peak memory bytes. Preserve reported PC buffer allocations and
+    # exact capacity logs; do not mislabel feasibility as a peak RAM measure.
+    server_log = Path(runtime_env[PREFIX + "LOG"])
+    with server_log.open(encoding="utf-8", errors="replace") as stream:
+        pc_buffers = [line.rstrip() for line in stream
+                      if re.search(r"(?:model|compute|KV|output) buffer size", line, re.I)]
     write_json(root / "capacity.json", {"status": "PASS", "tokens": CONTEXT,
                                        "chunks": capacity, "max_chunk": maximum,
-                                       "logs": sorted({r["log"] for r in capacity_rows})})
+                                       "logs": capacity_logs, "prepare": prepare_lines,
+                                       "pc_buffer_records": pc_buffers,
+                                       "phone_peak_memory_bytes": None,
+                                       "memory_check": "REAL_ALLOCATION_AND_PREFILL_FEASIBILITY"})
     stage2 = []
     total = max(512, 2*maximum)
     for x in x_grid(maximum):

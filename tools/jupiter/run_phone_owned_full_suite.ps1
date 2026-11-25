@@ -13,11 +13,11 @@
   Select model by -ModelSize or -Model, optionally choose CPU/CUDA/HTP
   layer counts or a sweep of Phone boundaries. No Decode.
 .EXAMPLE
-  .\tools\jupiter\run_phone_owned_full_suite.ps1 -ModelSize 32b -DryRun
+  .\tools\jupiter\run_phone_owned_full_suite.ps1 -ModelSize 32b -UseServer -DryRun
   .\tools\jupiter\run_phone_owned_full_suite.ps1 -ModelSize 32b -UseServer
-  .\tools\jupiter\run_phone_owned_full_suite.ps1 -ModelSize 32b -CpuLayers 48 -Layouts 56
-  .\tools\jupiter\run_phone_owned_full_suite.ps1 -ModelSize 32b -CudaLayers 8 -PhoneLayers 8 -Resume
-  .\tools\jupiter\run_phone_owned_full_suite.ps1 -ModelSize 32b -CpuLayers 44 -Layouts "56,58,60,63" -OutDir ".\jupiter-32b-layout-sweep"
+  .\tools\jupiter\run_phone_owned_full_suite.ps1 -ModelSize 32b -CpuLayers 36 -Layouts 52 -UseServer -ProfileOnly -Resume
+  .\tools\jupiter\run_phone_owned_full_suite.ps1 -ModelSize 32b -CpuLayers 36 -Layouts 52 -UseServer -Resume
+  .\tools\jupiter\run_phone_owned_full_suite.ps1 -ModelSize 32b -CpuLayers 36 -Layouts 52 -UseServer -SequencePolicy jupiter-dp -MaxChunk 128 -Resume
 #>
 [CmdletBinding()]
 param(
@@ -45,7 +45,7 @@ param(
     [string]$ProfileTag = "",
     [switch]$ProfileOnly,
     [ValidateSet("both", "sync", "autonomous")]
-    [string]$RunMode = "both",
+    [string]$RunMode = "autonomous",
     [string]$Layouts = "",
     [int]$CpuLayers = -1,
     [int]$CudaLayers = -1,

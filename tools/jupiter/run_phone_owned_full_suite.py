@@ -201,11 +201,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--q-repeats", type=int, default=2)
     p.add_argument("--refine-repeats", type=int, default=2)
     p.add_argument("--max-rounds", type=int, default=0,
-                   help="0: exact DP refinement until measured; positive: finite budget")
+                   help="historical jupiter-dp only: 0 means refine until measured; offline mode never refines per Prompt")
     p.add_argument("--max-chunk", type=int, default=None,
                    help="offline: 256 by default; historical per-Prompt/fixed-control: 128")
     p.add_argument("--run-mode", choices=("both", "sync", "autonomous"),
-                   default="both",
+                   default="autonomous",
                    help="both: original A/B with parity; single mode: one "
                         "native Prefill per Prompt/repeat, no warmup or revisit")
     p.add_argument("--repeats", type=int, default=1,
@@ -1054,7 +1054,7 @@ def run() -> int:
         raise ValueError("offline profile options require " + offline.POLICY)
     if is_offline:
         offline.check_options(args)
-        if not args.resident_server and (not args.dry_run or args.profile_only):
+        if not args.resident_server:
             raise ValueError("offline Native profile requires --resident-server (-UseServer)")
         if args.min_chunk_json:
             raise ValueError("offline mode measures its own layout-specific b; no historical Stage2 import")
