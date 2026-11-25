@@ -33,6 +33,7 @@ from phone_owned_models import inspect_model, resolve_splits
 from run_prefill_bench import read_plan
 from resident_runtime import ResidentServer, timeout_marker
 from native_calibration import BACKEND as NATIVE_CALIBRATION
+import offline_profile as offline
 
 PROMPT_NAME = re.compile(r"^prompt_(.+)_(\d+)$", re.IGNORECASE)
 CHUNK_BUCKETS = (32, 64, 88, 96, 128, 192, 256, 384, 512, 768, 1024, 2048, 4096)
@@ -182,9 +183,15 @@ def parse_args() -> argparse.Namespace:
                    help="Phone suffix layers up to min(model_layers-1, 64 RPC slots); "
                         "real HTP feasibility checked at model load/Prepare")
     p.add_argument("--sessions", type=int, choices=(1, 2, 3, 4), default=4)
-    p.add_argument("--sequence-policy", choices=("jupiter-dp", "fixed-control"),
-                   default="jupiter-dp",
-                   help="default: original Jupiter Stage2 b + measured q(x,y) Sequence DP")
+    p.add_argument("--sequence-policy", choices=(offline.POLICY, "jupiter-dp", "fixed-control"),
+                   default=offline.POLICY,
+                   help="default: reusable offline Jupiter DP; jupiter-dp is the historical per-Prompt calibration")
+    p.add_argument("--offline-profile-dir", default=None,
+                   help="share one hardware/layout profile across compatible experiment output directories")
+    p.add_argument("--profile-tag", default="",
+                   help="identify Phone binary/driver/device configuration; change when Phone changes")
+    p.add_argument("--profile-only", action="store_true",
+                   help="build/reuse the hardware profile without tokenizing or running benchmark Prompts")
     p.add_argument("--chunk-size", type=int, default=128,
                    help="used only for explicitly labeled fixed-control ablation")
     p.add_argument("--min-chunk-json", default=None,
@@ -195,8 +202,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--refine-repeats", type=int, default=2)
     p.add_argument("--max-rounds", type=int, default=0,
                    help="0: exact DP refinement until measured; positive: finite budget")
-    p.add_argument("--max-chunk", type=int, default=128,
-                   help="original Jupiter q(x,y) max UBatch/Chunk size")
+    p.add_argument("--max-chunk", type=int, default=None,
+                   help="offline: 256 by default; historical per-Prompt/fixed-control: 128")
     p.add_argument("--run-mode", choices=("both", "sync", "autonomous"),
                    default="both",
                    help="both: original A/B with parity; single mode: one "
@@ -373,6 +380,11 @@ def preflight(args: argparse.Namespace, files: list[Path],
             )
         },
     }
+    if args.sequence_policy == offline.POLICY:
+        config["offline_profile_dir"] = str(offline.profile_directory(args, output, layouts[0]))
+        config["offline_profile_signature"] = offline.digest_config(offline.hardware_config(args, layouts[0]))
+        config["jupiter_planner_code_sha256"]["offline_profile.py"] = offline.digest_file(
+            Path(__file__).with_name("offline_profile.py"))
     if args.resident_server and getattr(args, "calibration_backend", "legacy") == "legacy":
         config["legacy_recovery_policy"] = {
             "request_timeout_seconds": getattr(args, "legacy_request_timeout", 120),
@@ -1030,12 +1042,29 @@ def run() -> int:
             args.legacy_timeout_retries < 0):
         raise ValueError("invalid Legacy recovery policy")
     args.legacy_calibration = getattr(args, "legacy_calibration", False)
-    args.calibration_backend = ("none" if args.sequence_policy != "jupiter-dp" else
+    args.profile_only = getattr(args, "profile_only", False)
+    args.offline_profile_dir = getattr(args, "offline_profile_dir", None)
+    args.profile_tag = getattr(args, "profile_tag", "")
+    is_offline = args.sequence_policy == offline.POLICY
+    if args.max_chunk is None:
+        args.max_chunk = 256 if is_offline else 128
+    if is_offline and args.legacy_calibration:
+        raise ValueError("offline Native profile does not use Legacy; select jupiter-dp explicitly for the historical baseline")
+    if not is_offline and (args.profile_only or args.offline_profile_dir or args.profile_tag):
+        raise ValueError("offline profile options require " + offline.POLICY)
+    if is_offline:
+        offline.check_options(args)
+        if not args.resident_server and (not args.dry_run or args.profile_only):
+            raise ValueError("offline Native profile requires --resident-server (-UseServer)")
+        if args.min_chunk_json:
+            raise ValueError("offline mode measures its own layout-specific b; no historical Stage2 import")
+    args.calibration_backend = ("none" if args.sequence_policy == "fixed-control" else
                                 "legacy" if args.legacy_calibration else NATIVE_CALIBRATION)
     if args.calibration_backend == NATIVE_CALIBRATION and not args.resident_server and not args.dry_run:
         raise ValueError("Native DP calibration requires --resident-server (-UseServer); "
                          "use --legacy-calibration only for an explicit historical baseline")
-    print(f"[PHONE_SUITE_CALIBRATION_BACKEND] mode={args.calibration_backend}", flush=True)
+    print(f"[PHONE_SUITE_CALIBRATION_BACKEND] mode={args.calibration_backend} "
+          f"profile={'OFFLINE_SHARED' if is_offline else 'HISTORICAL_PER_PROMPT' if args.sequence_policy == 'jupiter-dp' else 'NONE'}", flush=True)
     if args.resident_server and args.calibration_backend == "legacy":
         print(f"[PHONE_SUITE_LEGACY_POLICY] request_timeout_seconds={args.legacy_request_timeout} "
               f"restart_new_plans={args.legacy_restart_prompts} "
@@ -1059,7 +1088,7 @@ def run() -> int:
     args.model_size = model.family
     args.model_layers = model.layers
     if args.out_dir is None:
-        args.out_dir = f"jupiter-autonomous-{model.family}-dp-2048"
+        args.out_dir = f"jupiter-autonomous-{model.family}-{'offline-dp' if is_offline else 'dp'}-2048"
         if args.run_mode != "both":
             args.out_dir += f"-{args.run_mode}-only"
         if args.resident_server:
@@ -1100,6 +1129,13 @@ def run() -> int:
             raise FileNotFoundError(getattr(args, name))
     output = Path(args.out_dir).resolve()
     output.mkdir(parents=True, exist_ok=True)
+    if args.profile_only:
+        if args.dry_run:
+            raise ValueError("--profile-only and --dry-run are exclusive")
+        result = ensure_offline_profile(args, layouts[0], output)
+        print(f"[PHONE_SUITE_PROFILE_ONLY] root={result['root']} b={result['b']} "
+              f"lengths={len(result['plans'])} status=PASS", flush=True)
+        return 0
     group_arg = args.groups.strip()
     if not group_arg:
         raise ValueError("--groups must be a comma-separated list or 'all'")
@@ -1145,6 +1181,58 @@ def run() -> int:
     return execute_resident_suite(args, cases, output, plan, layouts[0])
 
 
+def ensure_offline_profile(args, layout, output):
+    root = offline.profile_directory(args, output, layout)
+    manifest = offline.open_profile(args, layout, root)
+    cached = offline.load_ready(root, manifest)
+    if cached is not None:
+        print(f"[JUPITER_OFFLINE_PROFILE] root={root} b={cached['b']} "
+              f"lengths={len(cached['plans'])} status=REUSE", flush=True)
+        return cached
+    print(f"[JUPITER_OFFLINE_PROFILE] root={root} status=BUILD", flush=True)
+    # Calibration graph/KV namespace is isolated from the unprofiled worker.
+    with ResidentServer(args, layout, True, root, args.max_chunk, calibration=True) as runtime:
+        result = offline.build_profile(args, layout, root, manifest, runtime.child_env())
+    print(f"[JUPITER_OFFLINE_PROFILE] root={root} b={result['b']} "
+          f"lengths={len(result['plans'])} status=READY", flush=True)
+    return result
+
+
+def bind_offline_profile(args, layout, output):
+    # Never combine formal rows from two different measured profiles, even
+    # when the profile directory/configuration has the same name.
+    root = offline.profile_directory(args, output, layout)
+    path = Path(output) / "offline-profile-binding.json"
+    old = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+    if old is not None:
+        ready_path = root / "profile-ready.json"
+        if (not ready_path.is_file() or
+                offline.digest_file(ready_path) != old.get("profile_ready_sha256")):
+            raise ValueError("bound offline profile missing or changed; restore it or choose a new experiment directory")
+    result = ensure_offline_profile(args, layout, output)
+    binding = {"profile_dir": str(result["root"]),
+               "profile_signature": result["ready"]["signature"],
+               "profile_ready_sha256": result["ready_sha256"],
+               "validation_status": result["ready"]["validation_status"]}
+    if old is not None and old != binding:
+        raise ValueError("existing experiment uses a different offline profile")
+    if old is None and any(Path(output).glob("cases/**/case-result.json")):
+        raise ValueError("existing experiment rows have no offline profile binding; use a new directory")
+    write_json(path, binding)
+    return result
+
+
+def offline_case_plan(case, profile):
+    total = case["tokens"]
+    cuts = profile["plans"].get(total)
+    if cuts is None:
+        raise ValueError(f"offline profile has no sequence for {total} tokens")
+    return dict(case, chunks=list(cuts), min_chunk=profile["b"],
+                plan_file=str(profile["root"] / "sequence.plan"),
+                plan_source=("JUPITER_OFFLINE_SHORT_SINGLE_CHUNK" if total < profile["b"] else
+                             "JUPITER_NATIVE_OFFLINE_INTERPOLATED_DP"))
+
+
 def execute_resident_suite(args, cases, output, plan, layout):
     # Never load two copies of a 14B/32B model at once. Profile the same
     # native autonomous execution path, then use a separate unprofiled
@@ -1157,11 +1245,24 @@ def execute_resident_suite(args, cases, output, plan, layout):
             json.loads(path.read_text(encoding="utf-8")), args.run_mode)
 
     pending = [case for case in cases if pending_case(case)]
-    if not pending:
-        return execute_cases(args, cases, output, plan, resident_plans={})
     resident_plans = {}
     ubatch = args.max_chunk
-    if args.sequence_policy == "jupiter-dp" and args.calibration_backend == NATIVE_CALIBRATION:
+    if args.sequence_policy == offline.POLICY:
+        profile = bind_offline_profile(args, layout, output)
+        for case in pending:
+            key = (case["layout"], case["path"])
+            if key in resident_plans:
+                continue
+            chosen = offline_case_plan(case, profile)
+            resident_plans[key] = chosen
+            print(f"[PHONE_SUITE_OFFLINE_LOOKUP] layout={layout} prompt={case['name']} "
+                  f"tokens={case['tokens']} b={chosen['min_chunk']} "
+                  f"chunks={chosen['chunks']} status=READY", flush=True)
+        if not pending:
+            return execute_cases(args, cases, output, plan, resident_plans={})
+    elif not pending:
+        return execute_cases(args, cases, output, plan, resident_plans={})
+    elif args.sequence_policy == "jupiter-dp" and args.calibration_backend == NATIVE_CALIBRATION:
         with ResidentServer(args, layout, True, output, ubatch, calibration=True) as runtime:
             args._resident_env = runtime.child_env()
             try:
@@ -1221,13 +1322,15 @@ def execute_cases(args, cases, output, plan, resident_plans=None):
                   f" prompt={case['name']} kind={case['kind']}"
                   f" repeat={case['repeat']} status=RUN", flush=True)
             try:
-                if args.sequence_policy == "jupiter-dp":
+                if args.sequence_policy in ("jupiter-dp", offline.POLICY):
                     layout = case["layout"]
                     if resident_plans is not None:
                         planned = resident_plans[(layout, case["path"])]
                         case = dict(case, **{k: planned[k] for k in
                                     ("chunks", "plan_file", "plan_source", "min_chunk")})
                     else:
+                        if args.sequence_policy == offline.POLICY:
+                            raise RuntimeError("offline DP requires a bound shared sequence table")
                         if layout not in stage2_by_layout:
                             stage2_by_layout[layout] = stage2_for_layout(
                                 args, cases, layout, output)

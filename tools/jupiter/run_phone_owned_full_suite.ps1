@@ -2,9 +2,12 @@
 .SYNOPSIS
   Jupiter q(x,y)/Sequence DP full Prefill for Qwen3-14B or Qwen3-32B.
 .DESCRIPTION
-  Fixed Context/Batch=2048; original measured Stage2 b, Stage3 q(x,y)/DP.
-  UseServer now calibrates on the native Phone autonomous FIFO, not Legacy RPC.
-  Rebuild both PC and Phone (RPC patch 8); use a NEW output for native profiles.
+  Default: native offline b and shared q(x,y) profile, 2 physical stages,
+  paper k<=8, max Chunk=256, one sequence table for all lengths 2..2048.
+  -UseServer -ProfileOnly builds the reusable profile without benchmark Prompts.
+  -OfflineProfileDir shares the profile with other compatible experiment runs.
+  The old per-Prompt calibration is explicitly -SequencePolicy jupiter-dp.
+  Requires the existing RPC patch 8 binaries; use a NEW experiment output.
   Select a single native mode or compare Phone-autonomous P2C to native Sync.
   Single modes skip extra warmup and A-B-A revisits.
   Select model by -ModelSize or -Model, optionally choose CPU/CUDA/HTP
@@ -36,8 +39,11 @@ param(
     [string]$Pattern = "prompt_*_*.txt",
     [string]$Groups = "0,128,256,512,1024",
     [string]$OutDir = "",
-    [ValidateSet("jupiter-dp", "fixed-control")]
-    [string]$SequencePolicy = "jupiter-dp",
+    [ValidateSet("jupiter-offline-dp", "jupiter-dp", "fixed-control")]
+    [string]$SequencePolicy = "jupiter-offline-dp",
+    [string]$OfflineProfileDir = "",
+    [string]$ProfileTag = "",
+    [switch]$ProfileOnly,
     [ValidateSet("both", "sync", "autonomous")]
     [string]$RunMode = "both",
     [string]$Layouts = "",
@@ -48,7 +54,7 @@ param(
     [int]$Repeats = 1,
     [int]$Sessions = 4,
     [int]$ChunkSize = 128,
-    [int]$MaxChunk = 128,
+    [int]$MaxChunk = 0,
     [string]$MinChunkJson = "",
     [int]$Stage2Repeats = 2,
     [int]$QRepeats = 2,
@@ -72,7 +78,12 @@ try {
             $Model = "E:\llama\models\Qwen3-14B-Q4_K_M.gguf"
         }
     }
-    foreach ($required in @($Exe, $Tokenizer, $Model, $PromptsDir)) {
+    if ($MaxChunk -eq 0) {
+        $MaxChunk = if ($SequencePolicy -eq "jupiter-offline-dp") { 256 } else { 128 }
+    }
+    $requiredPaths = @($Exe, $Tokenizer, $Model)
+    if (!$ProfileOnly) { $requiredPaths += $PromptsDir }
+    foreach ($required in $requiredPaths) {
         if (!(Test-Path -LiteralPath $required)) {
             throw "Required path not found: $required. Compile llama-tokenize if missing."
         }
@@ -114,6 +125,9 @@ try {
                        "--legacy-restart-prompts", [string]$LegacyRestartPrompts,
                        "--legacy-timeout-retries", [string]$LegacyTimeoutRetries)
     }
+    if ($OfflineProfileDir) { $argsList += @("--offline-profile-dir", $OfflineProfileDir) }
+    if ($ProfileTag) { $argsList += @("--profile-tag", $ProfileTag) }
+    if ($ProfileOnly) { $argsList += "--profile-only" }
     if ($LegacyCalibration) { $argsList += "--legacy-calibration" }
     if ($SkipLegacyLogitsCheck) { $argsList += "--skip-legacy-logits-check" }
     if ($OutDir) { $argsList += @("--out-dir", $OutDir) }

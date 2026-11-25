@@ -8,7 +8,6 @@ the PAPER DP always searches at most 4*2=8 chunks. No per-Prompt q refinement.
 """
 from __future__ import annotations
 
-import argparse
 import csv
 import hashlib
 import json
@@ -38,9 +37,10 @@ WORDS = ("The model reads a short text and predicts the next word. "
          "A local system can process data with several devices. "
          "This simple example tests memory and time for a common task. "
          "Each step uses the same basic rules in a different order.").split()
-READY_FILES = ("min-chunk.json", "capacity.json", "q-profile.csv",
-               "q-samples.csv", "validation.csv", "validation.json",
-               "sequence.plan", "plan-summary.csv")
+READY_FILES = ("min-chunk.json", "capacity.json", "stage2-samples.csv",
+               "q-profile.csv", "q-samples.csv", "validation.csv",
+               "validation-samples.csv", "validation.json", "sequence.plan",
+               "plan-summary.csv")
 DETAIL_FIELDS = (
     "x", "y", "repeat", "phase", "cpu_compute_ms", "cuda_compute_ms",
     "pc_local_input_ms", "pc_compute_ms", "pc_service_ms",
@@ -83,8 +83,7 @@ def write_json(path, obj):
 
 
 def read_json(path):
-    return Path(path).read_text(encoding="utf-8") and json.loads(
-        Path(path).read_text(encoding="utf-8"))
+    return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
 def write_csv(path, fields, rows):
@@ -287,7 +286,7 @@ def exact_prompt(args, root, total):
 
 def detailed_rows(text, cuts, cpu_layers):
     """Physical-stage accounting; no communication/Head time double-counting."""
-    data = validate_run(text, sum(cuts), cuts)
+    validate_run(text, sum(cuts), cuts)
     rows = profile_rows(text, metric="wall_ms", require_cpu=cpu_layers > 0,
                         pc_prefix_only=True)
     by_xy = {}
@@ -578,7 +577,7 @@ def build_profile(args, layout, root, manifest, runtime_env):
     capacity_rows = m.run("capacity", capacity, 1)
     # If maximum does not divide the context, explicitly test max width too.
     if maximum not in capacity:
-        m.run("capacity", calibration_plan(CONTEXT, [(maximum, 0)], maximum), 1)
+        capacity_rows.extend(m.run("capacity", calibration_plan(CONTEXT, [(maximum, 0)], maximum), 1))
     write_json(root / "capacity.json", {"status": "PASS", "tokens": CONTEXT,
                                        "chunks": capacity, "max_chunk": maximum,
                                        "logs": sorted({r["log"] for r in capacity_rows})})
@@ -614,6 +613,8 @@ def build_profile(args, layout, root, manifest, runtime_env):
     # interpolated plans exact or iterate on benchmark Prompt contents.
     validation, held_rows = [], []
     held = holdout_points(b, maximum)
+    if not held:
+        raise ValueError("no independent interpolation validation coordinates")
     for x, y in held:
         if (x, y) in expected:
             raise ValueError("holdout overlaps training grid")
