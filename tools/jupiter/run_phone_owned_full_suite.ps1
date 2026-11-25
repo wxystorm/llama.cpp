@@ -20,6 +20,7 @@ param(
     [string]$Tokenizer = ".\build-phone-owned\bin\Release\llama-tokenize.exe",
     [string]$ServerExe = ".\build-phone-owned\bin\Release\llama-server.exe",
     [switch]$UseServer,
+    [switch]$LegacyCalibration,
     [switch]$SkipLegacyLogitsCheck,
     [int]$ResidentStartTimeout = 1800,
     [int]$LegacyRequestTimeout = 120,
@@ -111,6 +112,7 @@ try {
                        "--legacy-restart-prompts", [string]$LegacyRestartPrompts,
                        "--legacy-timeout-retries", [string]$LegacyTimeoutRetries)
     }
+    if ($LegacyCalibration) { $argsList += "--legacy-calibration" }
     if ($SkipLegacyLogitsCheck) { $argsList += "--skip-legacy-logits-check" }
     if ($OutDir) { $argsList += @("--out-dir", $OutDir) }
     if ($Layouts) { $argsList += @("--layouts", $Layouts) }

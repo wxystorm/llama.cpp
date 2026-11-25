@@ -32,6 +32,7 @@ from run_phone_owned_multi_prompt import count_model_tokens
 from phone_owned_models import inspect_model, resolve_splits
 from run_prefill_bench import read_plan
 from resident_runtime import ResidentServer, timeout_marker
+from native_calibration import BACKEND as NATIVE_CALIBRATION
 
 PROMPT_NAME = re.compile(r"^prompt_(.+)_(\d+)$", re.IGNORECASE)
 CHUNK_BUCKETS = (32, 64, 88, 96, 128, 192, 256, 384, 512, 768, 1024, 2048, 4096)
@@ -48,7 +49,7 @@ FIELDNAMES = (
     "layout", "group", "prompt", "kind", "repeat", "status", "tokens",
     "context", "chunks", "chunk_size", "n_chunks",
     "min_chunk", "plan_source", "plan_file", "run_mode", "first_mode",
-    "execution_backend", "legacy_calibration_validation", "prefill_metric", "sync_reset_ms", "autonomous_reset_ms",
+    "execution_backend", "calibration_backend", "legacy_calibration_validation", "prefill_metric", "sync_reset_ms", "autonomous_reset_ms",
     "sync_request_wall_ms", "autonomous_request_wall_ms",
     "sync_ms", "autonomous_ms", "sync_tok_s", "autonomous_tok_s",
     "speedup", "sync_cache_hit", "autonomous_cache_hit",
@@ -144,6 +145,8 @@ def parse_args() -> argparse.Namespace:
                    help="restart Legacy after this many NEW completed Stage3 plans; 0 disables")
     p.add_argument("--legacy-timeout-retries", type=int, default=2,
                    help="additional worker restarts per timed-out Stage2/3 job")
+    p.add_argument("--legacy-calibration", action="store_true",
+                   help="explicit historical Legacy RPC baseline, not the migrated executor")
     p.add_argument("--skip-legacy-logits-check", action="store_true",
                    help="resident Stage2/3 timing only; tolerate nonfinite legacy logits, "
                         "never weaken native output checks")
@@ -295,7 +298,9 @@ def preflight(args: argparse.Namespace, files: list[Path],
     config = {
         "format": 1,
         "execution_backend": "resident-server" if args.resident_server else "cli",
-        "legacy_calibration_validation": ("TIMING_ONLY" if getattr(args, "skip_legacy_logits_check", False)
+        "calibration_backend": getattr(args, "calibration_backend", "legacy"),
+        "legacy_calibration_validation": ("NOT_USED" if getattr(args, "calibration_backend", "legacy") != "legacy"
+                                          else "TIMING_ONLY" if getattr(args, "skip_legacy_logits_check", False)
                                           else "FINITE_ONLY" if args.resident_server else "CLI_UNVERIFIED"),
         "resident_server": (file_signature(Path(args.resident_server))
                             if args.resident_server else None),
@@ -332,11 +337,11 @@ def preflight(args: argparse.Namespace, files: list[Path],
             for name in (
                 "jupiter_planner.py", "run_min_chunk_profile.py",
                 "min_chunk_profile.py", "run_q_sweep.py",
-                "run_sequence_pipeline.py", "refine_sequence_q.py",
+                "run_sequence_pipeline.py", "refine_sequence_q.py", "native_calibration.py",
             )
         },
     }
-    if args.resident_server:
+    if args.resident_server and getattr(args, "calibration_backend", "legacy") == "legacy":
         config["legacy_recovery_policy"] = {
             "request_timeout_seconds": getattr(args, "legacy_request_timeout", 120),
             "restart_new_plans": getattr(args, "legacy_restart_prompts", 10),
@@ -470,11 +475,12 @@ def child_run(command: list[str], stdout_path: Path, timeout: int,
 
 def calibration_env(args: argparse.Namespace) -> dict[str, str]:
     env = os.environ.copy()
-    # Jupiter's original q(x,y) calibrator and model partition MUST run
-    # without the Phone-native graph replacement being benchmarked.
+    # The original DP objective is independent of the Graph execution
+    # mechanism. Main calibration uses the SAME Phone-owned executor.
+    native = getattr(args, "calibration_backend", "legacy") == NATIVE_CALIBRATION
     env.update({
-        "LLAMA_JUPITER_PHONE_OWNED_NATIVE": "0",
-        "LLAMA_JUPITER_PHONE_OWNED_AUTONOMOUS": "0",
+        "LLAMA_JUPITER_PHONE_OWNED_NATIVE": str(int(native)),
+        "LLAMA_JUPITER_PHONE_OWNED_AUTONOMOUS": str(int(native)),
         "LLAMA_JUPITER_PHONE_OWNED_ASYNC": "0",
         "LLAMA_JUPITER_HTP_SESSIONS": str(args.sessions),
         "LLAMA_JUPITER_HTP_ACTIVE_SESSIONS": str(args.sessions),
@@ -564,7 +570,9 @@ def stage2_for_layout(args: argparse.Namespace, cases: list[dict],
     if args.min_chunk_json:
         source = Path(args.min_chunk_json).resolve()
     else:
-        stage2 = output / "calibration" / f"l{layout:02d}" / "stage2"
+        calibration_dir = ("native-calibration" if
+            getattr(args, "calibration_backend", "legacy") == NATIVE_CALIBRATION else "calibration")
+        stage2 = output / calibration_dir / f"l{layout:02d}" / "stage2"
         source = stage2 / "min-chunk.json"
         if not source.is_file():
             # Jupiter Stage2 is a *hardware* measurement, not a per-Prompt
@@ -602,6 +610,9 @@ def stage2_for_layout(args: argparse.Namespace, cases: list[dict],
     if not source.is_file():
         raise RuntimeError(f"Jupiter Stage2 min-chunk.json missing: {source}")
     info = json.loads(source.read_text(encoding="utf-8-sig"))
+    if (getattr(args, "calibration_backend", "legacy") == NATIVE_CALIBRATION and
+            info.get("calibration_backend") != NATIVE_CALIBRATION):
+        raise ValueError("Native Stage2 profile required; do not reuse Legacy data")
     if (int(info["pc_layers"]) != layout or
             int(info.get("cpu_layers", 0)) != args.cpu_layers or
             int(info["max_chunk"]) != args.max_chunk or
@@ -614,14 +625,16 @@ def stage2_for_layout(args: argparse.Namespace, cases: list[dict],
 
 def exact_jupiter_dp_plan(args: argparse.Namespace, case: dict,
                           output: Path, stage2_json: Path, legacy=None) -> dict:
-    target = output / "calibration" / f"l{case['layout']:02d}" / \
+    native = getattr(args, "calibration_backend", "legacy") == NATIVE_CALIBRATION
+    target = output / ("native-calibration" if native else "calibration") / f"l{case['layout']:02d}" / \
         "plans" / case["name"].removesuffix(".txt")
     stage3 = target / "stage3"
     plan_file = target / "final.plan"
     summary_path = stage3 / "sequence-summary.json"
     existing = (json.loads(summary_path.read_text(encoding="utf-8"))
                 if summary_path.is_file() else None)
-    if existing and (existing.get("pc_layers") != case["layout"] or
+    if existing and ((native and existing.get("calibration_backend") != NATIVE_CALIBRATION) or
+                     existing.get("pc_layers") != case["layout"] or
                      existing.get("cpu_layers") != args.cpu_layers or
                      existing.get("prompt_tokens") != case["tokens"]):
         raise ValueError("Old Jupiter Stage3 results use a different "
@@ -668,6 +681,8 @@ def exact_jupiter_dp_plan(args: argparse.Namespace, case: dict,
     if not plan_file.is_file() or not summary_path.is_file():
         raise RuntimeError(f"Jupiter Stage3 plan incomplete: {target}")
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    if (native and summary.get("calibration_backend") != NATIVE_CALIBRATION):
+        raise RuntimeError("Native Stage3 profile provenance missing")
     if summary.get("status") != status:
         raise RuntimeError(f"Jupiter DP not fully measured and verified: "
                            f"{summary.get('status')}")
@@ -691,7 +706,8 @@ def exact_jupiter_dp_plan(args: argparse.Namespace, case: dict,
     planned = dict(case)
     planned["chunks"] = chunks
     planned["plan_file"] = str(plan_file)
-    planned["plan_source"] = "JUPITER_STAGE2_B_QXY_EXACT_DP"
+    planned["plan_source"] = ("JUPITER_NATIVE_STAGE2_B_QXY_EXACT_DP" if native
+                              else "JUPITER_STAGE2_B_QXY_EXACT_DP")
     planned["min_chunk"] = summary["min_chunk"]
     print(f"[PHONE_SUITE_DP_READY] layout={case['layout']} "
           f"prompt={case['name']} b={planned['min_chunk']}"
@@ -704,6 +720,8 @@ def run_mode(args: argparse.Namespace, case: dict,
     work.mkdir(parents=True, exist_ok=True)
     child_env = os.environ.copy()
     child_env.update(getattr(args, "_resident_env", {}))
+    child_env["LLAMA_JUPITER_PROFILE_STAGE"] = "0"
+    child_env["LLAMA_JUPITER_Q_SWEEP"] = "0"
     child_run(cli_for_case(args, case, mode, work),
               work / "runner.stdout.log", args.timeout_seconds, env=child_env)
     report = json.loads(
@@ -834,6 +852,7 @@ def csv_row(row: dict) -> dict:
         "run_mode": row.get("run_mode", "both"),
         "first_mode": row.get("first_mode", ""),
         "execution_backend": row.get("execution_backend", "cli"),
+        "calibration_backend": row.get("calibration_backend", "legacy"),
         "legacy_calibration_validation": row.get("legacy_calibration_validation", "CLI_UNVERIFIED"),
         "prefill_metric": (auto or sync).get("prefill_metric", ""),
         "sync_reset_ms": sync.get("resident_reset_ms"),
@@ -892,6 +911,7 @@ def group_summaries(rows: list[dict]) -> list[dict]:
             "layout": layout, "group": group,
             "run_mode": items[0].get("run_mode", "both"),
             "execution_backend": items[0].get("execution_backend", "cli"),
+            "calibration_backend": items[0].get("calibration_backend", "legacy"),
             "legacy_calibration_validation": items[0].get("legacy_calibration_validation", "CLI_UNVERIFIED"),
             "passed_cases": len(items),
             "passed_pairs": sum(x.get("speedup") is not None for x in items),
@@ -934,6 +954,7 @@ def publish(output: Path, rows: list[dict],
         "manifest_sha256": manifest_sha,
         "run_mode": mode,
         "execution_backend": (rows[0].get("execution_backend", "cli") if rows else ""),
+        "calibration_backend": (rows[0].get("calibration_backend", "legacy") if rows else ""),
         "legacy_calibration_validation": (rows[0].get("legacy_calibration_validation", "CLI_UNVERIFIED") if rows else ""),
         "expected_cases": expected_cases,
         "finished_cases": len(rows),
@@ -970,13 +991,21 @@ def run() -> int:
     if (args.legacy_request_timeout <= 0 or args.legacy_restart_prompts < 0 or
             args.legacy_timeout_retries < 0):
         raise ValueError("invalid Legacy recovery policy")
-    if args.resident_server:
+    args.legacy_calibration = getattr(args, "legacy_calibration", False)
+    args.calibration_backend = ("none" if args.sequence_policy != "jupiter-dp" else
+                                "legacy" if args.legacy_calibration else NATIVE_CALIBRATION)
+    if args.calibration_backend == NATIVE_CALIBRATION and not args.resident_server and not args.dry_run:
+        raise ValueError("Native DP calibration requires --resident-server (-UseServer); "
+                         "use --legacy-calibration only for an explicit historical baseline")
+    print(f"[PHONE_SUITE_CALIBRATION_BACKEND] mode={args.calibration_backend}", flush=True)
+    if args.resident_server and args.calibration_backend == "legacy":
         print(f"[PHONE_SUITE_LEGACY_POLICY] request_timeout_seconds={args.legacy_request_timeout} "
               f"restart_new_plans={args.legacy_restart_prompts} "
               f"timeout_retries={args.legacy_timeout_retries}", flush=True)
     args.skip_legacy_logits_check = getattr(args, "skip_legacy_logits_check", False)
-    if args.skip_legacy_logits_check and (not args.resident_server or args.sequence_policy != "jupiter-dp"):
-        raise ValueError("--skip-legacy-logits-check requires resident jupiter-dp calibration")
+    if args.skip_legacy_logits_check and (not args.resident_server or args.calibration_backend != "legacy"):
+        raise ValueError("--skip-legacy-logits-check requires explicit --legacy-calibration; "
+                         "native calibration never skips finite output validation")
     if args.skip_legacy_logits_check:
         print("[PHONE_SUITE_WARNING] legacy_calibration_validation=TIMING_ONLY "
               "accuracy=UNVERIFIED native_logits_check=STRICT", flush=True)
@@ -997,6 +1026,8 @@ def run() -> int:
             args.out_dir += f"-{args.run_mode}-only"
         if args.resident_server:
             args.out_dir += "-resident"
+        if args.calibration_backend == NATIVE_CALIBRATION:
+            args.out_dir += "-native-profile"
         if args.skip_legacy_logits_check:
             args.out_dir += "-legacy-timing-only"
     if args.resident_server:
@@ -1054,7 +1085,9 @@ def run() -> int:
     for case in cases:
         case["run_mode"] = args.run_mode
         case["execution_backend"] = "resident-server" if args.resident_server else "cli"
+        case["calibration_backend"] = args.calibration_backend
         case["legacy_calibration_validation"] = (
+            "NOT_USED" if args.calibration_backend != "legacy" else
             "TIMING_ONLY" if args.skip_legacy_logits_check else
             "FINITE_ONLY" if args.resident_server else "CLI_UNVERIFIED")
     print(f"[PHONE_SUITE] model=Qwen3-{model.family.upper()}"
@@ -1075,9 +1108,9 @@ def run() -> int:
 
 
 def execute_resident_suite(args, cases, output, plan, layout):
-    # Never load two copies of a 14B/32B model at once. First finish all
-    # remaining exact DP plans on one legacy model; then release it and
-    # measure all prompts on one native model. Completed cases are retained.
+    # Never load two copies of a 14B/32B model at once. Profile the same
+    # native autonomous execution path, then use a separate unprofiled
+    # worker for the formal measurements. Legacy is explicit opt-in only.
     def pending_case(case):
         path = case_directory(output, case) / "case-result.json"
         if not args.resume or not path.is_file():
@@ -1090,7 +1123,21 @@ def execute_resident_suite(args, cases, output, plan, layout):
         return execute_cases(args, cases, output, plan, resident_plans={})
     resident_plans = {}
     ubatch = args.max_chunk
-    if args.sequence_policy == "jupiter-dp":
+    if args.sequence_policy == "jupiter-dp" and args.calibration_backend == NATIVE_CALIBRATION:
+        with ResidentServer(args, layout, True, output, ubatch, calibration=True) as runtime:
+            args._resident_env = runtime.child_env()
+            try:
+                stage2 = stage2_for_layout(args, cases, layout, output)
+                for index, case in enumerate(pending, 1):
+                    key = (case["layout"], case["path"])
+                    if key in resident_plans:
+                        continue
+                    print(f"[PHONE_SUITE_RESIDENT_CALIBRATION] {index}/{len(pending)} "
+                          f"prompt={case['name']} mode=PHONE_AUTONOMOUS", flush=True)
+                    resident_plans[key] = exact_jupiter_dp_plan(args, case, output, stage2)
+            finally:
+                args._resident_env = {}
+    elif args.sequence_policy == "jupiter-dp":
         with LegacyCalibration(args, layout, output, ubatch) as legacy:
             stage2 = stage2_for_layout(args, cases, layout, output, legacy=legacy)
             for index, case in enumerate(pending, 1):
