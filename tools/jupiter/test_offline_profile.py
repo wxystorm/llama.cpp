@@ -16,20 +16,22 @@ class TestOfflineProfile(unittest.TestCase):
             jobs = offline.training_jobs(b, 256)
             seen = []
             for cuts, targets in jobs:
-                self.assertEqual(sum(cuts), 2048)
+                self.assertEqual(sum(cuts), max(x+y for x,y in targets))
+                self.assertLessEqual(sum(cuts), 2048)
                 self.assertLessEqual(len(cuts), 16)
                 self.assertTrue(all(8 <= x <= 256 for x in cuts))
                 self.assertTrue(set(targets).issubset(sequence_points(cuts)))
                 seen.extend(targets)
             expected = {(x, y) for x in offline.x_grid(256) if x >= b
-                        for y in set(offline.BASE_Y + (2048-x,)) if y+x <= 2048}
+                        for y in set(offline.BASE_Y + (min(2048-x,7*256),))
+                        if y <= min(2048-x,7*256)}
             self.assertEqual(set(seen), expected)
             self.assertEqual(len(seen), len(expected))
             held = offline.holdout_points(b, 256)
             self.assertTrue(held)
             self.assertFalse(set(held) & expected)
             for x, y in held:
-                cuts = offline.calibration_plan(2048, [(x,y)], 256)
+                cuts = offline.calibration_plan(x+y, [(x,y)], 256)
                 self.assertIn((x,y), sequence_points(cuts))
                 self.assertTrue(all(8 <= c <= 256 for c in cuts))
 

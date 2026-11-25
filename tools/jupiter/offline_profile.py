@@ -201,21 +201,27 @@ def calibration_plan(total, points, maximum, minimum=MIN_PROFILE_CHUNK, cap=WIRE
 
 
 def pack_points(points, total, maximum):
-    """Greedily share full native Prefills; preserve every target exactly."""
+    """Share real-KV runs, ending each one at its last target (no filler tail)."""
+    def make(group):
+        length = max(x+y for x,y in group)
+        if length > total:
+            raise ValueError("offline calibration exceeds context")
+        return calibration_plan(length, group, maximum)
+
     group, jobs = [], []
     for point in sorted(set(points), key=lambda p: p[1]):
         try:
-            calibration_plan(total, group + [point], maximum)
+            make(group + [point])
         except ValueError:
             if not group:
                 raise
-            jobs.append((calibration_plan(total, group, maximum), group))
+            jobs.append((make(group), group))
             group = [point]
-            calibration_plan(total, group, maximum)
+            make(group)
         else:
             group.append(point)
     if group:
-        jobs.append((calibration_plan(total, group, maximum), group))
+        jobs.append((make(group), group))
     return jobs
 
 
@@ -226,7 +232,10 @@ def x_grid(maximum):
 def training_jobs(b, maximum):
     jobs = []
     for x in sorted(set([b] + [v for v in x_grid(maximum) if v >= b])):
-        ys = sorted(set([y for y in BASE_Y if y + x <= CONTEXT] + [CONTEXT - x]))
+        # A paper-feasible target has at most seven earlier Chunks.
+        # Do not profile prefixes that no formal plan could ever reach.
+        limit = min(CONTEXT-x, (MAX_K-1)*maximum)
+        ys = sorted(set([y for y in BASE_Y if y <= limit] + [limit]))
         jobs.extend(pack_points([(x, y) for y in ys], CONTEXT, maximum))
     return jobs
 
@@ -237,7 +246,7 @@ def holdout_points(b, maximum):
     ys = (64, 384, 640, 896, 1152, 1408, 1664)
     # Independent, off-grid points; none is used to build the training table.
     return [(x, ys[i % len(ys)]) for i, x in enumerate(midpoints)
-            if ys[i % len(ys)] + x + MIN_PROFILE_CHUNK <= CONTEXT]
+            if ys[i % len(ys)] + x <= CONTEXT and ys[i % len(ys)] <= (MAX_K-1)*maximum]
 
 
 def exact_prompt(args, root, total):
@@ -632,7 +641,7 @@ def build_profile(args, layout, root, manifest, runtime_env):
     for x, y in held:
         if (x, y) in expected:
             raise ValueError("holdout overlaps training grid")
-        cuts = calibration_plan(CONTEXT, [(x, y)], maximum)
+        cuts = calibration_plan(x+y, [(x, y)], maximum)
         held_rows.extend(m.points("validation", cuts, [(x, y)], args.q_repeats))
     held_profile = QProfile(aggregate_rows(held_rows), metric="wall_ms")
     for x, y in held:

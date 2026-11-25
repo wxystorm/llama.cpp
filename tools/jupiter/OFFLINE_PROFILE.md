@@ -16,6 +16,8 @@ and results separate.
   prompts; the 90% throughput proxy is not hardware occupancy. One b is
   selected for all lengths, with explicit feasibility/plateau fallback.
 * Measure a shared (x, KV-prefix y) grid with real native KV writes.
+  Sample only reachable prefix lengths; end each synthetic calibration
+  at its last target to avoid filler-tail Prefill. Context stays 2048.
   Median physical-stage wall times -> q(x,y)=max(PC,Phone).
   The q costs exclude graph preparation, network and final output path.
 * Independent off-grid samples report interpolation error. The 20% maximum
