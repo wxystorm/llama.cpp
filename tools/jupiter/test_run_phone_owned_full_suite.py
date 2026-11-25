@@ -15,6 +15,37 @@ import run_phone_owned_full_suite as suite
 from phone_owned_models import ModelLayout
 
 
+class TestNativeProbeMigration(unittest.TestCase):
+    def test_resume_only_exact_probe_upgrade(self):
+        previous = {
+            "execution_backend": "resident-server",
+            "calibration_backend": "native-autonomous",
+            "driver_sha256": suite.PRE_NATIVE_PROBE_DRIVER_SHA256[0],
+            "jupiter_planner_code_sha256": {
+                name: hashes[0] for name, hashes in suite.PRE_NATIVE_PROBE_PLANNER_SHA256.items()
+            },
+            "model": {"size": 123}, "layouts": [52], "sessions": 4,
+            "q_repeats": 2, "resident_server": {"sha256": "unchanged"},
+        }
+        previous["jupiter_planner_code_sha256"]["jupiter_planner.py"] = "unchanged"
+        old = {"config": previous, "sha256": suite.manifest_digest(previous)}
+        current = dict(previous, driver_sha256="new")
+        current["jupiter_planner_code_sha256"] = dict(
+            previous["jupiter_planner_code_sha256"],
+            **{name: "new" for name in suite.PRE_NATIVE_PROBE_PLANNER_SHA256})
+        self.assertTrue(suite.migrate_native_probe_manifest(old, current, True))
+        self.assertFalse(suite.migrate_native_probe_manifest(old, current, False))
+        for key, val in (("layouts", [48]), ("sessions", 1), ("q_repeats", 1),
+                         ("resident_server", {"sha256": "changed"})):
+            self.assertFalse(suite.migrate_native_probe_manifest(
+                old, dict(current, **{key: val}), True))
+        altered = dict(current, jupiter_planner_code_sha256=dict(
+            current["jupiter_planner_code_sha256"], **{"jupiter_planner.py": "changed"}))
+        self.assertFalse(suite.migrate_native_probe_manifest(old, altered, True))
+        self.assertFalse(suite.migrate_native_probe_manifest(
+            dict(old, sha256="invalid"), current, True))
+
+
 class TestPlanning(unittest.TestCase):
     def test_chunk_plans(self):
         self.assertEqual(suite.choose_chunks(2), [1, 1])

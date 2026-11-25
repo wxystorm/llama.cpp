@@ -1,11 +1,12 @@
 """Model-free tests for native autonomous calibration attribution."""
 import os
+import argparse
 import unittest
 from unittest.mock import patch
 
 from native_calibration import validate_run, profile_rows, PHONE, ENV
 from jupiter_planner import QProfile
-from run_q_sweep import print_sweep_plans
+from run_q_sweep import print_sweep_plans, native_calibration_token_count
 
 def sample():
     lines = [
@@ -60,6 +61,23 @@ class TestNativeCalibration(unittest.TestCase):
             profile_rows(text.replace("native_bridge=1", "native_bridge=0"))
         with self.assertRaises(ValueError):
             profile_rows(text.replace("compute_ms=10.000", "compute_ms=nan"))
+    def test_130_token_probe_uses_chat_count_not_uniform_tail_inference(self):
+        env = {ENV: "1", "LLAMA_JUPITER_RESIDENT_URL": "http://127.0.0.1:1"}
+        args = argparse.Namespace(target_tokens=130, batch=2048, context=2048, max_chunk=128)
+        self.assertEqual(native_calibration_token_count(args, env), 130)
+        self.assertIsNone(native_calibration_token_count(args, {}))
+        with self.assertRaises(ValueError):
+            native_calibration_token_count(args, {ENV: "1"})
+        plans = print_sweep_plans(130, [24,32,48,64,80,96,106], 24,128,
+                                  max_subsequences=16)
+        self.assertTrue(plans)
+        for _, cuts in plans:
+            self.assertEqual(sum(cuts), 130)
+            self.assertTrue(all(24 <= c <= 128 for c in cuts))
+        args.target_tokens = None
+        with self.assertRaises(ValueError):
+            native_calibration_token_count(args, env)
+
     def test_long_sweep_respects_native_wire_capacity(self):
         plans = print_sweep_plans(1855, [64,96,128], 64,128, max_subsequences=16)
         self.assertTrue(plans)

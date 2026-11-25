@@ -45,6 +45,14 @@ DEFAULT_GROUPS = "0,128,256,512,1024"
 # still match byte-for-byte the old manifest configuration.
 PRE_RECOVERY_CLIENT_SHA256 = ["cd94abdd509e680da0e98a40bd0e09fa8dc34dbf6314a8a4b8185ea83f3c881f","a5c3347df8fb4d947fa6d675e10a76512d8b3f143b9ca29b619479eae57c43de"]
 PRE_RECOVERY_DRIVER_SHA256 = ["ac6cb9b98f22a4ce317e6842e0c0cccdefafcb2a31db2d6d4957f46df374fba7","f2d45deb7cfa65191f0dce4e4a954066316aac251881c33a45f114e26d9348e1"]
+# Exact LF/CRLF fingerprints of the previously shipped native probe code.
+# Only the redundant unmeasured token probe is being removed. No changed
+# model, binary, device layout, measurement parameters or planner is allowed.
+PRE_NATIVE_PROBE_DRIVER_SHA256 = ["cf9818f07731da1d9e56cb0573475546c644f44eeda7cb2f970152667ce5eebe","9d3c37cfec79ea776b06664e2e2dedba5e71a57635ccd33be3f60b004a683432"]
+PRE_NATIVE_PROBE_PLANNER_SHA256 = {
+    "run_q_sweep.py": ["f9653266e02460e2270fcecc6dc92fa8f20fce69cee0d27968293dd3f4a2f592","07f507cf5aace2cb6650fc6478d52ed7efdf5f92289969851f3efa029666cf9a"],
+    "run_min_chunk_profile.py": ["ad14a87a84167f5beb29f5684eb342f6a1aae59e8be776a197c7b6706a842c4a","3aec35a77d3c2705418bbf75fec13f927786c3e8af987fff42eed9fe31d53b45"],
+}
 FIELDNAMES = (
     "layout", "group", "prompt", "kind", "repeat", "status", "tokens",
     "context", "chunks", "chunk_size", "n_chunks",
@@ -262,6 +270,30 @@ def migrate_pre_recovery_manifest(old, config, resume):
     return expected == previous
 
 
+def migrate_native_probe_manifest(old, config, resume):
+    """Resume existing native measured data only across this exact probe fix."""
+    previous = old.get("config")
+    if (not resume or not isinstance(previous, dict) or
+            old.get("sha256") != manifest_digest(previous) or
+            previous.get("calibration_backend") != NATIVE_CALIBRATION or
+            config.get("calibration_backend") != NATIVE_CALIBRATION or
+            config.get("execution_backend") != "resident-server" or
+            previous.get("driver_sha256") not in PRE_NATIVE_PROBE_DRIVER_SHA256):
+        return False
+    previous_codes = previous.get("jupiter_planner_code_sha256")
+    if not isinstance(previous_codes, dict):
+        return False
+    expected = dict(config)
+    expected["driver_sha256"] = previous["driver_sha256"]
+    expected_codes = dict(config["jupiter_planner_code_sha256"])
+    for name, allowed in PRE_NATIVE_PROBE_PLANNER_SHA256.items():
+        if previous_codes.get(name) not in allowed:
+            return False
+        expected_codes[name] = previous_codes[name]
+    expected["jupiter_planner_code_sha256"] = expected_codes
+    return expected == previous
+
+
 def preflight(args: argparse.Namespace, files: list[Path],
               layouts: list[int], output: Path) -> dict:
     cache_file = output / "token-cache.json"
@@ -353,19 +385,25 @@ def preflight(args: argparse.Namespace, files: list[Path],
     if manifest_path.exists():
         old = json.loads(manifest_path.read_text(encoding="utf-8"))
         if old.get("sha256") != signature:
-            if not migrate_pre_recovery_manifest(old, config, args.resume):
+            if migrate_native_probe_manifest(old, config, args.resume):
+                reason = "NATIVE_UNMEASURED_PROBE_ONLY"
+                backup_prefix = "suite-manifest.pre-native-probe-"
+            elif migrate_pre_recovery_manifest(old, config, args.resume):
+                reason = "RECOVERY_CONTROL_ONLY"
+                backup_prefix = "suite-manifest.pre-recovery-"
+            else:
                 raise ValueError("Existing output uses different files/options. "
                                  "Choose a new --out-dir, not --resume.")
-            backup = output / ("suite-manifest.pre-recovery-" + old["sha256"][:16] + ".json")
+            backup = output / (backup_prefix + old["sha256"][:16] + ".json")
             if backup.exists():
                 if json.loads(backup.read_text(encoding="utf-8")) != old:
-                    raise ValueError("Existing pre-recovery manifest backup differs")
+                    raise ValueError("Existing manifest migration backup differs")
             else:
                 write_json(backup, old)
             manifest["previous_manifest_sha256"] = old["sha256"]
             print(f"[PHONE_SUITE_MANIFEST_MIGRATION] old={old['sha256']} "
                   f"new={signature} backup={backup} "
-                  "reason=RECOVERY_CONTROL_ONLY status=PASS", flush=True)
+                  f"reason={reason} status=PASS", flush=True)
         elif "previous_manifest_sha256" in old:
             manifest["previous_manifest_sha256"] = old["previous_manifest_sha256"]
         if not args.resume and any(output.glob("cases/**/case-result.json")):

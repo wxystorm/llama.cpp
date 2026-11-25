@@ -26,6 +26,7 @@ from min_chunk_profile import partition_feasible, select_min_chunk
 from native_calibration import active as native_calibration_active, profile_rows, PHONE, BACKEND
 from run_q_sweep import (
     infer_runtime_prompt_tokens,
+    native_calibration_token_count,
     make_sweep_plan,
     reconstruct_plan_from_log,
     stream_process,
@@ -265,16 +266,22 @@ def main() -> int:
     # actual llama_context prefill batch size.
     env = calibration_env(pc_layers, args.cpu_layers)
     command = make_cli(args, prompt)
-    probe_log = out / "token-probe.log"
-    probe_env = env.copy()
-    probe_env["LLAMA_JUPITER_PROFILE_STAGE"] = "0"
-    print(f"[JUPITER_B_PROBE] log={probe_log}", flush=True)
-    code = stream_process(command, probe_env, probe_log)
-    if code != 0:
-        raise RuntimeError(f"token probe exited {code}; log={probe_log}")
-    total, source = infer_runtime_prompt_tokens(probe_log)
-    if args.target_tokens is not None and total != args.target_tokens:
-        raise ValueError(f"runtime token count {total} != --target-tokens {args.target_tokens}")
+    total = native_calibration_token_count(args, env)
+    if total is not None:
+        source = "CHAT_TOKEN_COUNT_PENDING_RUNTIME_VALIDATION"
+        print(f"[JUPITER_B_PROBE] action=SKIP_INFERENCE expected_tokens={total} "
+              "validation=EACH_RESIDENT_REQUEST", flush=True)
+    else:
+        probe_log = out / "token-probe.log"
+        probe_env = env.copy()
+        probe_env["LLAMA_JUPITER_PROFILE_STAGE"] = "0"
+        print(f"[JUPITER_B_PROBE] log={probe_log}", flush=True)
+        code = stream_process(command, probe_env, probe_log)
+        if code != 0:
+            raise RuntimeError(f"token probe exited {code}; log={probe_log}")
+        total, source = infer_runtime_prompt_tokens(probe_log)
+        if args.target_tokens is not None and total != args.target_tokens:
+            raise ValueError(f"runtime token count {total} != --target-tokens {args.target_tokens}")
     if total > args.batch or total > args.context:
         raise ValueError("actual prompt exceeds --batch or --context")
 

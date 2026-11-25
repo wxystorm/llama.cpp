@@ -433,8 +433,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument(
         "--target-tokens", type=int, default=None,
-        help="optional hint for a dry run; normal runs use llama-cli's "
-             "actual token count and override any mismatched hint",
+        help="Native resident: required chat-token count, validated per request; "
+             "Legacy: optional hint, checked by CLI probe",
     )
     p.add_argument(
         "--x-values",
@@ -464,6 +464,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="extra llama-cli argument; repeat this option for multiple args",
     )
     return p
+
+
+def native_calibration_token_count(args, env):
+    """Use the caller's chat-templated count; never execute an unmeasured
+    uniform-tail probe on the native Phone. Every real resident request
+    checks the tokenized Prompt against the exact explicit Chunk sum BEFORE
+    decode and validates the actual completed plan afterward.
+    """
+    if not native_calibration_active(env):
+        return None
+    if not resident_enabled(env):
+        raise ValueError("native calibration requires resident token/plan validation")
+    total = args.target_tokens
+    if total is None or not 2 <= total <= min(args.batch, args.context):
+        raise ValueError("native calibration needs a valid --target-tokens from chat tokenization")
+    if total > 16 * args.max_chunk:
+        raise ValueError("native target exceeds 16-Chunk plan capacity")
+    return total
 
 
 def main() -> int:
@@ -533,45 +551,53 @@ def main() -> int:
     base_env.pop("LLAMA_JUPITER_PLAN_FILE", None)
     base_env.pop("LLAMA_JUPITER_SEQUENCE_PLAN", None)
 
-    # First run once without a sequence override. The model's actual tokenizer
-    # and chat/prompt processing determine the exact prefill length. Without
-    # this probe, a one-token difference silently disables the explicit plan.
-    probe_log = out_dir / "q-token-probe.log"
-    probe_env = base_env.copy()
-    probe_env["LLAMA_JUPITER_PROFILE_STAGE"] = "0"
+    total_tokens = native_calibration_token_count(args, base_env)
+    if total_tokens is not None:
+        # Preserve any previous probe log for diagnosis. No synthetic success
+        # log is generated, and no failed real measurement is skipped.
+        print(f"[JUPITER_SWEEP_PROBE] action=SKIP_INFERENCE "
+              f"expected_tokens={total_tokens} source=CHAT_TOKEN_COUNT "
+              "validation=EACH_RESIDENT_REQUEST", flush=True)
+    else:
+        # First run once without a sequence override. The model's actual tokenizer
+        # and chat/prompt processing determine the exact prefill length. Without
+        # this probe, a one-token difference silently disables the explicit plan.
+        probe_log = out_dir / "q-token-probe.log"
+        probe_env = base_env.copy()
+        probe_env["LLAMA_JUPITER_PROFILE_STAGE"] = "0"
 
-    cmd = build_cli_command(args, exe, model, prompt_text)
-    print(
-        f"[JUPITER_SWEEP_PROBE] action=BEGIN log={probe_log}",
-        flush=True,
-    )
-    exit_code = stream_process(cmd, probe_env, probe_log)
-    if exit_code != 0:
-        raise RuntimeError(
-            f"token probe failed with exit={exit_code}; log={probe_log}"
-        )
-
-    probe_text = probe_log.read_text(encoding="utf-8", errors="replace")
-    if not UBATCH_RE.search(probe_text):
-        raise RuntimeError(
-            "q-sweep prefill UBATCH records are missing at -lv 3. "
-            "Update common/log.cpp and rebuild the PC llama-cli so "
-            "LLAMA_JUPITER_Q_SWEEP=1 exposes calibration records. "
-            f"Probe log: {probe_log}"
-        )
-    total_tokens, source = infer_runtime_prompt_tokens(probe_log)
-    print(
-        f"[JUPITER_SWEEP_TOKENS] actual={total_tokens} source={source} "
-        f"requested={args.target_tokens if args.target_tokens is not None else 'auto'}",
-        flush=True,
-    )
-    if args.target_tokens is not None and args.target_tokens != total_tokens:
+        cmd = build_cli_command(args, exe, model, prompt_text)
         print(
-            f"[JUPITER_SWEEP_TARGET_OVERRIDE] "
-            f"requested={args.target_tokens} actual={total_tokens} "
-            "action=USE_RUNTIME_TOKEN_COUNT",
+            f"[JUPITER_SWEEP_PROBE] action=BEGIN log={probe_log}",
             flush=True,
         )
+        exit_code = stream_process(cmd, probe_env, probe_log)
+        if exit_code != 0:
+            raise RuntimeError(
+                f"token probe failed with exit={exit_code}; log={probe_log}"
+            )
+
+        probe_text = probe_log.read_text(encoding="utf-8", errors="replace")
+        if not UBATCH_RE.search(probe_text):
+            raise RuntimeError(
+                "q-sweep prefill UBATCH records are missing at -lv 3. "
+                "Update common/log.cpp and rebuild the PC llama-cli so "
+                "LLAMA_JUPITER_Q_SWEEP=1 exposes calibration records. "
+                f"Probe log: {probe_log}"
+            )
+        total_tokens, source = infer_runtime_prompt_tokens(probe_log)
+        print(
+            f"[JUPITER_SWEEP_TOKENS] actual={total_tokens} source={source} "
+            f"requested={args.target_tokens if args.target_tokens is not None else 'auto'}",
+            flush=True,
+        )
+        if args.target_tokens is not None and args.target_tokens != total_tokens:
+            print(
+                f"[JUPITER_SWEEP_TARGET_OVERRIDE] "
+                f"requested={args.target_tokens} actual={total_tokens} "
+                "action=USE_RUNTIME_TOKEN_COUNT",
+                flush=True,
+            )
 
     if total_tokens > args.context or total_tokens > args.batch:
         raise RuntimeError(
@@ -588,6 +614,9 @@ def main() -> int:
                 exe, model, prompt_text, planner,
             )
         except PrefillLengthCorrection as exc:
+            if native_calibration_active(base_env):
+                raise RuntimeError("native Prompt count differs from explicit Plan; "
+                                   "recheck chat tokenizer") from exc
             if correction_attempt != 0:
                 raise RuntimeError(
                     "prefill token count remained unstable across retries: "
