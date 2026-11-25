@@ -23,6 +23,7 @@ import re
 import sys
 
 from min_chunk_profile import partition_feasible, select_min_chunk
+from native_calibration import active as native_calibration_active, profile_rows, PHONE, BACKEND
 from run_q_sweep import (
     infer_runtime_prompt_tokens,
     make_sweep_plan,
@@ -106,6 +107,16 @@ def first_chunk_service_times(text: str, tokens: int) -> dict[str, float]:
     A matching pair must finish its UBATCH (QUEUED) event; warmups with
     smaller token counts cannot supply the measurement.
     """
+    if native_calibration_active() or "[JUPITER_NATIVE_CALIBRATION]" in text:
+        rows = [r for r in profile_rows(text) if (r["x"], r["y"]) == (tokens, 0)]
+        gpu = [r for r in rows if r["device"].startswith("CUDA")]
+        phone = [r for r in rows if r["device"] == PHONE]
+        if not gpu or len(phone) != 1:
+            raise ValueError("missing native first-Chunk PC/Phone service")
+        return {"pc_compute_ms": sum(r["compute_ms"] for r in gpu),
+                "phone_compute_ms": phone[0]["compute_ms"],
+                "pc_wall_ms": sum(r["wall_ms"] for r in gpu),
+                "phone_wall_ms": phone[0]["wall_ms"]}
     target: tuple[int, int] | None = None
     totals: dict[str, list[float]] = {}
     found: dict[str, int] = {}
@@ -173,7 +184,7 @@ def calibration_env(pc_layers: int, cpu_layers: int = 0) -> dict[str, str]:
         "LLAMA_JUPITER_PREFILL": "1",
         "LLAMA_JUPITER_PC_LAYERS": str(pc_layers),
         "LLAMA_JUPITER_CPU_LAYERS": str(cpu_layers),
-        "LLAMA_JUPITER_WINDOW": "1",
+        "LLAMA_JUPITER_WINDOW": "2" if native_calibration_active() else "1",
         "LLAMA_JUPITER_TRACE": "1",
         "LLAMA_JUPITER_Q_SWEEP": "1",
         "LLAMA_JUPITER_PROFILE_STAGE": "1",
@@ -275,6 +286,8 @@ def main() -> int:
         "max_chunk": args.max_chunk, "batch": args.batch,
         "context": args.context, "threads": args.threads, "repeats": args.repeats,
     }
+    if native_calibration_active():
+        signature["calibration_backend"] = BACKEND
     config_path = out / "configuration.json"
     if args.resume and config_path.is_file():
         previous = json.loads(config_path.read_text(encoding="utf-8"))
@@ -298,6 +311,8 @@ def main() -> int:
     for x in args.candidates:
         try:
             plan = make_first_chunk_plan(total, x, args.min_tail, args.max_chunk)
+            if native_calibration_active() and len(plan) > 16:
+                raise ValueError("candidate exceeds native 16-Chunk plan")
             plan_text = ",".join(map(str, plan))
         except ValueError as exc:
             print(f"[JUPITER_B_SKIP] x={x} reason={exc}", flush=True)
@@ -341,6 +356,10 @@ def main() -> int:
                       f"{row['pc_compute_ms']:.3f} phone_compute_ms="
                       f"{row['phone_compute_ms']:.3f} status=OK", flush=True)
             except (RuntimeError, ValueError, OSError) as exc:
+                if native_calibration_active():
+                    # Never select b from a partial set after a failed native
+                    # execution, and never continue on a poisoned worker.
+                    raise
                 row["reason"] = str(exc)
                 print(f"[JUPITER_B_REJECT] x={x} reason={exc}", flush=True)
             samples.append(row)
@@ -378,7 +397,9 @@ def main() -> int:
         "min_chunk": selected.tokens,
         "status": status,
         "method": "measured_first_chunk_throughput_saturation_proxy",
-        "metric": "synchronized_stage_compute_ms",
+        "metric": ("native_local_service_ms" if native_calibration_active()
+                   else "synchronized_stage_compute_ms"),
+        "calibration_backend": BACKEND if native_calibration_active() else "legacy",
         "prefix_tokens": 0,
         "threshold": args.threshold,
         "pc_layers": pc_layers,

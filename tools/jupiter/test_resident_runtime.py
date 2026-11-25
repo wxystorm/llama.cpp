@@ -74,6 +74,27 @@ class TestResident(unittest.TestCase):
             self.assertTrue(is_request_timeout(urllib.error.URLError(TimeoutError())))
             self.assertFalse(is_request_timeout(ValueError("timed out")))
 
+    def test_native_calibration_probe_and_exact_plan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cmd, env, config = self.setup_case(Path(tmp))
+            config["calibration"] = True
+            env[PREFIX + "NATIVE_CALIBRATION"] = "1"
+            env.pop("LLAMA_JUPITER_LOGITS_DUMP_FILE")
+            env.pop("LLAMA_JUPITER_SEQUENCE_PLAN")
+            payload = request_payload(cmd, env, config, "a"*32)
+            self.assertTrue(payload["calibration"])
+            self.assertTrue(payload["autonomous"])
+            self.assertEqual(payload["chunks"], [])
+            env["LLAMA_JUPITER_PROFILE_STAGE"] = "1"
+            with self.assertRaises(ValueError):
+                request_payload(cmd, env, config, "a"*32)
+            env["LLAMA_JUPITER_SEQUENCE_PLAN"] = "94,95,77"
+            payload = request_payload(cmd, env, config, "a"*32)
+            self.assertEqual(payload["chunks"], [94,95,77])
+            env["LLAMA_JUPITER_PHONE_OWNED_AUTONOMOUS"] = "0"
+            with self.assertRaises(ValueError):
+                request_payload(cmd, env, config, "a"*32)
+
     def test_log_isolation(self):
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "server.log"

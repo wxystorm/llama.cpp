@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Iterable, List, Sequence
 
 from resident_runtime import enabled as resident_enabled, run_resident_cli
+from native_calibration import active as native_calibration_active, BACKEND
 
 
 PLAN_RE = re.compile(
@@ -115,6 +116,7 @@ def print_sweep_plans(
     xs: Sequence[int],
     minimum: int,
     maximum: int,
+    max_subsequences: int | None = None,
 ) -> List[tuple[int, List[int]]]:
     plans: List[tuple[int, List[int]]] = []
     for x in xs:
@@ -139,6 +141,23 @@ def print_sweep_plans(
                     f"[JUPITER_SWEEP_SKIP] x={x} reason=NO_LEGAL_PARTITION"
                 )
                 continue
+        if max_subsequences is not None and len(chunks) > max_subsequences:
+            # Preserve as many measured exact-x positions as fit the real
+            # 16-slot native wire Plan. Never change the target x itself.
+            compact = None
+            for count in range(min(total // x, max_subsequences), 0, -1):
+                rest = total - count*x
+                try:
+                    tail = split_feasible_tail(rest, minimum, maximum) if rest else []
+                except ValueError:
+                    continue
+                if count + len(tail) <= max_subsequences:
+                    compact = [x]*count + tail
+                    break
+            if compact is None:
+                print(f"[JUPITER_SWEEP_SKIP] x={x} reason=NATIVE_PLAN_CAPACITY")
+                continue
+            chunks = compact
         if sum(chunks) != total:
             raise RuntimeError(
                 f"internal plan error for x={x}: sum={sum(chunks)} target={total}"
@@ -502,7 +521,7 @@ def main() -> int:
     base_env["LLAMA_JUPITER_PREFILL"] = "1"
     base_env["LLAMA_JUPITER_PC_LAYERS"] = str(args.pc_layers)
     base_env["LLAMA_JUPITER_CPU_LAYERS"] = str(args.cpu_layers)
-    base_env["LLAMA_JUPITER_WINDOW"] = "1"
+    base_env["LLAMA_JUPITER_WINDOW"] = "2" if native_calibration_active(base_env) else "1"
     base_env["LLAMA_JUPITER_TRACE"] = "1"
     base_env["LLAMA_JUPITER_PROFILE_STAGE"] = "1"
     base_env["LLAMA_JUPITER_Q_SWEEP"] = "1"
@@ -596,9 +615,11 @@ def run_sweep_for_length(
     prompt_text: str,
     planner: Path,
 ) -> int:
+    native = native_calibration_active(base_env)
     plans = print_sweep_plans(
         total_tokens, args.x_values,
         args.min_chunk, args.max_chunk,
+        max_subsequences=16 if native else None,
     )
 
     # Segregate artifacts by actual token count and configuration so --resume
@@ -611,6 +632,8 @@ def run_sweep_for_length(
     ])
     if args.cpu_layers:
         signature_input += "\nCPU_LAYERS=" + str(args.cpu_layers)
+    if native:
+        signature_input += "\nCALIBRATION_BACKEND=" + BACKEND
     signature = hashlib.sha256(
         signature_input.encode("utf-8")
     ).hexdigest()[:12]
@@ -776,6 +799,7 @@ def run_sweep_for_length(
             "--min-chunk", str(args.min_chunk),
             "--max-chunk", str(args.max_chunk),
             "--target-length", str(total_tokens),
+            *(["--max-subsequences", "16"] if native else []),
         ])
         # The sequence plan is bound to the exact model boundary used for
         # profiling. Keep both decisions in the same runtime plan, rather

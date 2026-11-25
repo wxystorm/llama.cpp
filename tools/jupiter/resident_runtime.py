@@ -14,6 +14,8 @@ import urllib.error
 import urllib.request
 import uuid
 
+from native_calibration import active as native_calibration_active, validate_run
+
 PREFIX = "LLAMA_JUPITER_RESIDENT_"
 FLAGS = ("TRACE", "PROFILE_STAGE", "Q_SWEEP", "TIMELINE",
          "SCHED_ALLOC_TIMING", "LOGITS_HASH")
@@ -93,6 +95,9 @@ def explicit_cuts(env, config):
 
 def request_payload(command, env, config, request_id):
     cli = parse_cli(command)
+    calibration = bool(config.get("calibration", False))
+    if calibration != native_calibration_active(env):
+        raise ValueError("resident calibration namespace mismatch")
     for key, expected in (("-m", config["model"]), ("--rpc", config["rpc"]),
                           ("-b", str(config["batch"])), ("-c", str(config["context"])),
                           ("-t", str(config["threads"]))):
@@ -121,14 +126,19 @@ def request_payload(command, env, config, request_id):
     cuts = explicit_cuts(env, config)
     if any(c <= 0 or c > ubatch for c in cuts):
         raise ValueError("invalid resident chunk width")
-    if config["native"] and (not cuts or len(cuts) > 16):
-        raise ValueError("native resident requires an exact supported DP plan")
+    profile = env.get("LLAMA_JUPITER_PROFILE_STAGE", "0") == "1"
+    if config["native"] and (len(cuts) > 16 or (not cuts and (not calibration or profile))):
+        raise ValueError("native resident requires an exact supported DP plan (except token probe)")
+    if config["native"] and profile and not calibration:
+        raise ValueError("use the separate native calibration worker for stage profiling")
     auto = env.get("LLAMA_JUPITER_PHONE_OWNED_AUTONOMOUS", "0") == "1"
+    if calibration and (not config["native"] or not auto or env.get("LLAMA_JUPITER_LOGITS_DUMP_FILE")):
+        raise ValueError("native calibration requires autonomous mode and no logits export")
     if auto and not config["native"]:
         raise ValueError("autonomous request sent to legacy worker")
     return {"id": request_id, "prompt": cli["-p"], "chunks": cuts,
             "expected_tokens": sum(cuts), "autonomous": auto,
-            "window": config["window"],
+            "window": config["window"], "calibration": calibration,
             "flags": {k: env.get("LLAMA_JUPITER_" + k, "0") == "1" for k in FLAGS},
             "return_logits": bool(env.get("LLAMA_JUPITER_LOGITS_DUMP_FILE"))}
 
@@ -212,6 +222,9 @@ def run_resident_cli(command, env, log_path):
             raise RuntimeError("invalid resident completion or missing reset")
         if payload["expected_tokens"] and result["tokens"] != payload["expected_tokens"]:
             raise RuntimeError("resident actual token count differs from exact DP plan")
+        if payload["calibration"]:
+            validate_run(trace.decode("utf-8", errors="replace"), result["tokens"], payload["chunks"])
+            result["calibration_backend"] = "native-autonomous"
         timing_only = bool(config.get("legacy_timing_only", False)
                            and not config["native"] and not payload["return_logits"])
         if result.get("logits_validation") != ("TIMING_ONLY" if timing_only else "FINITE_ONLY"):
@@ -255,16 +268,19 @@ def run_resident_cli(command, env, log_path):
 
 class ResidentServer:
     """One owned model process, immutable placement and scheduler window."""
-    def __init__(self, args, layout, native, output, ubatch):
+    def __init__(self, args, layout, native, output, ubatch, *, calibration=False):
+        if calibration and not native:
+            raise ValueError("calibration requires native Phone-owned worker")
         self.config = dict(model=str(Path(args.model).resolve()), rpc=args.rpc,
                            context=2048, batch=2048, ubatch=ubatch,
                            threads=8, pc_layers=layout, cpu_layers=args.cpu_layers,
                            sessions=args.sessions, native=native, window=2 if native else 1,
-                           legacy_timing_only=bool(not native and
+                           calibration=calibration, legacy_timing_only=bool(not native and
                                getattr(args, "skip_legacy_logits_check", False)))
         self.exe = Path(args.resident_server).resolve()
         self.log = Path(output) / "resident-runtime" / (
-            ("native" if native else "legacy") + "-" + uuid.uuid4().hex + ".log")
+            ("native-calibration" if calibration else "native" if native else "legacy")
+            + "-" + uuid.uuid4().hex + ".log")
         self.key = uuid.uuid4().hex + uuid.uuid4().hex
         self.timeout = (max(1800, args.timeout_seconds) if native else
                         getattr(args, "legacy_request_timeout", 120))
@@ -276,6 +292,7 @@ class ResidentServer:
         env = {k: v for k, v in os.environ.items() if not k.startswith(PREFIX)}
         env.update({
             PREFIX + "SERVER": "1",
+            PREFIX + "NATIVE_CALIBRATION": str(int(cfg["calibration"])),
             PREFIX + "LEGACY_TIMING_ONLY": str(int(cfg["legacy_timing_only"])),
             "LLAMA_JUPITER_PREFILL": "1",
             "LLAMA_JUPITER_PC_LAYERS": str(cfg["pc_layers"]),
@@ -321,8 +338,9 @@ class ResidentServer:
                     status, health = http_json(self.url + "/health", self.key, None, 10)
                     if status != 200 or not health.get("resident"):
                         raise RuntimeError("not the dedicated resident endpoint")
-                    if health.get("legacy_timing_only") != cfg["legacy_timing_only"]:
-                        raise RuntimeError("resident validation policy mismatch; rebuild llama-server")
+                    if (health.get("legacy_timing_only") != cfg["legacy_timing_only"] or
+                            health.get("native_calibration") != cfg["calibration"]):
+                        raise RuntimeError("resident validation/calibration policy mismatch; rebuild llama-server")
                     print(f"[JUPITER_RESIDENT_READY] native={native} port={port}", flush=True)
                     return self
                 time.sleep(0.25)
@@ -338,7 +356,8 @@ class ResidentServer:
                 PREFIX + "LOG": str(self.log.resolve()),
                 PREFIX + "CONFIG": json.dumps(self.config),
                 PREFIX + "TIMEOUT": str(self.timeout),
-                PREFIX + "RECOVER_TIMEOUT": str(int(not self.config["native"]))}
+                PREFIX + "RECOVER_TIMEOUT": str(int(not self.config["native"])),
+                PREFIX + "NATIVE_CALIBRATION": str(int(self.config["calibration"]))}
 
     def close(self):
         proc = self.proc

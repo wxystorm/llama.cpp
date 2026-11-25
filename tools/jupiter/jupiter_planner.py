@@ -32,6 +32,9 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 
+from native_calibration import (active as native_calibration_active, is_phone,
+                                PHONE, profile_rows, FIELDS as NATIVE_FIELDS)
+
 INF = float("inf")
 
 
@@ -109,7 +112,13 @@ class QProfile:
         )
         if not 1 <= self.required_rpc_stages <= 4:
             raise ValueError("invalid LLAMA_JUPITER_HTP_ACTIVE_SESSIONS")
-        self.htp_aggregate = requested_htp > 1
+        names = {(row.get("device") or row.get("stage") or "stage").strip()
+                 for row in rows}
+        self.native_phone = PHONE in names
+        if (self.native_phone and any(s.startswith("RPC") for s in names) or
+                native_calibration_active() and not self.native_phone):
+            raise ValueError("Native and Legacy q profiles cannot be mixed")
+        self.htp_aggregate = requested_htp > 1 and not self.native_phone
         for row in rows:
             x = int(row["x"])
             y = int(row["y"])
@@ -170,9 +179,9 @@ class QProfile:
         # absent for some graph shapes, so do not require those everywhere.
         all_stages = {stage for _, _, stage in grouped_stage}
         self.require_cpu = require_cpu
-        self.require_phone = any(s.startswith("RPC") for s in all_stages)
-        self.require_pc_accel = any(
-            not s.startswith("RPC") and not s.startswith("CPU") for s in all_stages
+        self.require_phone = any(is_phone(s) for s in all_stages)
+        self.require_pc_accel = self.native_phone or any(
+            not is_phone(s) and not s.startswith("CPU") for s in all_stages
         )
         self.stages_by_xy: Dict[Tuple[int, int], set[str]] = {}
         for x, y, stage in grouped_stage:
@@ -189,8 +198,8 @@ class QProfile:
         if (x, y) not in self.values:
             return False
         stages = self.stages_by_xy.get((x, y), set())
-        has_phone = any(s.startswith("RPC") for s in stages)
-        has_pc = any(not s.startswith("RPC") and not s.startswith("CPU") for s in stages)
+        has_phone = PHONE in stages if self.native_phone else any(is_phone(s) for s in stages)
+        has_pc = any(not is_phone(s) and not s.startswith("CPU") for s in stages)
         has_cpu = any(s.startswith("CPU") for s in stages)
         observed_rpc = sum(stage.startswith("RPC") for stage in stages)
         return (
@@ -434,6 +443,17 @@ def cmd_sequence(args: argparse.Namespace) -> None:
 
 
 def cmd_extract_q(args: argparse.Namespace) -> None:
+    with _open_text_auto(args.log) as stream:
+        text = stream.read()
+    if native_calibration_active() or "[JUPITER_NATIVE_CALIBRATION]" in text:
+        rows = profile_rows(text, args.metric, args.min_tokens)
+        with open(args.output, "w", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(stream, fieldnames=NATIVE_FIELDS)
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f"[JUPITER_Q_EXTRACT] samples={len(rows)} metric={args.metric} "
+              f"backend=native-autonomous output={args.output}")
+        return
     begin_re = re.compile(
         r"\[JUPITER_UBATCH\] event=BEGIN .*?prefix_tokens=(\d+) tokens=(\d+)"
     )

@@ -27,6 +27,7 @@ from jupiter_planner import (
     sequence_points,
     solve_sequence,
 )
+from native_calibration import active as native_calibration_active, is_phone, PHONE, BACKEND
 from run_q_sweep import (
     build_cli_command,
     reconstruct_plan_from_log,
@@ -111,8 +112,8 @@ def targeted_rows(
         if int(row["x"]) == x and int(row["y"]) == y
     ]
     devices = {row["device"] for row in rows}
-    has_phone = any(d.startswith("RPC") for d in devices)
-    has_pc = any(not d.startswith("RPC") and not d.startswith("CPU") for d in devices)
+    has_phone = PHONE in devices if native_calibration_active() else any(is_phone(d) for d in devices)
+    has_pc = any(not is_phone(d) and not d.startswith("CPU") for d in devices)
     has_cpu = any(d.startswith("CPU") for d in devices)
     if not (has_phone and has_pc and (not require_cpu or has_cpu)):
         raise RuntimeError(
@@ -201,6 +202,8 @@ def build_resume_config(
     }
     if getattr(args, "cpu_layers", 0):
         config["cpu_layers"] = args.cpu_layers
+    if native_calibration_active():
+        config["calibration_backend"] = BACKEND
     return config
 
 
@@ -283,7 +286,7 @@ def main() -> int:
         "LLAMA_JUPITER_PREFILL": "1",
         "LLAMA_JUPITER_PC_LAYERS": str(args.pc_layers),
         "LLAMA_JUPITER_CPU_LAYERS": str(args.cpu_layers),
-        "LLAMA_JUPITER_WINDOW": "1",
+        "LLAMA_JUPITER_WINDOW": "2" if native_calibration_active() else "1",
         "LLAMA_JUPITER_TRACE": "1",
         "LLAMA_JUPITER_PROFILE_STAGE": "1",
         "LLAMA_JUPITER_Q_SWEEP": "1",

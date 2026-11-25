@@ -19,6 +19,7 @@ import subprocess
 import sys
 
 from jupiter_planner import QProfile, _read_csv, sequence_missing_points
+from native_calibration import active as native_calibration_active, BACKEND
 from min_chunk_profile import partition_feasible, select_min_chunk
 from refine_sequence_q import build_resume_config
 from run_prefill_bench import PLAN_RE, build_cli, parse_timing, read_plan, run_one
@@ -202,7 +203,8 @@ def verify_runtime(args: argparse.Namespace, plan: Path, chunks: list[int],
         "LLAMA_JUPITER_Q_SWEEP": "0",
         # Verification checks the exact cuts, not benchmark performance.
         # The resident legacy scheduler has one immutable copy.
-        "LLAMA_JUPITER_WINDOW": ("1" if env.get("LLAMA_JUPITER_RESIDENT_URL") else "2"),
+        "LLAMA_JUPITER_WINDOW": ("2" if native_calibration_active(env) else
+                                 "1" if env.get("LLAMA_JUPITER_RESIDENT_URL") else "2"),
         "LLAMA_JUPITER_LOGITS_TOP10": "0",
     })
     env.pop("LLAMA_JUPITER_SEQUENCE_PLAN", None)
@@ -312,6 +314,8 @@ def main() -> int:
         if not source.is_file():
             raise ValueError(f"stage-2 min-chunk JSON not found: {source}")
         summary = json.loads(source.read_text(encoding="utf-8-sig"))
+        if (native_calibration_active() and summary.get("calibration_backend") != BACKEND):
+            raise ValueError("native Stage3 cannot consume Legacy Stage2 calibration")
         measured_prompt_tokens = int(summary["prompt_tokens"])
         if (args.target_tokens is not None and
                 args.target_tokens != measured_prompt_tokens and
@@ -476,6 +480,7 @@ def main() -> int:
             else "REOPTIMIZE_UNTIL_EXACT_Q_COVERAGE"
         ),
         "pc_layers": pc, "cpu_layers": args.cpu_layers,
+        "calibration_backend": BACKEND if native_calibration_active() else "legacy",
         "pipeline_stages": 3 if args.cpu_layers else 2,
         "prompt_tokens": total, "min_chunk": b,
         "max_chunk": max_chunk, "min_chunk_status": status,
