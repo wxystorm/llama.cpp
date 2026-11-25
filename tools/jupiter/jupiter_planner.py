@@ -303,6 +303,26 @@ def solve_sequence(
     max_chunk: int | None,
     max_k: int | None,
 ) -> SequenceSolution:
+    return solve_sequence_table(
+        profile, total, devices, min_chunk, max_chunk, max_k, targets=[total]
+    )[total]
+
+
+def solve_sequence_table(
+    profile: QProfile,
+    total: int,
+    devices: int,
+    min_chunk: int,
+    max_chunk: int | None,
+    max_k: int | None,
+    targets: Iterable[int] | None = None,
+) -> Dict[int, SequenceSolution]:
+    """Same Eq. (2)-(4), with one shared DP table for all requested lengths.
+
+    State W[y,k] depends only on shorter prefixes, not on final Prompt N.
+    Compute it once offline instead of solving/refining separately per Prompt.
+    Historical callers still use solve_sequence with their original k cap.
+    """
     if total <= 0 or devices <= 0 or min_chunk <= 0:
         raise ValueError("total, devices and min_chunk must be positive")
     if max_chunk is not None and max_chunk < min_chunk:
@@ -353,9 +373,9 @@ def solve_sequence(
                     W[y][k] = cur
                     cut[y][k] = l
 
-    def backtrack(k: int) -> List[int]:
+    def backtrack(length: int, k: int) -> List[int]:
         chunks: List[int] = []
-        y = total
+        y = length
         kk = k
         while kk > 1:
             l = cut[y][kk]
@@ -370,28 +390,34 @@ def solve_sequence(
         chunks.reverse()
         return chunks
 
-    best: SequenceSolution | None = None
-    for k in range(1, max_k + 1):
-        if not math.isfinite(W[total][k]):
-            continue
-        chunks = backtrack(k)
-        if not chunks:
-            continue
+    result: Dict[int, SequenceSolution] = {}
+    lengths = list(range(1, total + 1) if targets is None else targets)
+    for length in lengths:
+        if not 1 <= length <= total:
+            raise ValueError("target length outside DP table")
+        best: SequenceSolution | None = None
+        for k in range(1, max_k + 1):
+            if not math.isfinite(W[length][k]):
+                continue
+            chunks = backtrack(length, k)
+            if not chunks:
+                continue
 
-        prefix = 0
-        sum_h = 0.0
-        for x in chunks:
-            sum_h += profile.q(x, prefix)
-            prefix += x
+            prefix = 0
+            sum_h = 0.0
+            for x in chunks:
+                sum_h += profile.q(x, prefix)
+                prefix += x
 
-        predicted = sum_h + (devices - 1) * W[total][k]
-        candidate = SequenceSolution(total, k, chunks, W[total][k], predicted)
-        if best is None or candidate.predicted_ms < best.predicted_ms:
-            best = candidate
-
-    if best is None:
-        raise ValueError("no feasible sequence partition")
-    return best
+            predicted = sum_h + (devices - 1) * W[length][k]
+            candidate = SequenceSolution(length, k, chunks, W[length][k], predicted)
+            if best is None or candidate.predicted_ms < best.predicted_ms:
+                best = candidate
+        if best is not None:
+            result[length] = best
+        elif targets is not None:
+            raise ValueError(f"no feasible sequence partition for {length}")
+    return result
 
 
 def cmd_sequence(args: argparse.Namespace) -> None:

@@ -101,7 +101,14 @@ def validate_run(text, expected_tokens=None, expected_cuts=None):
             "profile": markers[0][1] == "1"}
 
 
-def profile_rows(text, metric="compute_ms", min_tokens=1, require_cpu=False):
+def profile_rows(text, metric="compute_ms", min_tokens=1, require_cpu=False,
+                 pc_prefix_only=False):
+    """Optionally keep PC prefix service only, excluding the post-bridge Head.
+
+    The tagged CPU split may include local staging/housekeeping alongside
+    the bridge; subtract the measured callback, retain its local residual.
+    All later splits belong to the post-bridge output path, not the prefix.
+    """
     data = validate_run(text)
     if not data["profile"]:
         raise ValueError("native q extraction requires synchronized stage profiling")
@@ -148,6 +155,8 @@ def profile_rows(text, metric="compute_ms", min_tokens=1, require_cpu=False):
                 compute = max(0.0, compute - bridge_ms)
                 wall = max(0.0, wall - bridge_ms)
                 bridge_count += 1
+            elif pc_prefix_only and bridge_count:
+                continue
             entry = stages.setdefault(device, [0.0, 0.0, 0.0])
             for i, value in enumerate((inp, compute, wall)):
                 entry[i] += value
