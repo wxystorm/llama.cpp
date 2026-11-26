@@ -574,10 +574,10 @@ public:
         }
         // Each Region computes its Chunks serially on the owning HTP Session.
         // Reuse a single stable scratch slot for all its fixed-UID graphs.
-        // We deliberately do NOT alias scratch between different Regions:
-        // async registration can precompile a successor while an earlier
-        // Region is executing on the same Session. Weights and KV stay in
-        // their own immutable/per-layer allocations.
+        // The default remains private scratch per layer. The opt-in session
+        // arena may alias temporary storage between layers only because
+        // precompile writes and compute are serialized by the same session
+        // mutex. Graph metadata, weights and KV remain distinct.
         //
         // Graphless enables reuse by default; set
         // GGML_RPC_PHONE_QWEN3_SHARED_SCRATCH=0 for an exact legacy A/B.
@@ -589,6 +589,30 @@ public:
             graphless_env != nullptr &&
             std::strcmp(graphless_env, "1") == 0 &&
             !(reuse_env != nullptr && std::strcmp(reuse_env, "0") == 0);
+        // Session scratch is opt-in and restricted to the graphless HTP-only
+        // direct-host path: one compute worker, synchronous layer execution,
+        // and an owned host output before releasing the session lock.
+        const auto flag_is_one = [](const char * name) {
+            const char * value = std::getenv(name);
+            return value != nullptr && std::strcmp(value, "1") == 0;
+        };
+        const bool session_scratch_requested =
+            flag_is_one("GGML_RPC_PHONE_NPU_SESSION_SCRATCH");
+        if (session_scratch_requested &&
+                (!reuse_scratch || session_guard == nullptr ||
+                 !flag_is_one("GGML_RPC_PHONE_HTP_ONLY") ||
+                 !flag_is_one("GGML_RPC_PHONE_QWEN3_LOCAL_ONLY") ||
+                 !flag_is_one("GGML_RPC_PHONE_QWEN3_LOCAL_DIRECT_INPUT") ||
+                 !flag_is_one("GGML_RPC_PHONE_QWEN3_LOCAL_DIRECT_P2C"))) {
+            reason = "PHONE_SESSION_SCRATCH_REQUIRES_GRAPHLESS_HTP_ONLY_DIRECT";
+            return false;
+        }
+        if (session_scratch_requested && owned_session_scratch_ &&
+                owned_session_scratch_run_id_ != plan.run_id) {
+            reason = "PHONE_SESSION_SCRATCH_RUN_MISMATCH";
+            return false;
+        }
+        bool using_session_scratch = false;
         // A fixed Hexagon node cache retains tensor addresses. Never resize
         // an arena after its first graph has been compiled.
         constexpr size_t scratch_cap_bytes = size_t(256) * 1024 * 1024;
@@ -663,16 +687,59 @@ public:
                         reason = "PHONE_OWNED_HTP_SCRATCH_BUDGET_EXCEEDED";
                         break;
                     }
-                    kv->scratch_buffer.reset(
-                        ggml_backend_buft_alloc_buffer(
-                            scratch_buft, reserve_bytes));
-                    if (!kv->scratch_buffer) {
-                        reason = "PHONE_OWNED_HTP_SCRATCH_ALLOC";
-                        break;
-                    }
-                    stats.graph_storage_bytes +=
-                        ggml_backend_buffer_get_size(
+                    // Reuse the first stable arena of this HTP executor. A
+                    // larger graph may use a private layer arena instead;
+                    // never move or resize an arena referenced by fixed UIDs.
+                    const bool can_share = session_scratch_requested &&
+                        (!owned_session_scratch_ || reserve_bytes <=
+                            ggml_backend_buffer_get_size(
+                                owned_session_scratch_.get()));
+                    if (can_share && owned_session_scratch_) {
+                        kv->scratch_buffer = owned_session_scratch_;
+                        using_session_scratch = true;
+                        GGML_LOG_INFO(
+                            "[PHONE_SESSION_SCRATCH] event=HIT"
+                            " run=%" PRIu64 " region=%u layer=%u"
+                            " required_bytes=%zu capacity_bytes=%zu"
+                            " new_bytes=0 status=PASS\n",
+                            plan.run_id, plan.region, plan.layer,
+                            reserve_bytes, ggml_backend_buffer_get_size(
+                                kv->scratch_buffer.get()));
+                    } else {
+                        const int64_t arena_begin_us = ggml_time_us();
+                        ggml_backend_buffer_ptr allocated(
+                            ggml_backend_buft_alloc_buffer(
+                                scratch_buft, reserve_bytes));
+                        if (!allocated) {
+                            reason = "PHONE_OWNED_HTP_SCRATCH_ALLOC";
+                            break;
+                        }
+                        kv->scratch_buffer = std::move(allocated);
+                        const size_t actual_bytes = ggml_backend_buffer_get_size(
                             kv->scratch_buffer.get());
+                        stats.graph_storage_bytes += actual_bytes;
+                        if (can_share) {
+                            owned_session_scratch_ = kv->scratch_buffer;
+                            owned_session_scratch_run_id_ = plan.run_id;
+                            using_session_scratch = true;
+                            // Count the physical arena exactly once, including
+                            // the case of a later failed graph registration.
+                            owned_scratch_live_bytes_ += actual_bytes;
+                            owned_scratch_peak_bytes_ = std::max(
+                                owned_scratch_peak_bytes_, owned_scratch_live_bytes_);
+                        }
+                        if (session_scratch_requested) {
+                            GGML_LOG_INFO(
+                                "[PHONE_SESSION_SCRATCH] event=%s"
+                                " run=%" PRIu64 " region=%u layer=%u"
+                                " required_bytes=%zu capacity_bytes=%zu"
+                                " new_bytes=%zu alloc_ms=%.3f status=PASS\n",
+                                can_share ? "NEW" : "PRIVATE_FALLBACK",
+                                plan.run_id, plan.region, plan.layer,
+                                reserve_bytes, actual_bytes, actual_bytes,
+                                (ggml_time_us() - arena_begin_us) / 1000.0);
+                        }
+                    }
                 }
                 if (graph_required_bytes >
                         ggml_backend_buffer_get_size(
@@ -785,7 +852,11 @@ public:
             if (reason.empty()) { reason = "PHONE_OWNED_HTP_PARTIAL"; }
             return false;
         }
-        owned_scratch_live_bytes_ += stats.scratch_live_bytes;
+        // The shared arena is already counted on its first allocation.
+        // Private layer arenas retain the original accounting.
+        if (!using_session_scratch) {
+            owned_scratch_live_bytes_ += stats.scratch_live_bytes;
+        }
         owned_scratch_peak_bytes_ = std::max(
             owned_scratch_peak_bytes_, owned_scratch_live_bytes_);
         stats.session_scratch_live_bytes = owned_scratch_live_bytes_;
@@ -803,7 +874,8 @@ public:
             stats.session_scratch_live_bytes / 1048576.0,
             stats.session_scratch_peak_bytes / 1048576.0,
             stats.scratch_slots,
-            reuse_scratch ? "REGION_SINGLE_SLOT" : "LEGACY_PER_CHUNK");
+            using_session_scratch ? "SESSION_SINGLE_SLOT" :
+                reuse_scratch ? "REGION_SINGLE_SLOT" : "LEGACY_PER_CHUNK");
         owned_kv_.emplace(key, std::move(kv));
         for (uint32_t chunk = 0; chunk < pending.size(); ++chunk) {
             owned_graphs_.emplace(
@@ -1245,7 +1317,7 @@ public:
         }
 
         const int64_t upload_begin = ggml_time_us();
-        // All fixed Chunk graphs in this Region share one scratch slot.
+        // Fixed Chunk graphs can share scratch across layers on a Session.
         // Positions, KV indices and the full causal mask MUST be restored
         // immediately before compute, under the existing HTP Session lock.
         if (state.scratch_buffer &&
@@ -1597,7 +1669,8 @@ public:
     // Shadow graphs never contribute to decode KV, so release their scratch
     // and KV immediately instead of reserving Phone HTP RAM until next RUN.
     void release_owned_htp_graphs() {
-        if (owned_graphs_.empty() && owned_kv_.empty()) { return; }
+        if (owned_graphs_.empty() && owned_kv_.empty() &&
+                !owned_session_scratch_) { return; }
         const auto reg = backend_ != nullptr ?
             ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_)) :
             nullptr;
@@ -1609,7 +1682,9 @@ public:
             if (clear) { clear(backend_); }
         }
         owned_graphs_.clear();
-        owned_kv_.clear();  // Frees Region scratch only after cache/graphs.
+        owned_kv_.clear();  // Drop layer references after cached nodes.
+        owned_session_scratch_.reset();
+        owned_session_scratch_run_id_ = 0;
         owned_scratch_live_bytes_ = 0;
         owned_scratch_peak_bytes_ = 0;
     }
@@ -2485,7 +2560,9 @@ public:
         }
         registered_graphs_.clear();
         owned_graphs_.clear();  // Hexagon cached nodes already invalidated.
-        owned_kv_.clear();      // Shared Region scratch is released here.
+        owned_kv_.clear();      // Drop layer references before the arena.
+        owned_session_scratch_.reset();
+        owned_session_scratch_run_id_ = 0;
         owned_scratch_live_bytes_ = 0;
         owned_scratch_peak_bytes_ = 0;
         deferred_kv_.clear();
@@ -2673,9 +2750,9 @@ private:
     struct owned_layer_kv {
         ggml_context_ptr ctx;
         ggml_backend_buffer_ptr buffer;
-        // Region-private scratch outlives all fixed-UID Chunk graph entries.
-        // Never alias immutable weights or persistent F16 KV into this slot.
-        ggml_backend_buffer_ptr scratch_buffer;
+        // Private or session-shared scratch outlives all fixed-UID Chunk
+        // graph entries. Immutable weights and persistent F16 KV never alias.
+        std::shared_ptr<ggml_backend_buffer> scratch_buffer;
         ggml_phone_owned::region_plan plan {};
         uint32_t next_chunk = 0;
         ggml_tensor * k = nullptr;
@@ -2740,8 +2817,11 @@ private:
         const ggml_tensor * canonical_k_indices = nullptr;
         const ggml_tensor * canonical_v_indices = nullptr;
     };
-    // Declare after model_weights_, and graph after KV, so destruction
-    // order is graph -> KV -> model weights.
+    // Stable, run-scoped arena for this executor/session. Declare before KV
+    // and graph maps so cached nodes are cleared first, then graph metadata,
+    // then layer references, then the arena itself. No cross-session sharing.
+    std::shared_ptr<ggml_backend_buffer> owned_session_scratch_;
+    uint64_t owned_session_scratch_run_id_ = 0;
     std::map<std::pair<uint64_t, uint32_t>,
              std::unique_ptr<owned_layer_kv>> owned_kv_;
     std::map<std::tuple<uint64_t, uint32_t, uint32_t>,
