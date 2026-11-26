@@ -29,6 +29,13 @@ struct layer_weights {
     ggml_tensor * ffn_down = nullptr;
     ggml_tensor * q_norm = nullptr;
     ggml_tensor * k_norm = nullptr;
+    ggml_tensor * wq_b = nullptr;
+    ggml_tensor * wk_b = nullptr;
+    ggml_tensor * wv_b = nullptr;
+    ggml_tensor * wo_b = nullptr;
+    ggml_tensor * ffn_gate_b = nullptr;
+    ggml_tensor * ffn_up_b = nullptr;
+    ggml_tensor * ffn_down_b = nullptr;
 };
 
 struct graph_result {
@@ -103,8 +110,10 @@ inline bool validate_weights(const ggml_phone_owned::region_plan & p,
     if (!vec(w.attn_norm, d) || !mat(w.wq, d, hq) ||
             !mat(w.wk, d, hk) || !mat(w.wv, d, hk) ||
             !mat(w.wo, hq, d) || !vec(w.ffn_norm, d) ||
-            !vec(w.q_norm, p.head_dim) ||
-            !vec(w.k_norm, p.head_dim)) {
+            (!ggml_phone_owned::is_llama_dense(p) &&
+             (!vec(w.q_norm, p.head_dim) || !vec(w.k_norm, p.head_dim))) ||
+            (ggml_phone_owned::is_llama_dense(p) &&
+             (w.q_norm || w.k_norm))) {
         reason = "QWEN3_ATTENTION_WEIGHT_LAYOUT";
         return false;
     }
@@ -114,6 +123,22 @@ inline bool validate_weights(const ggml_phone_owned::region_plan & p,
             !mat(w.ffn_up, d, n_ff) ||
             !mat(w.ffn_down, n_ff, d)) {
         reason = "QWEN3_FFN_WEIGHT_LAYOUT";
+        return false;
+    }
+    const auto optional_vec = [&](const ggml_tensor * t, int64_t n) {
+        return t == nullptr || vec(t, n);
+    };
+    if (!optional_vec(w.wq_b, hq) || !optional_vec(w.wk_b, hk) ||
+            !optional_vec(w.wv_b, hk) || !optional_vec(w.wo_b, d) ||
+            !optional_vec(w.ffn_gate_b, n_ff) ||
+            !optional_vec(w.ffn_up_b, n_ff) || !optional_vec(w.ffn_down_b, d)) {
+        reason = "DENSE_AFFINE_BIAS_LAYOUT";
+        return false;
+    }
+    if (!ggml_phone_owned::is_llama_dense(p) &&
+            (w.wq_b || w.wk_b || w.wv_b || w.wo_b || w.ffn_gate_b ||
+             w.ffn_up_b || w.ffn_down_b)) {
+        reason = "UNSUPPORTED_QWEN3_AFFINE_BIAS";
         return false;
     }
     reason = "NONE";
@@ -216,14 +241,20 @@ inline bool build_graph(ggml_context * ctx,
     ggml_tensor * x_norm = ggml_mul(ctx,
         ggml_rms_norm(ctx, input, p.rms_norm_eps), w.attn_norm);
     mark(x_norm, "attn_norm");
-    ggml_tensor * q = ggml_reshape_3d(ctx,
-        ggml_mul_mat(ctx, w.wq, x_norm), p.head_dim, p.n_heads, tokens);
-    ggml_tensor * k = ggml_reshape_3d(ctx,
-        ggml_mul_mat(ctx, w.wk, x_norm), p.head_dim, p.n_heads_kv, tokens);
-    ggml_tensor * v = ggml_reshape_3d(ctx,
-        ggml_mul_mat(ctx, w.wv, x_norm), p.head_dim, p.n_heads_kv, tokens);
-    q = ggml_mul(ctx, ggml_rms_norm(ctx, q, p.rms_norm_eps), w.q_norm);
-    k = ggml_mul(ctx, ggml_rms_norm(ctx, k, p.rms_norm_eps), w.k_norm);
+    ggml_tensor * q_proj = ggml_mul_mat(ctx, w.wq, x_norm);
+    if (w.wq_b) { q_proj = ggml_add(ctx, q_proj, w.wq_b); }
+    ggml_tensor * q = ggml_reshape_3d(ctx, q_proj, p.head_dim, p.n_heads, tokens);
+    ggml_tensor * k_proj = ggml_mul_mat(ctx, w.wk, x_norm);
+    if (w.wk_b) { k_proj = ggml_add(ctx, k_proj, w.wk_b); }
+    ggml_tensor * k = ggml_reshape_3d(ctx, k_proj, p.head_dim, p.n_heads_kv, tokens);
+    ggml_tensor * v_proj = ggml_mul_mat(ctx, w.wv, x_norm);
+    if (w.wv_b) { v_proj = ggml_add(ctx, v_proj, w.wv_b); }
+    ggml_tensor * v = ggml_reshape_3d(ctx, v_proj, p.head_dim, p.n_heads_kv, tokens);
+    // Mistral Small 3.2 does not have Qwen3's learned per-head Q/K norm.
+    if (!ggml_phone_owned::is_llama_dense(p)) {
+        q = ggml_mul(ctx, ggml_rms_norm(ctx, q, p.rms_norm_eps), w.q_norm);
+        k = ggml_mul(ctx, ggml_rms_norm(ctx, k, p.rms_norm_eps), w.k_norm);
+    }
     q = ggml_rope_ext(ctx, q, pos, nullptr, p.head_dim, p.rope_type,
                        p.n_ctx_orig, p.rope_freq_base, p.rope_freq_scale,
                        p.rope_ext_factor, p.rope_attn_factor,
@@ -275,6 +306,7 @@ inline bool build_graph(ggml_context * ctx,
     // n_embd (Qwen3-32B uses 8192 Q features vs 5120 hidden features).
     attn = ggml_reshape_2d(ctx, attn, attn_width, tokens);
     ggml_tensor * attn_out = ggml_mul_mat(ctx, w.wo, attn);
+    if (w.wo_b) { attn_out = ggml_add(ctx, attn_out, w.wo_b); }
     mark(attn_out, "attn_out");
     ggml_tensor * ffn_inp = ggml_add(ctx, attn_out, input);
     mark(ffn_inp, "ffn_inp");
@@ -283,12 +315,15 @@ inline bool build_graph(ggml_context * ctx,
         ggml_rms_norm(ctx, ffn_inp, p.rms_norm_eps), w.ffn_norm);
     mark(ffn_norm, "ffn_norm");
     ggml_tensor * up = ggml_mul_mat(ctx, w.ffn_up, ffn_norm);
+    if (w.ffn_up_b) { up = ggml_add(ctx, up, w.ffn_up_b); }
     mark(up, "ffn_up");
     ggml_tensor * gate = ggml_mul_mat(ctx, w.ffn_gate, ffn_norm);
+    if (w.ffn_gate_b) { gate = ggml_add(ctx, gate, w.ffn_gate_b); }
     mark(gate, "ffn_gate");
     ggml_tensor * glu = ggml_swiglu_split(ctx, gate, up);
     mark(glu, "ffn_swiglu");
     ggml_tensor * ffn = ggml_mul_mat(ctx, w.ffn_down, glu);
+    if (w.ffn_down_b) { ffn = ggml_add(ctx, ffn, w.ffn_down_b); }
     mark(ffn, "ffn_down");
     ggml_tensor * result = ggml_add(ctx, ffn, ffn_inp);
     mark(result, "ffn_out");

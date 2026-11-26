@@ -45,6 +45,39 @@ int main() {
     const char * reason = nullptr;
     const region_plan a = make_plan();
     CHECK(validate(a, reason));
+    // Llama24 + calibration share the wire without aliasing flag bits.
+    auto llama = a;
+    llama.n_heads = 32;
+    llama.layer = 32;
+    llama.version = k_multi_plan_version;
+    llama.flags = flags_for_layers(8, true) | k_flag_calibration;
+    llama.rope_type = k_rope_norm;
+    llama.schedule_count = 3;
+    llama.schedule[0] = 100;
+    llama.schedule[1] = 180;
+    llama.schedule[2] = 232;
+    llama.chunk_tokens = 232;
+    CHECK(validate(llama, reason));
+    CHECK(is_llama_dense(llama));
+    CHECK(is_calibration_flags(llama.flags));
+    CHECK(layer_count(llama) == 8);
+    for (uint32_t i = 0; i < 8; ++i) {
+        const auto child = single_layer_plan(llama, i);
+        CHECK(validate(child, reason));
+        CHECK(child.flags == (k_flag_flash_attn | k_flag_llama_dense));
+        CHECK(child.layer == 32 + i);
+        CHECK(chunk_begin(child, 2) == 280);
+        CHECK(chunk_size(child, 2) == 232);
+    }
+    auto wrong_rope = llama;
+    wrong_rope.rope_type = k_rope_neox;
+    CHECK(!validate(wrong_rope, reason));
+    auto wrong_arch = llama;
+    wrong_arch.flags &= ~k_flag_llama_dense;
+    CHECK(!validate(wrong_arch, reason));
+    auto qwen_template = a;
+    qwen_template.flags |= k_flag_llama_dense;
+    CHECK(!same_execution_template(a, qwen_template));
     // Qwen3-32B: 5120 hidden features, 64 query heads, 128 head dim.
     auto wide = a;
     wide.region = 15;

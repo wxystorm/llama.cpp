@@ -61,6 +61,25 @@ class TestModelsAndSplits(unittest.TestCase):
         self.assertEqual(m.resolve_splits(
             model, phone_layers=24, cuda_layers=12), ([40], 28))
 
+    def test_llama24_defaults_and_architecture_gate(self):
+        gguf = replace(self.mock_gguf(40), architecture="llama",
+                       attention_head_count=32, attention_value_length=128)
+        with patch.object(m, "read_gguf_weights", return_value=gguf):
+            model = m.inspect_model(Path("any.gguf"), "24b")
+            self.assertEqual(m.inspect_model(Path("any.gguf")), model)
+            with self.assertRaises(ValueError):
+                m.inspect_model(Path("any.gguf"), "14b")
+        self.assertEqual((model.family, model.layers), ("24b", 40))
+        self.assertEqual(m.resolve_splits(model), ([32], 25))
+        self.assertEqual(m.resolve_splits(model, phone_layers=8, cuda_layers=7), ([32], 25))
+        for bad in (replace(gguf, architecture="qwen3"),
+                    replace(gguf, attention_head_count=40),
+                    replace(gguf, attention_value_length=64),
+                    replace(gguf, rope_dimension_count=64)):
+            with patch.object(m, "read_gguf_weights", return_value=bad):
+                with self.assertRaises(ValueError):
+                    m.inspect_model(Path("any.gguf"))
+
     def test_bad_gguf_dimensions_rejected(self):
         model = self.mock_gguf(64)
         with patch.object(m, "read_gguf_weights", return_value=model):

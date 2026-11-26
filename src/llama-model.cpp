@@ -1313,13 +1313,23 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
              (n_layer_all == 64 && hparams.n_head() == 64)) &&
             hparams.n_embd == 5120 && hparams.n_head_kv() == 8 &&
             hparams.n_embd_head_k() == 128;
+        // Mistral Small 3.2 text GGUF uses the dense Llama architecture.
+        // Keep this gate narrow; arbitrary Llama/MoE/SWA math is not native.
+        const bool native_llama24_shape = arch == LLM_ARCH_LLAMA &&
+            n_layer_all == 40 && hparams.n_embd == 5120 &&
+            hparams.n_head() == 32 && hparams.n_head_kv() == 8 &&
+            hparams.n_embd_head_k() == 128 && hparams.n_embd_head_v() == 128 &&
+            hparams.n_rot() == 128 && hparams.n_expert == 0 &&
+            !hparams.use_kq_norm && !hparams.is_swa_any() &&
+            hparams.rope_type == LLAMA_ROPE_TYPE_NORM;
         if (jupiter_phone_native &&
-                (!native_qwen3_shape || jupiter_pc_layers <= 0 ||
+                (!(native_qwen3_shape || native_llama24_shape) || jupiter_pc_layers <= 0 ||
                  jupiter_pc_layers >= n_layer_all ||
                  n_layer_all - jupiter_pc_layers > 64)) {
             throw std::runtime_error(
                 "Jupiter native Phone-owned Prefill requires dense Qwen3-14B"
-                " (40 layers) or Qwen3-32B (64 layers), with a contiguous"
+                " (40 layers), Qwen3-32B (64 layers), or Llama/Mistral-24B"
+                " (40 layers, Q32/KV8), with a contiguous"
                 " Phone suffix bounded by the 64-layer RPC descriptor,"
                 " a nonempty PC prefix, and 5120 hidden features");
         }

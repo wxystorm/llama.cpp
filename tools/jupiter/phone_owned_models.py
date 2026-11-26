@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exact Qwen3 dense 14B/32B Phone-owned Prefill model/layout contract.
+"""Exact Qwen3 14B/32B and dense Llama/Mistral 24B native contract.
 
 Read GGUF metadata, not the filename. The HTP executor consumes the same
 metadata-derived tensor shapes as the original Jupiter model. No Decode.
@@ -26,6 +26,10 @@ class ModelLayout:
     head_dim: int
 
     @property
+    def label(self) -> str:
+        return "Mistral-Small-3.2-24B" if self.family == "24b" else f"Qwen3-{self.family.upper()}"
+
+    @property
     def phone_first_min(self) -> int:
         # Preserve at least one PC Transformer layer and honor the RPC array.
         return max(1, self.layers - RPC_LAYER_DEVICE_SLOTS)
@@ -36,7 +40,7 @@ class ModelLayout:
 
     @property
     def default_cpu_layers(self) -> int:
-        return 16 if self.layers == 40 else 44
+        return 25 if self.family == "24b" else 16 if self.layers == 40 else 44
 
     @property
     def default_pc_layers(self) -> int:
@@ -45,42 +49,37 @@ class ModelLayout:
     def validate_split(self, pc_layers: int, cpu_layers: int) -> None:
         if not self.phone_first_min <= pc_layers <= self.phone_first_max:
             raise ValueError(
-                f"Qwen3-{self.family}: first Phone layer must be "
+                f"{self.label}: first Phone layer must be "
                 f"{self.phone_first_min}..{self.phone_first_max}, got {pc_layers}")
         if not 0 <= cpu_layers < pc_layers:
             raise ValueError(
-                f"Qwen3-{self.family}: require 0 <= CPU layers < "
+                f"{self.label}: require 0 <= CPU layers < "
                 f"first Phone layer ({pc_layers}), got {cpu_layers}")
 
 
 def inspect_model(path: Path, family: str = "auto") -> ModelLayout:
-    """Verify dense Qwen3 GGUF dimensions before any Phone experiment."""
+    """Verify supported dense GGUF dimensions before any Phone experiment."""
     model = read_gguf_weights(Path(path))
-    if model.architecture != "qwen3":
-        raise ValueError(
-            f"Phone-native supports dense Qwen3, got GGUF arch={model.architecture!r}")
     layers = model.n_layers
-    names = {40: "14b", 64: "32b"}
-    if layers not in names:
-        raise ValueError(
-            f"Phone-native supports Qwen3-14B (40 layers) or "
-            f"Qwen3-32B (64 layers), got {layers} layers")
-    if family != "auto" and family != names[layers]:
-        raise ValueError(
-            f"--model-size={family} disagrees with GGUF {layers}-layer "
-            f"Qwen3-{names[layers]}")
     heads = model.attention_head_count
     kv_heads = model.attention_head_count_kv
     hidden = model.embedding_length
     head_dim = model.attention_key_length or model.rope_dimension_count
-    if (hidden != 5120 or
-            (heads, kv_heads, head_dim) !=
-            ((40, 8, 128) if layers == 40 else (64, 8, 128))):
-        raise ValueError(
-            f"Unsupported Qwen3 GGUF dimensions: layers={layers}, "
-            f"hidden={hidden}, Q={heads}, KV={kv_heads}, head_dim={head_dim}")
-    return ModelLayout(names[layers], layers, hidden, heads,
-                       kv_heads, head_dim)
+    value_dim = model.attention_value_length or head_dim
+    shape = (model.architecture, layers, hidden, heads, kv_heads, head_dim)
+    supported = {
+        ("qwen3", 40, 5120, 40, 8, 128): "14b",
+        ("llama", 40, 5120, 32, 8, 128): "24b",
+        ("qwen3", 64, 5120, 64, 8, 128): "32b",
+    }
+    actual = supported.get(shape)
+    if actual is None or value_dim != head_dim or (
+            model.rope_dimension_count not in (0, head_dim)):
+        raise ValueError(f"Unsupported dense native GGUF dimensions: {shape}, "
+                         f"value_dim={value_dim}, rope_dim={model.rope_dimension_count}")
+    if family != "auto" and family != actual:
+        raise ValueError(f"--model-size={family} disagrees with GGUF {actual}: {shape}")
+    return ModelLayout(actual, layers, hidden, heads, kv_heads, head_dim)
 
 
 def resolve_splits(model: ModelLayout, *, layouts: str | None = None,
@@ -95,7 +94,7 @@ def resolve_splits(model: ModelLayout, *, layouts: str | None = None,
     max_phone = min(model.layers - 1, RPC_LAYER_DEVICE_SLOTS)
     if phone_layers is not None and not 1 <= phone_layers <= max_phone:
         raise ValueError(f"--phone-layers must be 1..{max_phone} for "
-                         f"Qwen3-{model.family} (keep a PC prefix; "
+                         f"{model.label} (keep a PC prefix; "
                          f"RPC capacity={RPC_LAYER_DEVICE_SLOTS})")
     if cuda_layers is not None and cuda_layers < 1:
         raise ValueError("--cuda-layers must be positive")

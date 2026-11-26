@@ -159,8 +159,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--skip-legacy-logits-check", action="store_true",
                    help="resident Stage2/3 timing only; tolerate nonfinite legacy logits, "
                         "never weaken native output checks")
-    p.add_argument("--model", required=True, help="dense Qwen3-14B/32B GGUF")
-    p.add_argument("--model-size", choices=("auto", "14b", "32b"),
+    p.add_argument("--model", required=True, help="dense Qwen3-14B/32B or Mistral-Small-3.2-24B GGUF")
+    p.add_argument("--model-size", choices=("auto", "14b", "24b", "32b"),
                    default="auto", help="verify GGUF architecture; default auto")
     p.add_argument("--rpc", required=True, help="running Phone host:port")
     p.add_argument("--prompts-dir", required=True,
@@ -171,7 +171,7 @@ def parse_args() -> argparse.Namespace:
                         "0,128,256,512,1024 (5x10=50); 'all' opts in to "
                         "other groups including 2048")
     p.add_argument("--out-dir", default=None,
-                   help="default: jupiter-autonomous-{14b|32b}-dp-2048")
+                   help="default: jupiter-autonomous-{14b|24b|32b}-dp-2048")
     p.add_argument("--layouts", default=None,
                    help="first Phone layer: 14B 1..39; 32B 1..63; "
                         "CPU prefix and HTP memory constraints still apply")
@@ -1108,7 +1108,7 @@ def run() -> int:
             raise FileNotFoundError(args.resident_server)
         if args.resident_start_timeout <= 0:
             raise ValueError("resident startup timeout must be positive")
-    print(f"[PHONE_SUITE_MODEL] model=Qwen3-{model.family.upper()}"
+    print(f"[PHONE_SUITE_MODEL] model={model.label}"
           f" layers={model.layers} CPU={args.cpu_layers}"
           f" first_phone={layouts} GPU={[x-args.cpu_layers for x in layouts]}"
           f" HTP={[model.layers-x for x in layouts]}"
@@ -1164,7 +1164,7 @@ def run() -> int:
             "NOT_USED" if args.calibration_backend != "legacy" else
             "TIMING_ONLY" if args.skip_legacy_logits_check else
             "FINITE_ONLY" if args.resident_server else "CLI_UNVERIFIED")
-    print(f"[PHONE_SUITE] model=Qwen3-{model.family.upper()}"
+    print(f"[PHONE_SUITE] model={model.label}"
           f" prompts={len(files)} layouts={layouts} run_mode={args.run_mode}"
           f" repeats={args.repeats} total_cases={len(cases)}"
           f" backend={'resident-server' if args.resident_server else 'cli'}"

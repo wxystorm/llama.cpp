@@ -3541,7 +3541,8 @@ bool rpc_server::phone_owned_prepare(
         std::string reason;
         const int64_t load_begin_us = ggml_time_us();
         if (!owner.load_model_layer(
-                local_tensor_source, child.layer, reason, load)) {
+                local_tensor_source, child.layer, reason, load,
+                ggml_phone_owned::is_llama_dense(child))) {
             GGML_LOG_ERROR("[JUPITER_PHONE_OWNED] PREPARE_REJECT"
                            " layer=%u device=%u reason=%s\n",
                            child.layer, device, reason.c_str());

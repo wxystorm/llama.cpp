@@ -29,8 +29,8 @@ def arguments() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--exe", required=True, help="rebuilt native-branch llama-cli.exe")
     p.add_argument("--model", required=True)
-    p.add_argument("--model-size", choices=("auto", "14b", "32b"), default="auto",
-                   help="verify actual GGUF Qwen3 model; default auto-detect")
+    p.add_argument("--model-size", choices=("auto", "14b", "24b", "32b"), default="auto",
+                   help="verify actual dense GGUF model; default auto-detect")
     p.add_argument("--rpc", required=True, help="same endpoint used for --rpc")
     p.add_argument("--prompt-file", required=True)
     p.add_argument("--sessions", type=int, choices=(1, 2, 3, 4), default=1)
@@ -127,7 +127,7 @@ def main() -> int:
         phone_layers=args.phone_layers)
     args.pc_layers = positions[0]
     args.cpu_layers = cpu_layers
-    print(f"[PHONE_NATIVE_MODEL] model=Qwen3-{spec.family.upper()}"
+    print(f"[PHONE_NATIVE_MODEL] model={spec.label}"
           f" layers={spec.layers} hidden={spec.hidden} heads={spec.heads}"
           f" placement=CPU[0,{cpu_layers})"
           f" CUDA[{cpu_layers},{args.pc_layers})"

@@ -47,6 +47,23 @@ a new profile directory/tag, even if the RPC endpoint is unchanged. The
 protocol does not identify the exact remote software image. Do not run
 concurrent profile/experiment workers against the same Phone service.
 
+## Mistral Small 3.2 24B (dense llama GGUF)
+
+The native suffix uses Llama operator order (normal RoPE, no Q/K
+RMSNorm), with unchanged Jupiter DP, contiguous placement and Phone
+FIFO/autonomous P2C. Calibration retains flag 0x2; Llama math uses
+flag 0x4, including every child layer. Both PC and Phone must be rebuilt.
+Do not reuse Qwen3 profiles or the old OpenCL 24B results. Initial
+CPU25/CUDA7/HTP8 is a capacity-test candidate, not a measured optimum.
+
+    .\tools\jupiter\run_phone_owned_full_suite.ps1 -ModelSize 24b -CpuLayers 25 -Layouts 32 -Sessions 4 -UseServer -MaxChunk 256 -OfflineProfileDir ".\jupiter-offline-profile\24b-l32-native" -OutDir ".\jupiter-24b-l32-native-full50" -ProfileOnly -Resume
+
+Before the full suite, validate a real short prompt against the regular
+graph (same tokens, same model); report full logits errors/top-1, not
+only PASS/finite values. Capacity, normal-RoPE/Q6_K kernel support and
+numeric parity need device validation. Remove -ProfileOnly after the
+profile passes. No Full Cycle scratch or lock changes are included.
+
 ## Artifacts
 
 hardware-config.json, capacity.json, min-chunk.json, stage2-samples.csv,

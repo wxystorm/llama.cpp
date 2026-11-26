@@ -31,7 +31,7 @@ param(
     [int]$LegacyRequestTimeout = 120,
     [int]$LegacyRestartPrompts = 10,
     [int]$LegacyTimeoutRetries = 2,
-    [ValidateSet("auto", "14b", "32b")]
+    [ValidateSet("auto", "14b", "24b", "32b")]
     [string]$ModelSize = "auto",
     [string]$Model = "",
     [string]$Rpc = "10.71.109.52:10140",
@@ -74,6 +74,8 @@ try {
     if (!$Model) {
         if ($ModelSize -eq "32b") {
             $Model = "E:\llama\models\Qwen3-32B-Q4_K_M.gguf"
+        } elseif ($ModelSize -eq "24b") {
+            $Model = "E:\llama\models\Mistral-Small-3.2-24B-Q6_K.gguf"
         } else {
             $Model = "E:\llama\models\Qwen3-14B-Q4_K_M.gguf"
         }

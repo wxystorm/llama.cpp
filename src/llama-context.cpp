@@ -374,7 +374,18 @@ struct jupiter_phone_owned_native_state {
             hp.n_head_kv() == 8 && hp.n_embd_head_k() == 128 &&
             ((model_layers == 40 && hp.n_head() == 40) ||
              (model_layers == 64 && hp.n_head() == 64));
-        if (!supported_dense_qwen3 ||
+        const bool supported_dense_llama24 =
+            model.arch == LLM_ARCH_LLAMA && model_layers == 40 &&
+            hp.n_embd == 5120 && hp.n_head() == 32 && hp.n_head_kv() == 8 &&
+            hp.n_embd_head_k() == 128 && hp.n_embd_head_v() == 128 &&
+            hp.n_rot() == 128 && hp.n_expert == 0 && !hp.use_kq_norm &&
+            !hp.is_swa_any() && hp.rope_type == LLAMA_ROPE_TYPE_NORM &&
+            hp.causal_attn && !hp.use_alibi && !hp.attn_soft_cap &&
+            hp.f_clamp_kqv == 0.0f && hp.f_max_alibi_bias == 0.0f &&
+            hp.f_attn_out_scale == 0.0f && hp.f_attn_value_scale == 0.0f &&
+            (hp.f_attention_scale == 0.0f ||
+             std::abs(hp.f_attention_scale - 1.0f / std::sqrt(128.0f)) < 1e-6f);
+        if (!(supported_dense_qwen3 || supported_dense_llama24) ||
                 native_first <= 0 || native_first >= model_layers ||
                 model_layers - native_first > 64 ||
                 !cparams.flash_attn || cparams.n_ctx != native_ctx ||
@@ -383,8 +394,32 @@ struct jupiter_phone_owned_native_state {
                 first_chunk == 0 || first_chunk > tokens ||
                 first_chunk > 4096 ||
                 !model.output || !model.output_norm) {
-            fail("UNSUPPORTED_QWEN3_14B_OR_32B_FRESH_PREFILL_SHAPE_OR_KV");
+            fail("UNSUPPORTED_DENSE_14B_24B_32B_FRESH_PREFILL_SHAPE_OR_KV");
             return false;
+        }
+        if (supported_dense_llama24) {
+            for (int il = native_first; il < model_layers; ++il) {
+                const auto & layer = model.layers[il];
+                // Reject unrepresented math rather than silently dropping it.
+                // Mistral uses separate Q/K/V projections, optional biases,
+                // and no learned RoPE factors or quantization scale tensors.
+                if (hp.n_head(il) != 32 || hp.n_head_kv(il) != 8 ||
+                        hp.n_embd_head_k(il) != 128 ||
+                        hp.n_embd_head_v(il) != 128 || hp.n_rot(il) != 128 ||
+                        !layer.wq || !layer.wk || !layer.wv || !layer.wo ||
+                        !layer.ffn_up || !layer.ffn_gate || !layer.ffn_down ||
+                        layer.wqkv || layer.ffn_gate_inp ||
+                        layer.attn_q_norm || layer.attn_k_norm ||
+                        model.get_rope_factors(cparams, il) ||
+                        layer.wq_s || layer.wk_s || layer.wv_s || layer.wo_s ||
+                        layer.ffn_up_s || layer.ffn_gate_s || layer.ffn_down_s ||
+                        layer.wq_in_s || layer.wk_in_s || layer.wv_in_s ||
+                        layer.wo_in_s || layer.ffn_up_in_s ||
+                        layer.ffn_gate_in_s || layer.ffn_down_in_s) {
+                    fail("UNSUPPORTED_LLAMA24_SUFFIX_LAYER_MATH");
+                    return false;
+                }
+            }
         }
         for (ggml_backend_t backend : backends) {
             if (!backend) { continue; }
@@ -451,6 +486,9 @@ struct jupiter_phone_owned_native_state {
         // count in the upper flag bits. Do not encode a one-layer v3 plan.
         plan.version = phone_layers == 1 ? 2 : 3;
         plan.flags = phone_layers == 1 ? 1 : 1 | (phone_layers << 16);
+        if (supported_dense_llama24) {
+            plan.flags |= GGML_RPC_PHONE_OWNED_LLAMA_DENSE_FLAG;
+        }
         const char * calibration = std::getenv("LLAMA_JUPITER_RESIDENT_NATIVE_CALIBRATION");
         if (calibration && std::atoi(calibration) != 0) {
             plan.flags |= GGML_RPC_PHONE_OWNED_CALIBRATION_FLAG;
@@ -513,7 +551,8 @@ struct jupiter_phone_owned_native_state {
         plan.n_heads_kv = hp.n_head_kv();
         plan.head_dim = hp.n_embd_head_k();
         plan.n_kv = cparams.n_ctx_seq;
-        plan.rope_type = 2; // GGML_ROPE_TYPE_NEOX
+        plan.rope_type = supported_dense_llama24 ?
+            GGML_ROPE_TYPE_NORMAL : GGML_ROPE_TYPE_NEOX;
         plan.n_ctx_orig = cparams.n_ctx_orig_yarn;
         plan.kv_type = 1; // GGML_TYPE_F16
         plan.rms_norm_eps = hp.f_norm_rms_eps;
@@ -865,6 +904,10 @@ llama_context::llama_context(
                     "LLAMA_JUPITER_PHONE_OWNED_NATIVE requires"
                     " LLAMA_JUPITER_PREFILL=1 and"
                     " LLAMA_JUPITER_PHONE_OWNED_ENDPOINT=host:port");
+            }
+            if (model.arch == LLM_ARCH_LLAMA &&
+                    (params.type_k != GGML_TYPE_F16 || params.type_v != GGML_TYPE_F16)) {
+                throw std::runtime_error("Jupiter native Llama requires F16 K/V");
             }
             jupiter_phone_native =
                 std::make_unique<jupiter_phone_owned_native_state>(endpoint);
@@ -2927,6 +2970,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 " reason=REQUIRES_FRESH_SINGLE_SEQUENCE_LOGITS_ON_LAST_TOKEN"
                 " tokens=%u outputs=%u\n", n_tokens_all, n_outputs_all);
             return -3;
+        }
+        if (model.arch == LLM_ARCH_LLAMA) {
+            if (loras->size() != 0) {
+                LLAMA_LOG_ERROR("[JUPITER_PHONE_OWNED_PREFILL] status=REJECT reason=LLAMA_LORA_UNSUPPORTED\n");
+                return -3;
+            }
+            for (int il = std::max(0, llama_jupiter::model_pc_layers(int(model.hparams.n_layer()) - 8));
+                    il < int(model.hparams.n_layer()); ++il) {
+                if (cvec->tensor_for(il) != nullptr) {
+                    LLAMA_LOG_ERROR("[JUPITER_PHONE_OWNED_PREFILL] status=REJECT reason=LLAMA_CVEC_UNSUPPORTED\n");
+                    return -3;
+                }
+            }
         }
         if (!jupiter_phone_native->prepare_run(
                 model, cparams, n_tokens_all,

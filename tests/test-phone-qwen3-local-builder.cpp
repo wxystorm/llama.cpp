@@ -71,6 +71,43 @@ int main() {
     };
     ggml_context * ctx = ggml_init(params);
     CHECK(ctx != nullptr);
+    // Mistral text graph: unequal chunks, Q=32, KV=8, no per-head norm.
+    {
+        auto lp = p;
+        lp.flags |= ggml_phone_owned::k_flag_llama_dense;
+        lp.rope_type = ggml_phone_owned::k_rope_norm;
+        lp.n_heads = 32;
+        lp.schedule_count = 3;
+        lp.schedule[0] = 100;
+        lp.schedule[1] = 180;
+        lp.schedule[2] = 232;
+        lp.chunk_tokens = 232;
+        ggml_context * lc = ggml_init(params);
+        CHECK(lc != nullptr);
+        auto lw = weights(lc, 32, 32768);
+        lw.q_norm = nullptr;
+        lw.k_norm = nullptr;
+        CHECK(ggml_phone_qwen3::validate_weights(lp, lw, reason));
+        ggml_phone_qwen3::graph_result lg {};
+        CHECK(ggml_phone_qwen3::build_graph(lc, lp, 1, lw, lg, reason));
+        CHECK(lg.token_begin == 100 && lg.tokens == 180);
+        CHECK(lg.output->ne[0] == 5120 && lg.output->ne[1] == 180);
+        int norms = 0, ropes = 0, kv_writes = 0;
+        for (int i = 0; i < ggml_graph_n_nodes(lg.graph); ++i) {
+            const auto * n = ggml_graph_node(lg.graph, i);
+            norms += n->op == GGML_OP_RMS_NORM;
+            kv_writes += n->op == GGML_OP_SET_ROWS;
+            if (n->op == GGML_OP_ROPE) {
+                ++ropes;
+                CHECK(n->op_params[2] == GGML_ROPE_TYPE_NORMAL);
+            }
+        }
+        CHECK(norms == 2 && ropes == 2 && kv_writes == 2);
+        auto bad = lw;
+        bad.wq_b = ggml_new_tensor_1d(lc, GGML_TYPE_F32, 5120);
+        CHECK(!ggml_phone_qwen3::validate_weights(lp, bad, reason));
+        ggml_free(lc);
+    }
     const auto w = weights(ctx);
     CHECK(ggml_phone_qwen3::validate_weights(p, w, reason));
     for (uint32_t chunk = 0; chunk < 4; ++chunk) {

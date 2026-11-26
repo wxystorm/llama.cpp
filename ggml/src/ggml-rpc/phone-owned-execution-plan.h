@@ -26,6 +26,9 @@ static constexpr uint32_t k_flag_calibration = 2;
 inline bool is_calibration_flags(uint32_t flags) {
     return (flags & k_flag_calibration) != 0;
 }
+// Calibration is a parent cache namespace; Llama math is a distinct bit.
+static constexpr uint32_t k_flag_llama_dense = 4u;
+static constexpr uint32_t k_rope_norm = 0; // GGML_ROPE_TYPE_NORMAL
 static constexpr uint32_t k_rope_neox = 2; // GGML_ROPE_TYPE_NEOX
 static constexpr uint32_t k_f16 = 1;      // GGML_TYPE_F16
 static constexpr uint32_t k_slots = 2;
@@ -78,8 +81,11 @@ inline uint32_t layer_count(const region_plan & p) {
     return p.version == k_multi_plan_version ?
         p.flags >> k_layer_count_shift : 1;
 }
-inline uint32_t flags_for_layers(uint32_t n_layers) {
-    return k_flag_flash_attn |
+inline bool is_llama_dense(const region_plan & p) {
+    return (p.flags & k_flag_llama_dense) != 0;
+}
+inline uint32_t flags_for_layers(uint32_t n_layers, bool llama_dense = false) {
+    return k_flag_flash_attn | (llama_dense ? k_flag_llama_dense : 0u) |
         (n_layers << k_layer_count_shift);
 }
 // The RPC PREPARE wire request carries one device index per Phone layer,
@@ -102,7 +108,8 @@ inline region_plan single_layer_plan(
         const region_plan & parent, uint32_t offset) {
     region_plan child = parent;
     child.version = k_plan_version;
-    child.flags = k_flag_flash_attn;
+    // Calibration stays parent-only; architecture must survive Pn -> P1.
+    child.flags = k_flag_flash_attn | (parent.flags & k_flag_llama_dense);
     child.region = internal_layer_region(parent, offset);
     child.layer = parent.layer + offset;
     return child;
@@ -164,14 +171,16 @@ inline uint32_t chunk_size(const region_plan & p, uint32_t chunk) {
 inline bool validate(const region_plan & p, const char * & reason) {
     reason = "NONE";
     const uint32_t layers = layer_count(p);
+    const uint32_t math_flags = k_flag_flash_attn |
+        (is_llama_dense(p) ? k_flag_llama_dense : 0u);
     const bool legacy = p.version == k_plan_version &&
-        (p.flags & ~k_flag_calibration) == k_flag_flash_attn;
+        (p.flags & ~k_flag_calibration) == math_flags;
     const bool multi = p.version == k_multi_plan_version &&
-        ((p.flags & 0xffffu) & ~k_flag_calibration) == k_flag_flash_attn &&
+        ((p.flags & 0xffffu) & ~k_flag_calibration) == math_flags &&
         layers >= 2 && layers <= k_max_phone_layers_per_region;
     if ((!legacy && !multi) ||
             p.layer >= 256 || layers > 256 - p.layer ||
-            p.rope_type != k_rope_neox ||
+            p.rope_type != (is_llama_dense(p) ? k_rope_norm : k_rope_neox) ||
             p.kv_type != k_f16) {
         reason = "UNSUPPORTED_QWEN3_PLAN_OR_FORMAT";
         return false;

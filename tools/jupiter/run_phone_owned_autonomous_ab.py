@@ -22,7 +22,7 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--exe", required=True)
     p.add_argument("--model", required=True)
-    p.add_argument("--model-size", choices=("auto", "14b", "32b"), default="auto")
+    p.add_argument("--model-size", choices=("auto", "14b", "24b", "32b"), default="auto")
     p.add_argument("--rpc", required=True)
     p.add_argument("--prompt-file", required=True)
     p.add_argument("--sessions", type=int, choices=(1, 2, 3, 4), default=4)
@@ -43,7 +43,7 @@ def main() -> int:
         phone_layers=args.phone_layers)
     args.pc_layers, args.cpu_layers = layout[0], cpu
     args.model_size = spec.family
-    print(f"[PHONE_AUTONOMOUS_AB] model=Qwen3-{spec.family.upper()}"
+    print(f"[PHONE_AUTONOMOUS_AB] model={spec.label}"
           f" CPU={cpu} CUDA={args.pc_layers-cpu}"
           f" HTP={spec.layers-args.pc_layers}", flush=True)
 
@@ -117,7 +117,7 @@ def main() -> int:
     auto_ms = results["autonomous"]["prompt_eval_ms"]
     record = {
         "order": list(order),
-        "model": "Qwen3-" + spec.family.upper(),
+        "model": spec.label,
         "model_layers": spec.layers,
         "cpu_layers": cpu,
         "cuda_layers": args.pc_layers-cpu,

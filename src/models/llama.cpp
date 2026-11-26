@@ -105,6 +105,16 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
+    const bool phone_native = !embed && params.jupiter_phone_owned_op != nullptr;
+    const int phone_first = phone_native ? params.jupiter_phone_first_layer : int(n_layer);
+    if (phone_native) {
+        GGML_ASSERT(n_layer == 40 && n_embd == 5120 &&
+                    n_head == 32 && n_head_kv == 8 && n_embd_head == 128 &&
+                    phone_first > 0 && phone_first < int(n_layer) &&
+                    int(n_layer) - phone_first <= 64 &&
+                    "Jupiter native Llama/Mistral-24B suffix contract");
+    }
+
     inpL = build_inp_embd(model.tok_embd);
 
     // inp_pos - contains the positions
@@ -123,7 +133,7 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
     // transformer layers
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = 0; il < phone_first; ++il) {
         res->t_layer_inp[il] = inpL;
         // 把当前层的输入保存到结果中，方便后续使用
         // inpl是当前的输入hidden states
@@ -231,6 +241,21 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
         inpL = cur;
     }
     cur = inpL;
+
+    if (phone_native) {
+        // Same CPU bridge as Jupiter Qwen3. Every Chunk token traverses the
+        // Phone suffix for KV; gather requested logits tokens afterwards.
+        GGML_ASSERT(cur->type == GGML_TYPE_F32);
+        cur = ggml_cont(ctx0, cur);
+        cur = ggml_map_custom1(
+            ctx0, cur, params.jupiter_phone_owned_op, 1,
+            params.jupiter_phone_owned_user);
+        cb(cur, "phone_owned_hidden", -1);
+        ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
+        if (inp_out_ids) {
+            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        }
+    }
 
     cur = build_norm(cur,
             model.output_norm, NULL,

@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--exe", required=True, help="Windows llama-cli.exe")
     p.add_argument("--tokenizer", required=True, help="matching llama-tokenize.exe")
     p.add_argument("--model", required=True)
-    p.add_argument("--model-size", choices=("auto", "14b", "32b"), default="auto")
+    p.add_argument("--model-size", choices=("auto", "14b", "24b", "32b"), default="auto")
     p.add_argument("--rpc", required=True)
     p.add_argument("--prompts", nargs="+", required=True,
                    help="two or more UTF-8 .txt files; order is preserved")

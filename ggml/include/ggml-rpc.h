@@ -13,6 +13,8 @@ extern "C" {
 // Patch 8: opt-in native calibration namespace + final P2C timing footer.
 // Ordinary native PREPARE/START/PUSH/P2C wire payloads remain unchanged.
 #define GGML_RPC_PHONE_OWNED_CALIBRATION_FLAG 2u
+// Keep calibration at bit 1; bit 2 identifies Llama dense layer math.
+#define GGML_RPC_PHONE_OWNED_LLAMA_DENSE_FLAG 4u
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");

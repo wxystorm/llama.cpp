@@ -22,7 +22,7 @@ def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--exe", required=True)
     p.add_argument("--model", required=True)
-    p.add_argument("--model-size", choices=("auto", "14b", "32b"), default="auto")
+    p.add_argument("--model-size", choices=("auto", "14b", "24b", "32b"), default="auto")
     p.add_argument("--rpc", required=True)
     p.add_argument("--prompt-file", required=True)
     p.add_argument("--sessions", type=int, choices=(1, 2, 3, 4), default=4)
