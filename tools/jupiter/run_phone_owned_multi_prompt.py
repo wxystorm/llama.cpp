@@ -51,7 +51,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def count_model_tokens(
-        tokenizer: Path, model: Path, prompt: str) -> int:
+        tokenizer: Path, model: Path, prompt: str, *, raw: bool = False) -> int:
     # The CLI sends one user message to /v1/chat/completions; its Server
     # expands the model's Jinja Chat Template before tokenization. Count
     # THAT exact formatted Prompt, not raw .txt tokens (Qwen3-14B may add
@@ -62,9 +62,12 @@ def count_model_tokens(
     env["LLAMA_JUPITER_PHONE_OWNED_NATIVE"] = "0"
     env.pop("LLAMA_JUPITER_SEQUENCE_PLAN", None)
     env.pop("LLAMA_JUPITER_PLAN_FILE", None)
+    command = [str(tokenizer), "-m", str(model), "--stdin"]
+    if not raw:
+        command.append("--chat-user")
+    command.extend(("--show-count", "--log-disable"))
     result = subprocess.run(
-        [str(tokenizer), "-m", str(model), "--stdin",
-         "--chat-user", "--show-count", "--log-disable"],
+        command,
         input=prompt, capture_output=True, text=True, encoding="utf-8",
         errors="replace", env=env, check=False,
     )

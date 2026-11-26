@@ -74,6 +74,8 @@ inline int jupiter_resident_server(common_params & params) {
     }
     const bool native = jr_env_enabled("LLAMA_JUPITER_PHONE_OWNED_NATIVE");
     const bool native_calibration = jr_env_enabled("LLAMA_JUPITER_RESIDENT_NATIVE_CALIBRATION");
+    const bool raw_prompt = jr_env_enabled("LLAMA_JUPITER_RESIDENT_RAW_PROMPT");
+    const std::string prompt_mode = raw_prompt ? "RAW" : "CHAT";
     if (native_calibration && !native) {
         std::fprintf(stderr, "Native calibration requires Phone-owned model loading\n");
         return 1;
@@ -145,6 +147,7 @@ inline int jupiter_resident_server(common_params & params) {
         return jr_response({{"status", "ok"}, {"resident", true},
                             {"native", native}, {"legacy_timing_only", legacy_timing_only},
                             {"native_calibration", native_calibration},
+                            {"prompt_mode", prompt_mode},
                             {"ctx", llama_n_ctx(ctx)},
                             {"batch", llama_n_batch(ctx)}, {"ubatch", llama_n_ubatch(ctx)}});
     });
@@ -169,24 +172,46 @@ inline int jupiter_resident_server(common_params & params) {
             if (prompt.empty()) {
                 throw std::invalid_argument("empty Prompt");
             }
-            // Same single-user Jinja template as llama-tokenize --chat-user
-            // and the existing CLI's default Qwen3 chat route.
-            common_chat_templates_inputs inputs {};
-            inputs.use_jinja = true;
-            inputs.add_generation_prompt = true;
-            inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
-            inputs.enable_thinking = common_chat_templates_support_enable_thinking(templates.get());
-            common_chat_msg user {};
-            user.role = "user";
-            user.content = prompt;
-            inputs.messages.push_back(std::move(user));
-            const auto formatted = common_chat_templates_apply(templates.get(), inputs).prompt;
+            if (body.value("prompt_mode", std::string("CHAT")) != prompt_mode) {
+                throw std::invalid_argument("resident prompt mode mismatch");
+            }
+            // RAW matches llama-tokenize without --chat-user and the
+            // historical 24B completion benchmark. In particular, never
+            // insert Mistral's implicit system or assistant prefix.
+            std::string formatted = prompt;
+            if (!raw_prompt) {
+                common_chat_templates_inputs inputs {};
+                inputs.use_jinja = true;
+                inputs.add_generation_prompt = true;
+                inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+                inputs.enable_thinking = common_chat_templates_support_enable_thinking(templates.get());
+                common_chat_msg user {};
+                user.role = "user";
+                user.content = prompt;
+                inputs.messages.push_back(std::move(user));
+                formatted = common_chat_templates_apply(templates.get(), inputs).prompt;
+            }
             auto tokens = common_tokenize(vocab, formatted, llama_vocab_get_add_bos(vocab), true);
+            const size_t source_tokens = tokens.size();
             auto cuts = body.value("chunks", std::vector<uint32_t>{});
             const auto expected = body.value("expected_tokens", uint32_t(0));
             const auto flags = body.value("flags", jr_json::object());
             if (body.value("calibration", false) != native_calibration) {
                 throw std::invalid_argument("resident calibration namespace mismatch");
+            }
+            const auto raw_prefix_tokens = body.value("raw_prefix_tokens", uint32_t(0));
+            // Only synthetic offline calibration may take an exact prefix
+            // of a longer raw token stream. Formal prompts are never cropped.
+            if (raw_prefix_tokens != 0) {
+                if (!raw_prompt || !native_calibration ||
+                        !flags.value("PROFILE_STAGE", false) || cuts.empty() ||
+                        raw_prefix_tokens != expected || raw_prefix_tokens < 2 ||
+                        raw_prefix_tokens > llama_n_ctx(ctx) ||
+                        raw_prefix_tokens > llama_n_batch(ctx) ||
+                        raw_prefix_tokens > tokens.size()) {
+                    throw std::invalid_argument("invalid synthetic raw calibration prefix");
+                }
+                tokens.resize(raw_prefix_tokens);
             }
             if (native_calibration && cuts.empty() && !flags.value("PROFILE_STAGE", false)) {
                 // Tokenizer probe only: still a real native, exact ordered
@@ -234,6 +259,9 @@ inline int jupiter_resident_server(common_params & params) {
 
             jr_marker("BEGIN", id, "RUN");
             began = true;
+            std::fprintf(stderr, "[JUPITER_RESIDENT_INPUT] mode=%s source_tokens=%zu tokens=%zu"
+                         " raw_prefix_tokens=%u\n", prompt_mode.c_str(),
+                         source_tokens, tokens.size(), raw_prefix_tokens);
             if (native_calibration) {
                 std::fprintf(stderr, "[JUPITER_NATIVE_CALIBRATION] mode=PHONE_AUTONOMOUS profile=%d\n",
                              int(flags.value("PROFILE_STAGE", false)));
@@ -312,6 +340,8 @@ inline int jupiter_resident_server(common_params & params) {
             // from NaNs or serialize invalid floats as legitimate logits.
             jr_json result = {{"id", id}, {"status", "PASS"}, {"tokens", tokens.size()},
                               {"prefill_ms", ms}, {"metric", "DECODE_TO_LOGITS"},
+                              {"prompt_mode", prompt_mode}, {"source_tokens", source_tokens},
+                              {"raw_prefix_tokens", raw_prefix_tokens},
                               {"logits_validation", timing_only ? "TIMING_ONLY" : "FINITE_ONLY"},
                               {"logits_finite", logits_finite}, {"logits_nan", nan_count},
                               {"logits_inf", inf_count}, {"logits_zero", zero_count},

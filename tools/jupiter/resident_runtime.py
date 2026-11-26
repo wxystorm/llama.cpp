@@ -136,7 +136,15 @@ def request_payload(command, env, config, request_id):
         raise ValueError("native calibration requires autonomous mode and no logits export")
     if auto and not config["native"]:
         raise ValueError("autonomous request sent to legacy worker")
+    prompt_mode = config.get("prompt_mode", "CHAT")
+    if prompt_mode not in ("RAW", "CHAT"):
+        raise ValueError("invalid resident prompt mode")
+    raw_prefix = int(env.get(PREFIX + "RAW_PREFIX_TOKENS", "0"))
+    if raw_prefix and (prompt_mode != "RAW" or not calibration or not profile
+                       or not cuts or raw_prefix < 2 or raw_prefix != sum(cuts)):
+        raise ValueError("raw prefix is restricted to exact offline calibration")
     return {"id": request_id, "prompt": cli["-p"], "chunks": cuts,
+            "prompt_mode": prompt_mode, "raw_prefix_tokens": raw_prefix,
             "expected_tokens": sum(cuts), "autonomous": auto,
             "window": config["window"], "calibration": calibration,
             "flags": {k: env.get("LLAMA_JUPITER_" + k, "0") == "1" for k in FLAGS},
@@ -222,6 +230,14 @@ def run_resident_cli(command, env, log_path):
             raise RuntimeError("invalid resident completion or missing reset")
         if payload["expected_tokens"] and result["tokens"] != payload["expected_tokens"]:
             raise RuntimeError("resident actual token count differs from exact DP plan")
+        if (result.get("prompt_mode", "CHAT") != payload["prompt_mode"] or
+                result.get("raw_prefix_tokens", 0) != payload["raw_prefix_tokens"]):
+            raise RuntimeError("resident prompt mode/prefix mismatch; rebuild llama-server")
+        if payload["prompt_mode"] == "RAW":
+            source_tokens = result.get("source_tokens")
+            if (not isinstance(source_tokens, int) or source_tokens < result["tokens"] or
+                    (not payload["raw_prefix_tokens"] and source_tokens != result["tokens"])):
+                raise RuntimeError("invalid raw input token accounting")
         if payload["calibration"]:
             validate_run(trace.decode("utf-8", errors="replace"), result["tokens"], payload["chunks"])
             result["calibration_backend"] = "native-autonomous"
@@ -248,7 +264,8 @@ def run_resident_cli(command, env, log_path):
         log_path.with_suffix(".resident.json").write_text(
             json.dumps(result, indent=2, allow_nan=False) + "\n", encoding="utf-8")
         for line in trace.decode("utf-8", errors="replace").splitlines():
-            if "[JUPITER_SEQUENCE_PLAN]" in line or "prompt eval time" in line:
+            if ("[JUPITER_SEQUENCE_PLAN]" in line or "prompt eval time" in line or
+                    "[JUPITER_RESIDENT_INPUT]" in line):
                 print(line, flush=True)
         return 0
     except Exception as exc:
@@ -275,7 +292,9 @@ class ResidentServer:
                            context=2048, batch=2048, ubatch=ubatch,
                            threads=8, pc_layers=layout, cpu_layers=args.cpu_layers,
                            sessions=args.sessions, native=native, window=2 if native else 1,
-                           calibration=calibration, legacy_timing_only=bool(not native and
+                           calibration=calibration,
+                           prompt_mode="RAW" if getattr(args, "model_size", None) == "24b" else "CHAT",
+                           legacy_timing_only=bool(not native and
                                getattr(args, "skip_legacy_logits_check", False)))
         self.exe = Path(args.resident_server).resolve()
         self.log = Path(output) / "resident-runtime" / (
@@ -293,6 +312,7 @@ class ResidentServer:
         env.update({
             PREFIX + "SERVER": "1",
             PREFIX + "NATIVE_CALIBRATION": str(int(cfg["calibration"])),
+            PREFIX + "RAW_PROMPT": str(int(cfg["prompt_mode"] == "RAW")),
             PREFIX + "LEGACY_TIMING_ONLY": str(int(cfg["legacy_timing_only"])),
             "LLAMA_JUPITER_PREFILL": "1",
             "LLAMA_JUPITER_PC_LAYERS": str(cfg["pc_layers"]),
@@ -339,9 +359,11 @@ class ResidentServer:
                     if status != 200 or not health.get("resident"):
                         raise RuntimeError("not the dedicated resident endpoint")
                     if (health.get("legacy_timing_only") != cfg["legacy_timing_only"] or
-                            health.get("native_calibration") != cfg["calibration"]):
+                            health.get("native_calibration") != cfg["calibration"] or
+                            health.get("prompt_mode", "CHAT") != cfg["prompt_mode"]):
                         raise RuntimeError("resident validation/calibration policy mismatch; rebuild llama-server")
-                    print(f"[JUPITER_RESIDENT_READY] native={native} port={port}", flush=True)
+                    print(f"[JUPITER_RESIDENT_READY] native={native} port={port}"
+                          f" prompt_mode={cfg['prompt_mode']}", flush=True)
                     return self
                 time.sleep(0.25)
             raise RuntimeError(f"resident startup timeout; see {self.log}")

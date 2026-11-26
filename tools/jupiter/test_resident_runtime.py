@@ -95,6 +95,30 @@ class TestResident(unittest.TestCase):
             with self.assertRaises(ValueError):
                 request_payload(cmd, env, config, "a"*32)
 
+    def test_raw_prefix_only_for_profile_and_never_formal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cmd, env, config = self.setup_case(Path(tmp))
+            config["prompt_mode"] = "RAW"
+            payload = request_payload(cmd, env, config, "a"*32)
+            self.assertEqual(payload["prompt_mode"], "RAW")
+            self.assertEqual(payload["raw_prefix_tokens"], 0)
+            env[PREFIX + "RAW_PREFIX_TOKENS"] = "266"
+            with self.assertRaises(ValueError):
+                request_payload(cmd, env, config, "a"*32)
+            config["calibration"] = True
+            env[PREFIX + "NATIVE_CALIBRATION"] = "1"
+            env.pop("LLAMA_JUPITER_LOGITS_DUMP_FILE")
+            env["LLAMA_JUPITER_PROFILE_STAGE"] = "1"
+            payload = request_payload(cmd, env, config, "a"*32)
+            self.assertEqual(payload["raw_prefix_tokens"], 266)
+            env[PREFIX + "RAW_PREFIX_TOKENS"] = "265"
+            with self.assertRaises(ValueError):
+                request_payload(cmd, env, config, "a"*32)
+            env[PREFIX + "RAW_PREFIX_TOKENS"] = "266"
+            config["prompt_mode"] = "CHAT"
+            with self.assertRaises(ValueError):
+                request_payload(cmd, env, config, "a"*32)
+
     def test_log_isolation(self):
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "server.log"

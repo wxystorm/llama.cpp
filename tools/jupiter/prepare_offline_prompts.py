@@ -119,6 +119,8 @@ def main():
     root = opts.profile_dir.resolve()
     manifest = offline.read_json(root / "hardware-config.json")
     cfg = manifest["config"]
+    if cfg.get("synthetic_input") == "RAW_PREFIX":
+        raise ValueError("RAW_PREFIX profile constructs exact inputs during resident calibration; no preflight needed")
     if offline.digest_config(cfg) != manifest["signature"]:
         raise ValueError("invalid hardware-config.json signature")
     if (root / "profile-ready.json").exists():

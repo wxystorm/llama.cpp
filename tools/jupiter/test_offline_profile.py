@@ -116,6 +116,22 @@ class TestOfflineProfile(unittest.TestCase):
             with self.assertRaises(ValueError):
                 offline.exact_prompt(args, root, 512)
 
+    def test_raw_24b_calibration_does_not_use_chat_length_search(self):
+        args = argparse.Namespace(tokenizer="fake", model="fake", model_size="24b")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.object(offline, "count_model_tokens", side_effect=AssertionError("chat count")):
+                for total in (160, 192, 2048):
+                    text = offline.exact_prompt(args, root, total)
+                    self.assertGreater(len(text.split()), total)
+                    self.assertEqual(text, offline.exact_prompt(args, root, total))
+                    meta = offline.read_json(root/"prompts"/f"synthetic-{total}.json")
+                    self.assertEqual(meta["tokens"], total)
+                    self.assertEqual(meta["mode"], "RAW_PREFIX")
+                (root/"prompts"/"synthetic-160.txt").write_text("changed", encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    offline.exact_prompt(args, root, 160)
+
     def test_ready_profile_fingerprints_and_coverage(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

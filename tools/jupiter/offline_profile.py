@@ -127,6 +127,8 @@ def hardware_config(args, layout):
     # this protocol. Users changing them must choose a new profile tag/path.
     return {
         "format": 1, "policy": POLICY, "backend": "native-autonomous",
+        "prompt_mode": "RAW" if args.model_size == "24b" else "CHAT",
+        "synthetic_input": "RAW_PREFIX" if args.model_size == "24b" else "EXACT_CHAT",
         "model": file_id(args.model), "model_size": args.model_size,
         "model_layers": args.model_layers, "cpu_layers": args.cpu_layers,
         "pc_layers": layout, "cuda_layers": layout - args.cpu_layers,
@@ -250,13 +252,30 @@ def holdout_points(b, maximum):
 
 
 def exact_prompt(args, root, total):
+    raw = getattr(args, "model_size", None) == "24b"
     path = root / "prompts" / f"synthetic-{total}.txt"
     meta = path.with_suffix(".json")
+    def metadata():
+        info = {"tokens": total, "sha256": digest_file(path)}
+        if raw:
+            info["mode"] = "RAW_PREFIX"
+        return info
     if meta.is_file():
-        info = read_json(meta)
-        if info != {"tokens": total, "sha256": digest_file(path)}:
+        if read_json(meta) != metadata():
             raise ValueError(f"synthetic prompt fingerprint mismatch: {path}")
         return path.read_text(encoding="utf-8")
+    if raw:
+        # A deterministic, generously long natural-text stream. The actual
+        # resident model tokenizes it without chat and takes exactly total
+        # tokens before decode. No target-length lexical search is needed.
+        if not 2 <= total <= CONTEXT:
+            raise ValueError("invalid synthetic raw prefix length")
+        text = " ".join(WORDS[i % len(WORDS)] for i in range(2 * total + 32))
+        atomic_text(path, text)
+        write_json(meta, metadata())
+        print(f"[JUPITER_OFFLINE_PROMPT] tokens={total} mode=RAW_PREFIX status=PREPARED",
+              flush=True)
+        return text
     # Each common word normally encodes as one token; count with the real
     # chat template, not an assumed token/word ratio. Try a deterministic
     # correction loop and fail closed if exact length cannot be obtained.
@@ -365,9 +384,13 @@ class Measurements:
 
     def run(self, phase, cuts, repeat):
         total = sum(cuts)
+        raw = getattr(self.args, "model_size", None) == "24b"
         prompt = self.prompt(total)
         job = {"phase": phase, "cuts": list(cuts), "repeat": repeat,
                "prompt_sha256": digest_bytes(prompt.encode("utf-8"))}
+        if raw:
+            job["prompt_mode"] = "RAW"
+            job["raw_prefix_tokens"] = total
         key = digest_config(job)[:24]
         root = self.root / "requests" / phase / key
         root.mkdir(parents=True, exist_ok=True)
@@ -415,6 +438,9 @@ class Measurements:
                 "LLAMA_JUPITER_SEQUENCE_PLAN": ",".join(map(str, cuts)),
             })
             env.update(self.runtime_env)
+            env.pop(PREFIX + "RAW_PREFIX_TOKENS", None)
+            if raw:
+                env[PREFIX + "RAW_PREFIX_TOKENS"] = str(total)
             command = [str(Path(self.args.exe).resolve()), "-m", str(Path(self.args.model).resolve()),
                        "--rpc", self.args.rpc, "--split-mode", "layer", "-ngl", "all",
                        "-c", str(CONTEXT), "-b", str(CONTEXT), "-ub", str(self.args.max_chunk),
@@ -436,6 +462,11 @@ class Measurements:
                 f"[JUPITER_RESIDENT_RESET] id={rid} status=PASS" not in text or
                 f"[JUPITER_RESIDENT] phase=END id={rid} status=PASS" not in text):
             raise ValueError(f"offline sample lacks verified Native completion/reset: {log}")
+        if raw and (result.get("prompt_mode") != "RAW" or
+                    result.get("raw_prefix_tokens") != total or
+                    not isinstance(result.get("source_tokens"), int) or
+                    result["source_tokens"] < total):
+            raise ValueError(f"offline sample lacks verified raw token prefix: {log}")
         rows = detailed_rows(text, cuts, self.args.cpu_layers)
         if not checkpoint.exists():
             write_json(checkpoint, {"job": job, "attempt": log.parent.name,

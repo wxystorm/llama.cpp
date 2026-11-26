@@ -315,12 +315,16 @@ def preflight(args: argparse.Namespace, files: list[Path],
         if not content:
             raise ValueError(f"Empty Prompt: {prompt_file}")
         sha = digest_prompt(prompt_file)
+        raw = args.model_size == "24b"
+        cache_identity = [str(model_id), str(tokenizer_id), sha]
+        if raw:
+            cache_identity.append("RAW")
         cache_key = hashlib.sha256(json.dumps(
-            [str(model_id), str(tokenizer_id), sha],
-            sort_keys=True).encode()).hexdigest()
+            cache_identity, sort_keys=True).encode()).hexdigest()
         if cache_key not in cache:
+            count_options = {"raw": True} if raw else {}
             cache[cache_key] = count_model_tokens(
-                Path(args.tokenizer), Path(args.model), content)
+                Path(args.tokenizer), Path(args.model), content, **count_options)
             write_json(cache_file, cache)
         n_tokens = int(cache[cache_key])
         ctx = choose_context(n_tokens)
@@ -348,6 +352,7 @@ def preflight(args: argparse.Namespace, files: list[Path],
         "exe": file_signature(Path(args.exe)),
         "tokenizer": tokenizer_id,
         "model": model_id, "model_size": args.model_size,
+        "prompt_mode": "RAW" if args.model_size == "24b" else "CHAT",
         "model_layers": args.model_layers,
         "phone_layer_counts": [args.model_layers - x for x in layouts],
         "rpc": args.rpc, "prompt_root": str(Path(args.prompts_dir).resolve()),
@@ -1087,6 +1092,12 @@ def run() -> int:
         cuda_layers=args.cuda_layers, phone_layers=args.phone_layers)
     args.model_size = model.family
     args.model_layers = model.layers
+    if args.model_size == "24b":
+        if not args.resident_server and not args.dry_run:
+            raise ValueError("24B raw Prompt benchmark requires -UseServer")
+        if args.sequence_policy not in (offline.POLICY, "fixed-control"):
+            raise ValueError("24B raw Prompt benchmark requires offline DP or fixed-control")
+        print("[PHONE_SUITE_INPUT] model=24b mode=RAW chat_template=DISABLED", flush=True)
     if args.out_dir is None:
         args.out_dir = f"jupiter-autonomous-{model.family}-{'offline-dp' if is_offline else 'dp'}-2048"
         if args.run_mode != "both":

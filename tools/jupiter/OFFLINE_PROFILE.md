@@ -56,7 +56,18 @@ flag 0x4, including every child layer. Both PC and Phone must be rebuilt.
 Do not reuse Qwen3 profiles or the old OpenCL 24B results. Initial
 CPU25/CUDA7/HTP8 is a capacity-test candidate, not a measured optimum.
 
-    .\tools\jupiter\run_phone_owned_full_suite.ps1 -ModelSize 24b -CpuLayers 25 -Layouts 32 -Sessions 4 -UseServer -MaxChunk 256 -OfflineProfileDir ".\jupiter-offline-profile\24b-l32-native" -OutDir ".\jupiter-24b-l32-native-full50" -ProfileOnly -Resume
+24B resident input is RAW, matching the historical /completion benchmark:
+no chat template, implicit system prompt or assistant prefix. Model BOS
+policy is unchanged. The formal token cache uses raw llama-tokenize and
+formal prompts are never cropped. Synthetic offline calibration uses
+a deterministic raw text stream and selects the exact token prefix on
+the actual resident model before decode; only calibration can request
+this. This avoids the Mistral chat-template minimum-length problem.
+Rebuild the PC llama-server; no Phone change is required for raw input.
+The previous chat-prefixed 24B profile is incompatible. Use a new
+directory, with the following command:
+
+    .\tools\jupiter\run_phone_owned_full_suite.ps1 -ModelSize 24b -CpuLayers 25 -Layouts 32 -Sessions 4 -UseServer -MaxChunk 256 -OfflineProfileDir ".\jupiter-offline-profile\24b-l32-native-raw" -OutDir ".\jupiter-24b-l32-native-raw-full50" -ProfileOnly -Resume
 
 Before the full suite, validate a real short prompt against the regular
 graph (same tokens, same model); report full logits errors/top-1, not
