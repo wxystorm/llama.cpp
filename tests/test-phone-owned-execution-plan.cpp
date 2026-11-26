@@ -295,7 +295,11 @@ int main() {
     invalid_chain.layer = 254;
     CHECK(!validate(invalid_chain, reason));
     invalid_chain = chain;
-    invalid_chain.flags = flags_for_layers(3) | 2;
+    // The current Jupiter offline profiler deliberately accepts bit 1.
+    invalid_chain.flags = flags_for_layers(3) | k_flag_calibration;
+    CHECK(validate(invalid_chain, reason));
+    CHECK(single_layer_plan(invalid_chain, 0).flags == k_flag_flash_attn);
+    invalid_chain.flags |= 8u; // unknown low flag, still reject
     CHECK(!validate(invalid_chain, reason));
     const auto legacy_child = single_layer_plan(a, 0);
     CHECK(legacy_child.region == a.region);
@@ -380,7 +384,9 @@ int main() {
     bad_multi.layer = 255;
     CHECK(!validate(bad_multi, reason));
     bad_multi = three;
-    bad_multi.flags |= 2;
+    bad_multi.flags |= k_flag_calibration;
+    CHECK(validate(bad_multi, reason));
+    bad_multi.flags |= 8u;
     CHECK(!validate(bad_multi, reason));
 
     invalid = a;
