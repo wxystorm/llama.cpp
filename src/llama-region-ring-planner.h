@@ -303,6 +303,36 @@ inline int chunk_for_region(
         c.xp : chunk_for(c, region.device);
 }
 
+// Locked full G/P layouts do not consume XC in either DAG or adaptive
+// linear scoring. With the production unbounded Slot Pool, the native
+// memory callback also has no XC-dependent allocation. Preserve the first
+// eligible XC in the original enumeration order (including tie breaking).
+// Never collapse mixed CPU, directional, bounded-slot or fixed-X searches.
+inline std::vector<int> locked_cpu_chunk_candidates(
+        const model & m,
+        const std::vector<llama_region_ring_region> & regions,
+        const std::vector<int> & widths,
+        bool force_full_search = false) {
+    if (force_full_search || m.slot_pool != 0 ||
+            m.fixed_planner_chunk != 0 || regions.empty() || widths.empty()) {
+        return widths;
+    }
+    const bool pure_gp = std::all_of(
+        regions.begin(), regions.end(), [](const auto & r) {
+            return (r.device == device::GPU &&
+                    r.kind == llama_region_ring_stage_kind::GPU) ||
+                   (r.device == device::PHONE &&
+                    r.kind == llama_region_ring_stage_kind::PHONE);
+        });
+    if (!pure_gp) { return widths; }
+    const auto first = std::find_if(
+        widths.begin(), widths.end(), [&](int x) {
+            return x > 0 && x <= m.tokens;
+        });
+    if (first == widths.end()) { return widths; }
+    return {*first};
+}
+
 inline bool make_regions(const candidate & c, int total_layers,
                          std::vector<llama_region_ring_region> & regions) {
     regions.clear();
