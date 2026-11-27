@@ -20,7 +20,11 @@
       "archive": "jupiter-qwen32b-数据.zip",
       "sha256": "32ceb6bb380330089649af1098dd2a75929093cbf923ac7e2d633f8ace3fa74e",
       "bytes": 42809022,
-      "runs": 40
+      "runs": 40,
+      "status": "SUPERSEDED",
+      "superseded_by": "runs/jupiter-32b/run-config.json",
+      "active_results": false,
+      "note": "Historical 40-record ZIP; the current 50 records come from user-supplied 2026-11-26 console output."
     },
     {
       "id": "galaxy-14b",

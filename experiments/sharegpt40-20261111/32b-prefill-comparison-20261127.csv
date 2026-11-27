@@ -1,0 +1,7 @@
+group,runs_per_method,ours_previous_mean_tps,ours_current_mean_tps,jupiter_mean_tps,ours_previous_drop_min_mean_tps,ours_current_drop_min_mean_tps,jupiter_drop_min_mean_tps,current_vs_previous_drop_min_speedup,current_vs_jupiter_drop_min_speedup,ours_previous_mean_planner_ms,ours_current_mean_planner_ms,ours_previous_weighted_tps,ours_current_weighted_tps,jupiter_weighted_tps
+0,10,50.776,51.788,39.716,53.086,54.763,43.680,1.032,1.254,30.991,8.254,50.245,50.278,25.037
+128,10,87.919,92.628,63.335,88.998,94.284,64.062,1.059,1.472,207.675,36.407,88.413,93.106,63.380
+256,10,109.842,114.909,67.306,110.720,116.391,68.217,1.051,1.706,188.247,33.397,110.446,115.612,67.605
+512,10,135.169,150.018,76.693,136.335,150.827,77.090,1.106,1.957,561.638,89.249,135.603,150.656,76.957
+1024,10,142.376,152.563,83.817,143.056,153.878,84.463,1.076,1.822,824.144,156.301,141.907,152.410,84.316
+ALL,50,105.216,112.381,66.173,106.439,114.029,67.502,1.071,1.689,362.539,64.722,123.037,131.796,72.234

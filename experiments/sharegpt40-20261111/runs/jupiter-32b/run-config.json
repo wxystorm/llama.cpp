@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "run_id": "jupiter-32b",
+  "model": "${MODEL_DIR}/Qwen3-32B-Q4_K_M.gguf",
+  "source": "User-supplied console log (2026-11-26): jupiter-32b-l52-offline-full50; pasted text 20261126-124010",
+  "source_received_date": "2026-11-26",
+  "method": "jupiter-offline-dp",
+  "backend": "resident-server",
+  "run_mode": "autonomous",
+  "pc_layers": 52,
+  "cpu_layers": 36,
+  "pc_gpu_layers": 16,
+  "phone_layers": 12,
+  "sessions": 4,
+  "context": 2048,
+  "batch": 2048,
+  "bench_repeats": 1,
+  "min_chunk_b": 128,
+  "offline_capacity_sample_chunk": 256,
+  "warmup": false,
+  "profile": "OFFLINE_SHARED",
+  "probe_count": 50,
+  "failures": 0,
+  "prompt_groups": [
+    0,
+    128,
+    256,
+    512,
+    1024
+  ],
+  "prompts_per_group": 10,
+  "group_counts": {
+    "0": 10,
+    "128": 10,
+    "256": 10,
+    "512": 10,
+    "1024": 10
+  },
+  "per_prompt_file": "per-prompt-details.csv",
+  "token_source": "PHONE_SUITE_OFFLINE_LOOKUP; chunk sums verified",
+  "metrics_source": "PHONE_SUITE result=PASS; prefill_ms, tok_s and cache_hit as logged",
+  "note": "Current 50-prompt L52 result replaces the earlier 40-prompt snapshot. The first sample is retained in the raw results. Token counts differ from Ours (49 prompts +8, one +13), so comparisons are matched by prompt filename, not identical token count. Exact launch command and binary hash not supplied."
+}

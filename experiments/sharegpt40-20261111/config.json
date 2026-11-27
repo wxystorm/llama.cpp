@@ -13,7 +13,7 @@
     ],
     "prompts_per_group": 10,
     "prompt_ids": "prompt_{group}_{01..10}.txt",
-    "note": "Ours 14B/24B/32B, Galaxy 14B, and Prima.cpp 24B/32B cover groups 0/128/256/512/1024. Prima.cpp 14B has a group-0 summary (10 prompts) and 40 existing prompt-level records. Jupiter 24B has user-reported remeasured group means for all 5 groups, 10 prompts each (50 total); new per-prompt data was not provided. Old 36 Jupiter 24B prompt-level records are superseded due to a prefix issue."
+    "note": "Ours 14B/24B/32B, Galaxy 14B, and Prima.cpp 24B/32B cover groups 0/128/256/512/1024. Prima.cpp 14B has a group-0 summary (10 prompts) and 40 existing prompt-level records. Jupiter 24B has user-reported remeasured group means for all 5 groups, 10 prompts each (50 total); new per-prompt data was not provided. Old 36 Jupiter 24B prompt-level records are superseded due to a prefix issue. The active Jupiter 32B L52 offline-DP run (2026-11-26) and Ours 32B optimized server-plan run (2026-11-27) both contain all 50 per-prompt records. Prompt filenames match; actual token counts differ."
   },
   "models": {
     "14b": "Qwen3-14B-Q4_K_M.gguf",
@@ -86,21 +86,31 @@
       "id": "jupiter-32b",
       "framework": "jupiter",
       "model": "32b",
-      "method": "Sequence DP",
+      "method": "Sequence DP (offline)",
       "pc_layers": 52,
-      "cpu_layers": 40,
-      "pc_gpu_layers": 12,
+      "cpu_layers": 36,
+      "pc_gpu_layers": 16,
       "phone_layers": 12,
+      "sessions": 4,
       "context": 2048,
       "batch": 2048,
-      "ubatch": 128,
-      "graph_prebuild": true,
-      "window": 2,
+      "backend": "resident-server",
+      "run_mode": "autonomous",
       "bench_repeats": 1,
-      "max_rounds": 1,
-      "min_chunk": 96,
-      "max_chunk": 128,
-      "memory_safety_percent": 5
+      "min_chunk": 128,
+      "warmup": false,
+      "profile": "OFFLINE_SHARED",
+      "run_config": "runs/jupiter-32b/run-config.json",
+      "per_prompt_details": "runs/jupiter-32b/per-prompt-details.csv",
+      "source_received_date": "2026-11-26",
+      "group_counts": {
+        "0": 10,
+        "128": 10,
+        "256": 10,
+        "512": 10,
+        "1024": 10
+      },
+      "metrics_source": "PHONE_SUITE result logs"
     },
     {
       "id": "galaxy-14b",
@@ -187,7 +197,15 @@
       },
       "metrics_source": "SERVER_PROBE prefill_ms and tps",
       "per_prompt_chunks": "runs/ours-32b-server-plan/per-prompt-details.csv",
-      "layout_source": "user-confirmed follow-up to 2026-11-17 SERVER_PROBE data"
+      "layout_source": "Fixed layout from preceding 2026-11-27 experiment setup",
+      "source_received_date": "2026-11-27",
+      "context": 2048,
+      "batch": 2048,
+      "ubatch": 2048,
+      "no_mmap": true,
+      "session_scratch_reuse": true,
+      "locked_xc_dedup": true,
+      "expected_source_commit": "a35aa25feb4a1f6958420dc0810d6eb495e795fc"
     },
     {
       "id": "ours-24b-server-plan",
@@ -292,5 +310,13 @@
       "included_in_group_summary": true,
       "included_in_results_csv": false
     }
-  ]
+  ],
+  "comparison_32b": {
+    "date": "2026-11-27",
+    "file": "32b-prefill-comparison-20261127.csv",
+    "previous_ours_ref": "91fe6a6c65bad073749ad1ab75a1fd6bc1380501",
+    "mean_definition": "Arithmetic mean of per-prompt TPS; trimmed mean drops exactly one minimum-TPS observation per group per method",
+    "all_definition": "Mean across five equally sized groups; weighted TPS uses all raw tokens divided by all raw Prefill time",
+    "token_alignment": "Match by prompt filename; not identical token counts between Jupiter and Ours"
+  }
 }
