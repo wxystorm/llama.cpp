@@ -11732,6 +11732,14 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 " policy=AUTOMATIC_UNDER_CAP\n",
                 max_plan_xg, max_plan_xp, short_chunk_search ? 1 : 0,
                 widths.front());
+            const auto xc_widths = llama_ring_planner::locked_cpu_chunk_candidates(
+                locked_model, locked_regions, widths,
+                flag_on("LLAMA_REGION_RING_LOCKED_FULL_XC_SEARCH"));
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_PLAN_LOCK] event=XC_SEARCH"
+                " original=%zu effective=%zu dedup=%d status=READY\n",
+                widths.size(), xc_widths.size(),
+                xc_widths.size() < widths.size() ? 1 : 0);
             for (const int xg : widths) {
                 if (xg > max_plan_xg || xg > model.tokens) { continue; }
                 // Two-Bank streaming requires at least two GPU chunks for
@@ -11741,7 +11749,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                         n_gpu_regions >= 2 && xg * 2 > model.tokens) {
                     continue;
                 }
-                for (const int xc : widths) {
+                for (const int xc : xc_widths) {
                     if (xc > model.tokens) { continue; }
                     for (const int xp : widths) {
                         // Phone-owned Plan v4 validates chunk_tokens <=
