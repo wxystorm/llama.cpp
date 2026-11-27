@@ -214,7 +214,88 @@ static void test_no_dag_serial_profile_scoring() {
             short_prompt.wall_ms > 0.0);
 }
 
+static void test_locked_cpu_chunk_dedup() {
+    model m = mock_profile();
+    m.layers = 64;
+    m.tokens = 1855;
+    m.hidden = 5120;
+    m.slot_pool = 0;
+    const auto regions = llama_region_ring_parse(
+        "G7,P4,G7,P4,G8,P5,G7,P4,G7,P4,G7", 64);
+    const std::vector<int> widths(first_cycle_chunk_candidates.begin(),
+                                  first_cycle_chunk_candidates.end());
+    REQUIRE(locked_cpu_chunk_candidates(m, regions, widths) ==
+            std::vector<int>{32});
+    REQUIRE(locked_cpu_chunk_candidates(m, regions, widths, true) == widths);
+
+    // Evaluate the same grid and preserve original xg/xc/xp tie order.
+    // Compare the complete scoring path, not just the number of widths.
+    auto search_locked = [&](bool force_full, size_t & tried) {
+        candidate best;
+        bool valid = false;
+        tried = 0;
+        const auto xc_widths = locked_cpu_chunk_candidates(
+            m, regions, widths, force_full);
+        for (int xg : widths) {
+            for (int xc : xc_widths) {
+                for (int xp : widths) {
+                    candidate c;
+                    c.concrete_regions = regions;
+                    c.xc = xc;
+                    c.xg = xg;
+                    c.xp = xp;
+                    ++tried;
+                    REQUIRE(simulate(m, regions, c));
+                    if (!valid || c.wall_ms < best.wall_ms) {
+                        best = c;
+                        valid = true;
+                    }
+                }
+            }
+        }
+        REQUIRE(valid);
+        return best;
+    };
+    for (bool linear : {false, true}) {
+        m.linear_no_dag_ablation = linear;
+        size_t full_count = 0;
+        size_t dedup_count = 0;
+        const auto full = search_locked(true, full_count);
+        const auto dedup = search_locked(false, dedup_count);
+        REQUIRE(full_count == 1000 && dedup_count == 100);
+        REQUIRE(full.xc == dedup.xc && full.xg == dedup.xg &&
+                full.xp == dedup.xp);
+        REQUIRE(full.wall_ms == dedup.wall_ms);
+        REQUIRE(full.tasks == dedup.tasks && full.edges == dedup.edges);
+    }
+    m.linear_no_dag_ablation = false;
+
+    const auto cpu = llama_region_ring_parse("G20,C8,P16,G20", 64);
+    REQUIRE(locked_cpu_chunk_candidates(m, cpu, widths) == widths);
+    const std::vector<llama_region_ring_region> directional = {
+        {device::GPU, 0, 20},
+        {llama_region_ring_stage_kind::C2P, 20, 21},
+        {device::PHONE, 21, 64},
+    };
+    REQUIRE(locked_cpu_chunk_candidates(m, directional, widths) == widths);
+    m.slot_pool = 2;
+    REQUIRE(locked_cpu_chunk_candidates(m, regions, widths) == widths);
+    m.slot_pool = 0;
+    m.fixed_planner_chunk = 64;
+    REQUIRE(locked_cpu_chunk_candidates(m, regions, widths) == widths);
+    m.fixed_planner_chunk = 0;
+    m.tokens = 66;
+    const std::vector<int> short_widths{16, 24, 32, 48, 64};
+    REQUIRE(locked_cpu_chunk_candidates(m, regions, short_widths) ==
+            std::vector<int>{16});
+    m.tokens = 8;
+    REQUIRE(locked_cpu_chunk_candidates(m, regions, short_widths) ==
+            short_widths);
+    REQUIRE(locked_cpu_chunk_candidates(m, {}, widths) == widths);
+}
+
 int main() {
+    test_locked_cpu_chunk_dedup();
     test_no_dag_serial_profile_scoring();
     test_gpg_phone_serial_profile_composition();
     test_gpg_sequential_gpu_banks_simulate();
